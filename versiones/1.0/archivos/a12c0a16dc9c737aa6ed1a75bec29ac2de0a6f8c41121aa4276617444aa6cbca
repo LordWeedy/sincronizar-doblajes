@@ -1,0 +1,2162 @@
+#!/usr/bin/env python3
+"""
+actualizador.py - Actualizaciones de Sincronizar Doblaje.
+
+La GUI pregunta en segundo plano al servidor de publicación (HTTPS) si hay una versión nueva. Cada versión es un
+manifiesto firmado con Ed25519 (la clave pública va en este archivo) con la lista de archivos del programa, su tamaño
+y su SHA-256. Al pulsar «Actualizar» se descargan solo los archivos nuevos, cambiados o dañados a una carpeta de
+preparación, se comprueban (tamaño, SHA-256 y sintaxis) y, con todo ya validado, la GUI se cierra y una copia de este
+archivo (en .actualizador\\ayudante) los aplica: respaldo, sustitución anotada en un diario (si se corta la luz, se
+deshace al volver a abrir el programa), comprobación de que la versión nueva arranca de verdad y, si algo falla,
+vuelta a la anterior. Solo se tocan los archivos del manifiesto: ajustes, .venv, ffmpeg, informes, resultados y lo
+demás que haya en la carpeta no se tocan nunca.
+
+Uso a mano (ver ACTUALIZACIONES.txt):
+  python actualizador.py estado                   versión instalada, lo pendiente y los respaldos
+  python actualizador.py comprobar                si hay una versión nueva
+  python actualizador.py recuperar                deshace una actualización que se quedó a medias
+  python actualizador.py deshacer                 vuelve a la versión anterior con el último respaldo (sin red)
+  python actualizador.py reparar                  vuelve a descargar los archivos dañados de la versión instalada
+  python actualizador.py restaurar-version X --confirmo   instala la versión publicada X aunque sea anterior
+"""
+
+import base64
+import errno
+import hashlib
+import json
+import os
+import random
+import re
+import shutil
+import socket
+import ssl
+import stat
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+VERSION = '1.0'
+PROGRAMA = "sincronizar-doblaje"
+FORMATO = 1
+# Las versiones van numeradas (1.0, 1.1...) y se anuncian en CANAL. Las de antes eran por fecha (AAAA.MM.DD) y esas
+# copias solo leen CANAL_FECHAS, que anuncia una última versión por fecha ya con este código: la que pasa a la 1.0.
+CANAL = "actual"
+CANAL_FECHAS = "estable"
+# Servidores HTTPS de publicación, el principal primero; todos sirven las mismas carpetas (ver ACTUALIZACIONES.txt).
+# Vacío: actualizaciones sin configurar; el programa funciona igual, solo que no busca versiones nuevas.
+SERVIDORES = ['https://raw.githubusercontent.com/LordWeedy/sincronizar-doblajes/main/']
+# Claves públicas Ed25519 en las que se confía (id -> 64 cifras hex). Solo cambian con una versión del programa
+# firmada con una de ellas: un manifiesto no puede añadir ni sustituir claves.
+CLAVES_PUBLICAS = {'f72df477143b13fd': 'd920e55de6fd7349e95cc3beb1b732252bb7c0c4b543fa819454d2a71e9f2326'}
+CA_EXTRA = None     # certificado raíz adicional, solo para instalaciones de prueba; None = los del sistema
+CONTEXTO_FIRMA = b"sincronizar-doblaje/manifiesto/1\n"
+
+# los .py del programa: todos declaran la misma VERSION y la que se ejecuta se comprueba al arrancar
+COMPONENTES = ("Sincronizar_Doblaje_Gui.py", "sincronizar_doblaje.py", "limpiar_vhs.py", "actualizador.py",
+               "actualizador_ventana.py")
+GUI = "Sincronizar_Doblaje_Gui.py"
+AJUSTES = "Sincronizar_Doblaje_ajustes.json"
+# nunca forman parte de un manifiesto ni se tocan: datos del usuario y componentes que instala la GUI aparte
+PROTEGIDOS = (".actualizador", ".venv", "ffmpeg", "__pycache__", ".git", "publicacion", AJUSTES.lower())
+
+MAX_SOBRE = 1 << 20
+MAX_ARCHIVO = 512 << 20
+MAX_TOTAL = 1 << 30
+MAX_ARCHIVOS = 500
+T_CONEXION = 15             # s para conectar o sin recibir nada
+VENTANA_AVANCE = (30, 1024)  # en 30 s, al menos 1 KB; si no, la transferencia está parada
+INTENTOS = 4
+ESPERA_BASE = 1.5
+T_CIERRE = 60               # s para que se cierren las ventanas del programa
+T_SALUD = 120               # s para que la versión nueva arranque y lo diga
+RESPALDOS_CONSERVADOS = 3
+PERIODO_COMPROBACION = 6 * 3600
+ESQUEMA_AJUSTES = 1
+# n -> función(dict) -> dict que pasa los ajustes del esquema n - 1 al n (se respaldan antes y se deshacen con la
+# actualización si esta no llega a arrancar)
+MIGRACIONES = {}
+
+ESPERA_EN_USO = 5.0         # el antivirus abre los archivos nuevos un momento: se reintenta antes de dar error
+
+ESTADOS_APLICANDO = ("respaldando", "aplicando")
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Errores con un mensaje que entiende quien usa el programa
+
+class ErrorActualizacion(Exception):
+    """Error con un mensaje para quien usa el programa; `detalle` es para el registro."""
+
+    def __init__(self, mensaje, detalle=""):
+        super().__init__(mensaje)
+        self.mensaje, self.detalle = mensaje, detalle
+
+
+class SinConexion(ErrorActualizacion):
+    pass
+
+
+class NoEncontrado(ErrorActualizacion):
+    pass
+
+
+class FirmaInvalida(ErrorActualizacion):
+    pass
+
+
+class ManifiestoInvalido(ErrorActualizacion):
+    pass
+
+
+class Cancelado(ErrorActualizacion):
+    pass
+
+
+class Ocupado(ErrorActualizacion):
+    pass
+
+
+class SinEspacio(ErrorActualizacion):
+    pass
+
+
+class SinPermisos(ErrorActualizacion):
+    pass
+
+
+class ArchivoEnUso(ErrorActualizacion):
+    pass
+
+
+def mensaje_de(e):
+    if isinstance(e, ErrorActualizacion):
+        return e.mensaje
+    if es_sin_espacio(e):
+        return "No queda espacio en el disco."
+    return f"Fallo inesperado: {type(e).__name__}: {e}"
+
+
+def es_sin_espacio(e):
+    return isinstance(e, OSError) and (e.errno == errno.ENOSPC or getattr(e, "winerror", None) in (39, 112))
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Ed25519 (RFC 8032), en Python puro: el programa no necesita instalar nada para comprobar las firmas
+
+_P = 2 ** 255 - 19
+_Q = 2 ** 252 + 27742317777372353535851937790883648493
+
+
+def _inv(x):
+    return pow(x, _P - 2, _P)
+
+
+_D = -121665 * _inv(121666) % _P
+_RAIZ_M1 = pow(2, (_P - 1) // 4, _P)
+
+
+def _suma(a, b):
+    x1, y1, z1, t1 = a
+    x2, y2, z2, t2 = b
+    pa = (y1 - x1) * (y2 - x2) % _P
+    pb = (y1 + x1) * (y2 + x2) % _P
+    pc = 2 * t1 * t2 * _D % _P
+    pd = 2 * z1 * z2 % _P
+    e, f, g, h = pb - pa, pd - pc, pd + pc, pb + pa
+    return (e * f % _P, g * h % _P, f * g % _P, e * h % _P)
+
+
+def _por(k, punto):
+    r = (0, 1, 1, 0)
+    while k > 0:
+        if k & 1:
+            r = _suma(r, punto)
+        punto = _suma(punto, punto)
+        k >>= 1
+    return r
+
+
+def _iguales(a, b):
+    return (a[0] * b[2] - b[0] * a[2]) % _P == 0 and (a[1] * b[2] - b[1] * a[2]) % _P == 0
+
+
+def _x(y, signo):
+    if y >= _P:
+        return None
+    x2 = (y * y - 1) * _inv(_D * y * y + 1) % _P
+    if x2 == 0:
+        return None if signo else 0
+    x = pow(x2, (_P + 3) // 8, _P)
+    if (x * x - x2) % _P:
+        x = x * _RAIZ_M1 % _P
+    if (x * x - x2) % _P:
+        return None
+    if (x & 1) != signo:
+        x = _P - x
+    return x
+
+
+_GY = 4 * _inv(5) % _P
+_GX = _x(_GY, 0)
+_G = (_GX, _GY, 1, _GX * _GY % _P)
+
+
+def _comprimir(punto):
+    zi = _inv(punto[2])
+    x, y = punto[0] * zi % _P, punto[1] * zi % _P
+    return int.to_bytes(y | ((x & 1) << 255), 32, "little")
+
+
+def _descomprimir(b):
+    if len(b) != 32:
+        return None
+    y = int.from_bytes(b, "little")
+    signo, y = y >> 255, y & ((1 << 255) - 1)
+    x = _x(y, signo)
+    return None if x is None else (x, y, 1, x * y % _P)
+
+
+def _h(b):
+    return int.from_bytes(hashlib.sha512(b).digest(), "little") % _Q
+
+
+def _expandir(secreta):
+    h = hashlib.sha512(secreta).digest()
+    a = int.from_bytes(h[:32], "little")
+    a &= (1 << 254) - 8
+    a |= 1 << 254
+    return a, h[32:]
+
+
+def ed25519_publica(secreta):
+    if len(secreta) != 32:
+        raise ValueError("la clave privada tiene que tener 32 bytes")
+    a, _ = _expandir(secreta)
+    return _comprimir(_por(a, _G))
+
+
+def ed25519_firmar(secreta, mensaje):
+    a, prefijo = _expandir(secreta)
+    pub = _comprimir(_por(a, _G))
+    r = _h(prefijo + mensaje)
+    rb = _comprimir(_por(r, _G))
+    s = (r + _h(rb + pub + mensaje) * a) % _Q
+    return rb + int.to_bytes(s, 32, "little")
+
+
+def ed25519_verificar(publica, mensaje, firma):
+    if len(publica) != 32 or len(firma) != 64:
+        return False
+    a = _descomprimir(publica)
+    r = _descomprimir(firma[:32])
+    if a is None or r is None:
+        return False
+    s = int.from_bytes(firma[32:], "little")
+    if s >= _Q:
+        return False
+    h = _h(firma[:32] + publica + mensaje)
+    return _iguales(_por(s, _G), _suma(r, _por(h, a)))
+
+
+def id_de_clave(publica):
+    return hashlib.sha256(publica).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Utilidades
+
+def version_tupla(v):
+    if not isinstance(v, str) or not re.fullmatch(r"\d{1,6}(\.\d{1,6}){0,3}", v):
+        raise ValueError(f"versión no válida: {v!r}")
+    t = tuple(int(x) for x in v.split("."))
+    return t + (0,) * (4 - len(t))
+
+
+def por_fecha(v):
+    """Si es una versión de la numeración de antes de la 1.0 (AAAA.MM.DD, con .1, .2... el mismo día)."""
+    return version_tupla(v)[0] >= 1000
+
+
+def orden_version(v):
+    """Para comparar versiones del programa: las de fecha van antes que la 1.0 y las siguientes."""
+    return (0 if por_fecha(v) else 1,) + version_tupla(v)
+
+
+def sha256_archivo(ruta, bloque=1 << 20):
+    h = hashlib.sha256()
+    with open(ruta, "rb") as f:
+        while True:
+            b = f.read(bloque)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def reemplazar(origen, destino, espera=1.0):
+    """os.replace reintentando un momento si el destino está abierto (otro lector, el antivirus)."""
+    fin = time.time() + espera
+    while True:
+        try:
+            os.replace(origen, destino)
+            return
+        except PermissionError:
+            if time.time() >= fin:
+                raise
+            time.sleep(0.1)
+
+
+def escribir_atomico(ruta, datos):
+    tmp = f"{ruta}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(datos)
+            f.flush()
+            os.fsync(f.fileno())
+        reemplazar(tmp, ruta, 3.0)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def escribir_json(ruta, obj):
+    escribir_atomico(ruta, json.dumps(obj, ensure_ascii=False, indent=1).encode("utf-8"))
+
+
+def leer_json(ruta, defecto=None):
+    for _ in range(20):
+        try:
+            with open(ruta, "rb") as f:
+                return json.loads(f.read().decode("utf-8"))
+        except FileNotFoundError:
+            return defecto
+        except PermissionError:
+            time.sleep(0.05)
+        except (OSError, ValueError):
+            return defecto
+    return defecto
+
+
+def ahora():
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def tamano_legible(n):
+    if n < 1024:
+        return f"{n} B"
+    if n < 1 << 20:
+        return f"{n / 1024:.1f} KB".replace(".", ",")
+    return f"{n / 1048576:.2f} MB".replace(".", ",")
+
+
+_SECRETOS = (
+    (re.compile(r"(?i)\b(https?://)[^/\s:@]+:[^/\s@]+@"), r"\1***@"),
+    (re.compile(r"(?i)\b(https?://[^\s?#]+)\?[^\s#\"']*"), r"\1?***"),
+    (re.compile(r"(?i)\b(authorization|proxy-authorization|cookie|set-cookie)(\s*[:=]\s*)[^\r\n]*"), r"\1\2***"),
+    (re.compile(r"(?i)\b(token|access_token|password|contraseña|clave_privada|secret)(\s*[:=]\s*)\S+"), r"\1\2***"),
+)
+
+
+def sin_secretos(texto):
+    for patron, cambio in _SECRETOS:
+        texto = patron.sub(cambio, texto)
+    return texto
+
+
+class Rutas:
+    def __init__(self, raiz):
+        self.raiz = os.path.realpath(os.path.abspath(raiz))
+        e = self.estado = os.path.join(self.raiz, ".actualizador")
+        self.json_estado = os.path.join(e, "estado.json")
+        self.diario = os.path.join(e, "diario.json")
+        self.plan = os.path.join(e, "plan.json")
+        self.cerrojo = os.path.join(e, "actualizando.lock")
+        self.instancias = os.path.join(e, "instancias")
+        self.salud = os.path.join(e, "salud")
+        self.preparacion = os.path.join(e, "preparacion")
+        self.respaldos = os.path.join(e, "respaldos")
+        self.ayudante = os.path.join(e, "ayudante")
+        self.registro = os.path.join(e, "registro.txt")
+        self.resultado = os.path.join(e, "resultado.json")
+        self.sesion = os.path.join(e, "sesion.json")
+
+
+def es_enlace(ruta):
+    """Enlace simbólico, punto de unión u otro punto de reanálisis (pueden llevar fuera de la carpeta)."""
+    try:
+        st = os.lstat(ruta)
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    return bool(getattr(st, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+
+
+def dentro(raiz, ruta):
+    raiz, ruta = os.path.normcase(os.path.realpath(raiz)), os.path.normcase(os.path.realpath(ruta))
+    try:
+        return os.path.commonpath([raiz, ruta]) == raiz and ruta != raiz
+    except ValueError:
+        return False
+
+
+def carpeta_interna(raiz, *partes):
+    """Crea (si hace falta) una carpeta del actualizador y comprueba que no lleve fuera por un enlace."""
+    raiz = os.path.realpath(raiz)
+    actual = raiz
+    for parte in (".actualizador",) + partes:
+        actual = os.path.join(actual, parte)
+        if es_enlace(actual):
+            raise SinPermisos(f"La carpeta {actual} es un enlace a otro sitio; por seguridad no se usa.")
+        os.makedirs(actual, exist_ok=True)
+    if not dentro(raiz, actual):
+        raise SinPermisos(f"La carpeta {actual} queda fuera de la instalación; por seguridad no se usa.")
+    return actual
+
+
+class Registro:
+    """Registro de la operación en .actualizador\\registro.txt (sin contraseñas ni tokens)."""
+
+    def __init__(self, raiz, eco=None):
+        self.ruta = Rutas(raiz).registro
+        self.eco = eco
+        self.lock = threading.Lock()
+
+    def __call__(self, texto):
+        texto = sin_secretos(str(texto))
+        if self.eco:
+            try:
+                self.eco(texto)
+            except Exception:
+                pass
+        with self.lock:
+            try:
+                os.makedirs(os.path.dirname(self.ruta), exist_ok=True)
+                if os.path.exists(self.ruta) and os.path.getsize(self.ruta) > 512 * 1024:
+                    reemplazar(self.ruta, self.ruta[:-4] + ".1.txt")
+                with open(self.ruta, "a", encoding="utf-8") as f:
+                    f.write(f"{ahora()} [{os.getpid()}] {texto}\n")
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Cerrojos entre procesos (también entre equipos, si la carpeta es compartida) e instancias del programa
+
+if os.name == "nt":
+    import msvcrt
+
+    def _bloquear(fd):
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+
+    def _desbloquear(fd):
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+else:
+    import fcntl
+
+    def _bloquear(fd):
+        fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, 0)
+
+    def _desbloquear(fd):
+        fcntl.lockf(fd, fcntl.LOCK_UN, 1, 0)
+
+
+class Cerrojo:
+    """Cerrojo de un archivo: lo tiene un solo proceso a la vez y se suelta solo si el proceso muere."""
+
+    def __init__(self, ruta):
+        self.ruta, self.fd = ruta, None
+
+    def tomar(self, esperar=0.0):
+        fin = time.time() + esperar
+        try:
+            os.makedirs(os.path.dirname(self.ruta), exist_ok=True)
+        except OSError:
+            pass
+        while True:
+            fd = None
+            try:
+                fd = os.open(self.ruta, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0))
+                _bloquear(fd)
+                self.fd = fd
+                return True
+            except OSError:
+                if fd is not None:
+                    os.close(fd)
+            if time.time() >= fin:
+                return False
+            time.sleep(0.2)
+
+    def soltar(self):
+        if self.fd is not None:
+            try:
+                _desbloquear(self.fd)
+            except OSError:
+                pass
+            os.close(self.fd)
+            self.fd = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.soltar()
+
+
+def cerrojo_libre(ruta):
+    c = Cerrojo(ruta)
+    if c.tomar():
+        c.soltar()
+        return True
+    return False
+
+
+class Instancia:
+    """Una ventana del programa o un análisis en marcha, para que no se actualice con él abierto."""
+
+    def __init__(self, raiz, tipo, ocupado=False, que=""):
+        r = Rutas(raiz)
+        carpeta_interna(r.raiz, "instancias")
+        limpiar_instancias(r.raiz)
+        self.id = f"{socket.gethostname()}_{os.getpid()}_{tipo}"
+        self.base = os.path.join(r.instancias, self.id)
+        self.cerrojo = Cerrojo(self.base + ".lock")
+        if not self.cerrojo.tomar(2.0):
+            raise OSError("no se pudo registrar la instancia")
+        self.info = {"id": self.id, "tipo": tipo, "equipo": socket.gethostname(), "pid": os.getpid(),
+                     "desde": ahora(), "ocupado": bool(ocupado), "que": que, "version": VERSION}
+        for viejo in (".cerrar", ".respuesta"):
+            try:
+                os.remove(self.base + viejo)
+            except OSError:
+                pass
+        escribir_json(self.base + ".json", self.info)
+
+    def marcar(self, ocupado, que=""):
+        self.info.update(ocupado=bool(ocupado), que=que)
+        try:
+            escribir_json(self.base + ".json", self.info)
+        except OSError:
+            pass
+
+    def peticion_de_cierre(self):
+        return os.path.exists(self.base + ".cerrar")
+
+    def responder(self, texto):
+        try:
+            escribir_json(self.base + ".respuesta", {"respuesta": texto, "cuando": ahora()})
+            os.remove(self.base + ".cerrar")
+        except OSError:
+            pass
+
+    def cerrar(self):
+        self.cerrojo.soltar()
+        for ext in (".json", ".lock", ".cerrar", ".respuesta"):
+            try:
+                os.remove(self.base + ext)
+            except OSError:
+                pass
+
+
+def registrar_instancia(raiz, tipo, ocupado=False, que=""):
+    """Para el motor y la GUI: nunca falla (sin carpeta escribible, sin registro)."""
+    try:
+        return Instancia(raiz, tipo, ocupado, que)
+    except Exception:
+        return None
+
+
+def instancias(raiz):
+    """[info] de las instancias que siguen vivas (su cerrojo está tomado)."""
+    r = Rutas(raiz)
+    vivas = []
+    try:
+        nombres = os.listdir(r.instancias)
+    except OSError:
+        return []
+    for nombre in nombres:
+        if not nombre.endswith(".lock"):
+            continue
+        base = os.path.join(r.instancias, nombre[:-5])
+        if not cerrojo_libre(base + ".lock"):
+            info = leer_json(base + ".json", {}) or {}
+            info.setdefault("id", nombre[:-5])
+            info["base"] = base
+            vivas.append(info)
+    return vivas
+
+
+def limpiar_instancias(raiz):
+    """Borra el registro de instancias que ya no existen (su cerrojo está libre)."""
+    r = Rutas(raiz)
+    try:
+        nombres = os.listdir(r.instancias)
+    except OSError:
+        return
+    for nombre in nombres:
+        if not nombre.endswith(".lock"):
+            continue
+        base = os.path.join(r.instancias, nombre[:-5])
+        c = Cerrojo(base + ".lock")
+        if c.tomar():
+            for ext in (".json", ".cerrar", ".respuesta"):
+                try:
+                    os.remove(base + ext)
+                except OSError:
+                    pass
+            c.soltar()
+            try:
+                os.remove(base + ".lock")
+            except OSError:
+                pass
+
+
+def describir_instancia(info):
+    que = {"gui": "una ventana del programa", "motor": "un análisis"}.get(info.get("tipo"), "el programa")
+    equipo = info.get("equipo") or "?"
+    lugar = "en este equipo" if equipo == socket.gethostname() else f"en el equipo {equipo}"
+    extra = f" ({info['que']})" if info.get("que") else ""
+    return f"{que} {lugar}{extra}"
+
+
+def ocupadas(raiz, excepto=None):
+    """Las instancias vivas con un trabajo en marcha (los análisis lo están siempre)."""
+    return [i for i in instancias(raiz) if i.get("id") != excepto and (i.get("ocupado") or i.get("tipo") == "motor")]
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Manifiesto firmado
+
+_RESERVADOS = {"con", "prn", "aux", "nul", "conin$", "conout$"} | {f"{p}{n}" for p in ("com", "lpt")
+                                                                    for n in "123456789¹²³"}
+
+
+def validar_ruta(ruta):
+    """La ruta relativa de un archivo del manifiesto ("a/b.py"), o ManifiestoInvalido si podría salirse de la
+    carpeta del programa o pisar algo que no es suyo."""
+    if not isinstance(ruta, str) or not 0 < len(ruta) <= 200:
+        raise ManifiestoInvalido("El manifiesto trae una ruta vacía o demasiado larga.")
+    if any(ord(c) < 32 for c in ruta) or any(c in ruta for c in '\\:*?"<>|'):
+        raise ManifiestoInvalido(f"El manifiesto trae una ruta no válida: {ruta!r}.")
+    if ruta.startswith("/") or ruta.endswith("/"):
+        raise ManifiestoInvalido(f"El manifiesto trae una ruta absoluta o de carpeta: {ruta!r}.")
+    partes = ruta.split("/")
+    for p in partes:
+        if p in ("", ".", ".."):
+            raise ManifiestoInvalido(f"El manifiesto trae una ruta que sale de la carpeta: {ruta!r}.")
+        if p != p.strip() or p.endswith("."):
+            raise ManifiestoInvalido(f"El manifiesto trae una ruta ambigua en Windows: {ruta!r}.")
+        if p.split(".")[0].lower() in _RESERVADOS:
+            raise ManifiestoInvalido(f"El manifiesto trae un nombre reservado de Windows: {ruta!r}.")
+        if re.search(r"~\d", p):
+            raise ManifiestoInvalido(f"El manifiesto trae un nombre corto de Windows (8.3): {ruta!r}.")
+    if partes[0].lower() in PROTEGIDOS or ruta.lower() in PROTEGIDOS:
+        raise ManifiestoInvalido(f"El manifiesto intenta tocar datos que no son del programa: {ruta!r}.")
+    return ruta
+
+
+def destino_seguro(raiz, ruta):
+    """La ruta absoluta de un archivo del programa dentro de la instalación, comprobando que ninguna carpeta del
+    camino (ni el archivo) sea un enlace o punto de unión que lleve fuera."""
+    raiz = os.path.realpath(raiz)
+    partes = validar_ruta(ruta).split("/")
+    actual = raiz
+    for i, p in enumerate(partes):
+        actual = os.path.join(actual, p)
+        if es_enlace(actual):
+            raise SinPermisos(f"{ruta}: en la instalación hay un enlace o punto de unión ({actual}); por seguridad "
+                              "no se escribe a través de él.")
+        if i < len(partes) - 1 and os.path.exists(actual) and not os.path.isdir(actual):
+            raise ManifiestoInvalido(f"{ruta}: {actual} no es una carpeta.")
+    if not dentro(raiz, actual):
+        raise SinPermisos(f"{ruta}: queda fuera de la carpeta del programa; no se toca.")
+    if os.path.isdir(actual):
+        raise ManifiestoInvalido(f"{ruta}: en la instalación es una carpeta, no un archivo.")
+    return actual
+
+
+def validar_manifiesto(m):
+    def exigir(cond, texto):
+        if not cond:
+            raise ManifiestoInvalido(f"El manifiesto no es válido: {texto}.")
+    exigir(isinstance(m, dict), "no es un objeto")
+    for clave, tipo in (("formato", int), ("programa", str), ("version", str), ("fecha", str), ("canal", str),
+                        ("notas", str), ("requisitos", dict), ("actualizable_desde", str), ("archivos", list)):
+        exigir(isinstance(m.get(clave), tipo), f"falta «{clave}» o no es del tipo esperado")
+    exigir(m["formato"] == FORMATO, f"formato {m['formato']} desconocido (este programa entiende el {FORMATO})")
+    exigir(m["programa"] == PROGRAMA, f"es de otro programa ({m['programa']})")
+    try:
+        exigir(orden_version(m["actualizable_desde"]) <= orden_version(m["version"]),
+               "«actualizable_desde» es posterior a la propia versión")
+    except ValueError as e:
+        raise ManifiestoInvalido(f"El manifiesto no es válido: {e}.")
+    exigir(len(m["notas"]) <= 20000, "las notas son demasiado largas")
+    exigir(0 < len(m["archivos"]) <= MAX_ARCHIVOS, "la lista de archivos está vacía o es demasiado larga")
+    vistos, total = set(), 0
+    for a in m["archivos"]:
+        exigir(isinstance(a, dict), "un archivo no es un objeto")
+        exigir(isinstance(a.get("tamano"), int) and 0 <= a["tamano"] <= MAX_ARCHIVO, "un tamaño no es válido")
+        exigir(isinstance(a.get("sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", a["sha256"]),
+               "un SHA-256 no es válido")
+        ruta = validar_ruta(a.get("ruta"))
+        exigir(ruta.lower() not in vistos, f"«{ruta}» está repetido")
+        vistos.add(ruta.lower())
+        total += a["tamano"]
+    exigir(total <= MAX_TOTAL, "los archivos ocupan demasiado")
+    for c in COMPONENTES:
+        exigir(c.lower() in vistos, f"falta {c}")
+    req = m["requisitos"]
+    if "python_min" in req:
+        try:
+            version_tupla(req["python_min"])
+        except ValueError:
+            raise ManifiestoInvalido("El manifiesto no es válido: «python_min» no es una versión.")
+    return m
+
+
+class Publicacion:
+    """Un manifiesto ya comprobado: firma, contenido y versión."""
+
+    def __init__(self, manifiesto, datos, sobre, clave):
+        self.manifiesto, self.datos, self.sobre, self.clave = manifiesto, datos, sobre, clave
+        self.huella = hashlib.sha256(datos).hexdigest()
+        self.version = manifiesto["version"]
+
+
+def abrir_sobre(sobre, claves=None):
+    """El sobre (manifiesto + firma, un solo archivo) -> Publicacion, solo si lo firma una clave de confianza."""
+    claves = CLAVES_PUBLICAS if claves is None else claves
+    if not claves:
+        raise FirmaInvalida("Este programa no tiene ninguna clave de confianza configurada.")
+    if len(sobre) > MAX_SOBRE:
+        raise ManifiestoInvalido("El manifiesto es demasiado grande.")
+    try:
+        s = json.loads(sobre.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise ManifiestoInvalido("El manifiesto descargado está incompleto o no es un manifiesto.")
+    if not (isinstance(s, dict) and s.get("formato") == FORMATO and isinstance(s.get("clave"), str)
+            and isinstance(s.get("manifiesto"), str) and isinstance(s.get("firma"), str)):
+        raise ManifiestoInvalido("El manifiesto descargado está incompleto o no es un manifiesto.")
+    publica = claves.get(s["clave"])
+    if publica is None:
+        raise FirmaInvalida("El manifiesto está firmado con una clave en la que este programa no confía.")
+    try:
+        datos = base64.b64decode(s["manifiesto"], validate=True)
+        firma = base64.b64decode(s["firma"], validate=True)
+        publica = bytes.fromhex(publica)
+    except ValueError:
+        raise ManifiestoInvalido("El manifiesto descargado está dañado.")
+    if not ed25519_verificar(publica, CONTEXTO_FIRMA + datos, firma):
+        raise FirmaInvalida("La firma del manifiesto no es válida: alguien lo ha modificado o no es nuestro. "
+                            "No se instala nada.")
+    try:
+        m = json.loads(datos.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise ManifiestoInvalido("El manifiesto firmado no se puede leer.")
+    return Publicacion(validar_manifiesto(m), datos, sobre, s["clave"])
+
+
+def crear_sobre(datos, secreta, clave_id):
+    firma = ed25519_firmar(secreta, CONTEXTO_FIRMA + datos)
+    return json.dumps({"formato": FORMATO, "clave": clave_id, "manifiesto": base64.b64encode(datos).decode(),
+                       "firma": base64.b64encode(firma).decode()}, indent=1).encode("utf-8")
+
+
+def compatible(m, version_instalada):
+    """None si se puede instalar en este equipo desde la versión instalada; si no, el motivo."""
+    req = m["requisitos"]
+    if req.get("plataforma") == "win" and os.name != "nt":
+        return "es solo para Windows"
+    if "python_min" in req and sys.version_info[:3] < version_tupla(req["python_min"])[:3]:
+        return (f"necesita Python {req['python_min']} o posterior (este equipo tiene "
+                f"{'.'.join(map(str, sys.version_info[:3]))})")
+    try:
+        if orden_version(version_instalada) < orden_version(m["actualizable_desde"]):
+            return (f"no se puede actualizar directamente desde la {version_instalada} (hace falta la "
+                    f"{m['actualizable_desde']} o posterior): instala el paquete completo")
+    except ValueError:
+        return "la versión instalada no se reconoce"
+    return None
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Red: solo HTTPS con certificado comprobado, tiempos máximos, reintentos y reanudación comprobada
+
+class _RedireccionSegura(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urllib.parse.urlsplit(newurl).scheme.lower() != "https":
+            raise SinConexion("El servidor redirige a una dirección que no es HTTPS; no se sigue.")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+class Red:
+    def __init__(self, servidores=None, ca_extra=None, registro=None, cancelar=None, t_conexion=T_CONEXION,
+                 intentos=INTENTOS, espera_base=ESPERA_BASE, avance=VENTANA_AVANCE, contexto=None):
+        servidores = SERVIDORES if servidores is None else servidores
+        self.servidores = []
+        for s in servidores:
+            if urllib.parse.urlsplit(s).scheme.lower() != "https":
+                raise ErrorActualizacion(f"El servidor {s} no es HTTPS; no se usa.")
+            self.servidores.append(s if s.endswith("/") else s + "/")
+        if contexto is None:
+            contexto = ssl.create_default_context()
+            contexto.minimum_version = ssl.TLSVersion.TLSv1_2
+            ca = CA_EXTRA if ca_extra is None else ca_extra
+            if ca:
+                contexto.load_verify_locations(ca)
+        self.contexto = contexto
+        self.registro = registro or (lambda t: None)
+        self.cancelar = cancelar or threading.Event()
+        self.t_conexion, self.intentos, self.espera_base, self.avance = t_conexion, intentos, espera_base, avance
+        self.abridor = urllib.request.OpenerDirector()
+        for h in (urllib.request.ProxyHandler(), urllib.request.HTTPSHandler(context=contexto),
+                  _RedireccionSegura(), urllib.request.HTTPDefaultErrorHandler(),
+                  urllib.request.HTTPErrorProcessor()):
+            self.abridor.add_handler(h)
+
+    def _abrir(self, url, cabeceras=None):
+        if urllib.parse.urlsplit(url).scheme.lower() != "https":
+            raise SinConexion("Solo se descarga por HTTPS.")
+        cab = {"User-Agent": f"Sincronizar-Doblaje/{VERSION} (actualizador)", "Accept-Encoding": "identity"}
+        cab.update(cabeceras or {})
+        return self.abridor.open(urllib.request.Request(url, headers=cab), timeout=self.t_conexion)
+
+    def _esperar(self, intento):
+        espera = self.espera_base * (2 ** intento) * random.uniform(0.8, 1.2)
+        if self.cancelar.wait(espera):
+            raise Cancelado("Cancelado.")
+
+    def _clasificar(self, e, url):
+        """(error para el usuario, si merece la pena reintentar)."""
+        if isinstance(e, ErrorActualizacion):
+            return e, not isinstance(e, (Cancelado, FirmaInvalida, ManifiestoInvalido, NoEncontrado, SinEspacio))
+        if es_sin_espacio(e):
+            return SinEspacio("No queda espacio en el disco para la descarga.", str(e)), False
+        if isinstance(e, urllib.error.HTTPError):
+            if e.code == 404:
+                return NoEncontrado(f"El servidor no tiene {url.rsplit('/', 1)[-1]} (404).", str(e)), False
+            reintentar = e.code in (408, 425, 429) or e.code >= 500
+            return SinConexion(f"El servidor respondió con un error ({e.code}).", str(e)), reintentar
+        if isinstance(e, urllib.error.URLError) and isinstance(e.reason, ssl.SSLCertVerificationError):
+            return SinConexion("El certificado HTTPS del servidor no es válido; no se descarga nada.", str(e)), False
+        if isinstance(e, ssl.SSLError):
+            return SinConexion("Falló la conexión segura (HTTPS) con el servidor.", str(e)), True
+        if isinstance(e, (socket.timeout, TimeoutError)) or "timed out" in str(e):
+            return SinConexion("El servidor no responde (tiempo de espera agotado).", str(e)), True
+        if isinstance(e, (urllib.error.URLError, ConnectionError, OSError)) and not es_sin_espacio(e):
+            return SinConexion("No hay conexión con el servidor de actualizaciones.", str(e)), True
+        return e, False
+
+    def leer(self, url, maximo):
+        """El contenido de un archivo pequeño (el manifiesto), con reintentos."""
+        ultimo = None
+        for intento in range(self.intentos):
+            if self.cancelar.is_set():
+                raise Cancelado("Cancelado.")
+            try:
+                limite = time.time() + 60
+                partes, n = [], 0
+                with self._abrir(url, {"Cache-Control": "no-cache", "Pragma": "no-cache"}) as r:
+                    while True:
+                        b = r.read1(65536)
+                        if not b:
+                            break
+                        partes.append(b)
+                        n += len(b)
+                        if n > maximo:
+                            raise ManifiestoInvalido("El manifiesto es demasiado grande.")
+                        if time.time() > limite or self.cancelar.is_set():
+                            raise SinConexion("El servidor tarda demasiado en mandar el manifiesto.")
+                return b"".join(partes)
+            except Exception as e:
+                ultimo, reintentar = self._clasificar(e, url)
+                self.registro(f"  {url}: {mensaje_de(ultimo)} {getattr(ultimo, 'detalle', '')}".rstrip())
+                if not reintentar:
+                    break
+                if intento + 1 < self.intentos:
+                    self._esperar(intento)
+        raise ultimo or SinConexion("No se pudo conectar con el servidor.")
+
+    def descargar(self, url, destino, tamano, sha, progreso=None):
+        """Descarga url en destino (que debe acabar en .parcial) comprobando tamaño y SHA-256. Reanuda lo descargado
+        antes solo si el registro de al lado dice que es exactamente este archivo (mismo SHA-256 y tamaño)."""
+        meta = destino + ".json"
+        ultimo = None
+        for intento in range(self.intentos):
+            if self.cancelar.is_set():
+                raise Cancelado("Cancelado.")
+            try:
+                self._una_descarga(url, destino, meta, tamano, sha, progreso)
+                return
+            except Exception as e:
+                ultimo, reintentar = self._clasificar(e, url)
+                self.registro(f"  {url}: {mensaje_de(ultimo)} {getattr(ultimo, 'detalle', '')}".rstrip())
+                if not reintentar:
+                    break
+                if intento + 1 < self.intentos:
+                    if progreso:
+                        progreso(reintento=f"{mensaje_de(ultimo)} Reintentando ({intento + 2} de {self.intentos})...")
+                    self._esperar(intento)
+        raise ultimo or SinConexion("No se pudo conectar con el servidor.")
+
+    def _una_descarga(self, url, destino, meta, tamano, sha, progreso):
+        previo = 0
+        m = leer_json(meta, {}) or {}
+        if os.path.exists(destino) and m.get("sha256") == sha and m.get("tamano") == tamano:
+            previo = os.path.getsize(destino)
+            if previo > tamano:
+                previo = 0
+        if previo == 0:
+            for x in (destino,):
+                if os.path.exists(x):
+                    os.remove(x)
+            escribir_json(meta, {"sha256": sha, "tamano": tamano, "url": url})
+        h = hashlib.sha256()
+        if previo:
+            with open(destino, "rb") as f:
+                for b in iter(lambda: f.read(1 << 20), b""):
+                    h.update(b)
+        hecho = previo
+        if progreso:
+            progreso(hecho=hecho)
+        if previo < tamano:
+            cab = {"Range": f"bytes={previo}-"} if previo else {}
+            try:
+                r = self._abrir(url, cab)
+            except urllib.error.HTTPError as e:
+                if e.code == 416 and previo:
+                    os.remove(destino)
+                    raise SinConexion("La descarga a medias no encaja; se empieza de nuevo.")
+                raise
+            with r:
+                if previo and r.status != 206:
+                    previo, hecho, h = 0, 0, hashlib.sha256()           # el servidor no reanuda: desde el principio
+                elif previo:
+                    rango = r.headers.get("Content-Range", "")
+                    if not rango.startswith(f"bytes {previo}-"):
+                        raise SinConexion("El servidor respondió con otro trozo del archivo.", rango)
+                largo = r.headers.get("Content-Length")
+                if largo is not None and int(largo) != tamano - previo:
+                    raise ManifiestoInvalido(f"El servidor dice que {url.rsplit('/', 1)[-1]} ocupa otra cosa "
+                                             f"({int(largo) + previo} bytes en vez de {tamano}).")
+                limite = time.time() + 600 + tamano / 16384
+                muestras = [(time.time(), hecho)]
+                with open(destino, "ab" if previo else "wb") as f:
+                    while hecho < tamano:
+                        if self.cancelar.is_set():
+                            raise Cancelado("Cancelado.")
+                        try:
+                            b = r.read1(65536)
+                        except (socket.timeout, TimeoutError) as e:
+                            raise SinConexion(f"La transferencia está parada (no llega nada en {self.t_conexion} s).",
+                                              str(e))
+                        except (ConnectionError, OSError) as e:
+                            if es_sin_espacio(e):
+                                raise
+                            raise SinConexion("Se cortó la conexión durante la descarga.", str(e))
+                        if not b:
+                            raise SinConexion("Se cortó la conexión durante la descarga (archivo incompleto).")
+                        if hecho + len(b) > tamano:
+                            raise ManifiestoInvalido("El servidor manda más datos de los que dice el manifiesto.")
+                        f.write(b)
+                        h.update(b)
+                        hecho += len(b)
+                        t = time.time()
+                        muestras.append((t, hecho))
+                        while len(muestras) > 2 and muestras[1][0] <= t - self.avance[0]:
+                            muestras.pop(0)
+                        if t - muestras[0][0] >= self.avance[0] and hecho - muestras[0][1] < self.avance[1]:
+                            raise SinConexion("La transferencia está parada (no avanza).")
+                        if t > limite:
+                            raise SinConexion("La descarga está tardando demasiado.")
+                        if progreso:
+                            progreso(hecho=hecho)
+                    f.flush()
+                    os.fsync(f.fileno())
+        if hecho != tamano or h.hexdigest() != sha:
+            for x in (destino, meta):
+                if os.path.exists(x):
+                    os.remove(x)
+            raise ManifiestoInvalido(f"{url.rsplit('/', 1)[-1]}: lo descargado no coincide con el manifiesto "
+                                     "(SHA-256 o tamaño distinto).")
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Comprobar si hay versión nueva
+
+class Comprobacion:
+    def __init__(self, estado, pub=None, servidor=None, motivo=None):
+        self.estado, self.pub, self.servidor, self.motivo = estado, pub, servidor, motivo
+
+
+def leer_estado(raiz):
+    return leer_json(Rutas(raiz).json_estado, {}) or {}
+
+
+def obtener_publicacion(red, claves=None, version=None, canal=CANAL):
+    """(Publicacion, servidor) del primer servidor que responda con un manifiesto bien firmado: el puntero de la
+    versión actual (la de `canal`) o, con `version`, el manifiesto de esa versión."""
+    if not red.servidores:
+        raise SinConexion("No hay ningún servidor de actualizaciones configurado.")
+    fallos = []
+    for s in red.servidores:
+        url = s + (f"versiones/{version}/manifiesto.json" if version else f"{canal}.json")
+        try:
+            pub = abrir_sobre(red.leer(url, MAX_SOBRE), claves)
+            if version and pub.version != version:
+                raise ManifiestoInvalido(f"El manifiesto de la {version} dice ser de la {pub.version}.")
+            return pub, s
+        except Cancelado:
+            raise
+        except ErrorActualizacion as e:
+            fallos.append(e)
+            red.registro(f"Servidor {s}: {e.mensaje}")
+    # el error más grave manda: una firma mala no se tapa con un «sin conexión» del alternativo
+    for clase in (FirmaInvalida, ManifiestoInvalido, NoEncontrado):
+        for e in fallos:
+            if isinstance(e, clase):
+                raise e
+    raise fallos[0]
+
+
+def comprobar(raiz, version_instalada, red, claves=None):
+    """Comprobacion: 'al_dia', 'disponible' o 'incompatible' (con su motivo)."""
+    pub, servidor = obtener_publicacion(red, claves)
+    m = pub.manifiesto
+    r = Rutas(raiz)
+    est = leer_estado(raiz)
+    try:
+        vista = est.get("version_max_vista")
+        if vista and orden_version(pub.version) < orden_version(vista):
+            red.registro(f"El servidor anuncia la {pub.version}, anterior a la {vista} que ya anunció: se ignora.")
+        elif os.path.isdir(r.estado) and (not vista or orden_version(pub.version) > orden_version(vista)):
+            est["version_max_vista"] = pub.version
+            escribir_json(r.json_estado, est)
+    except (OSError, ValueError):
+        pass
+    if orden_version(pub.version) <= orden_version(version_instalada):
+        return Comprobacion("al_dia", pub, servidor)
+    motivo = compatible(m, version_instalada)
+    return Comprobacion("incompatible" if motivo else "disponible", pub, servidor, motivo)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Plan y descarga a la carpeta de preparación
+
+class Plan:
+    def __init__(self, pub, servidor, operaciones, desde):
+        self.pub, self.servidor, self.operaciones, self.desde = pub, servidor, operaciones, desde
+        self.descargas = [o for o in operaciones if o["tipo"] in ("nuevo", "sustituir")]
+        self.bytes = sum(o["tamano"] for o in self.descargas)
+
+    def vacio(self):
+        return not self.operaciones
+
+
+def calcular_plan(raiz, pub, servidor=None, desde=None):
+    """Compara lo instalado con el manifiesto: qué archivos son nuevos, cuáles cambian (o están dañados) y cuáles
+    retira el actualizador (solo los que instaló él y siguen como los dejó)."""
+    raiz = os.path.realpath(raiz)
+    est = leer_estado(raiz)
+    ops = []
+    en_manifiesto = set()
+    for a in pub.manifiesto["archivos"]:
+        dest = destino_seguro(raiz, a["ruta"])
+        en_manifiesto.add(a["ruta"].lower())
+        if os.path.isfile(dest):
+            try:
+                sha_antes = sha256_archivo(dest)
+            except PermissionError as e:
+                raise ArchivoEnUso(f"No se puede leer {a['ruta']}: está abierto por otro programa.", str(e))
+            if os.path.getsize(dest) == a["tamano"] and sha_antes == a["sha256"]:
+                continue
+            ops.append({"ruta": a["ruta"], "tipo": "sustituir", "tamano": a["tamano"], "sha256": a["sha256"],
+                        "sha_antes": sha_antes})
+        else:
+            ops.append({"ruta": a["ruta"], "tipo": "nuevo", "tamano": a["tamano"], "sha256": a["sha256"],
+                        "sha_antes": None})
+    for ruta, info in sorted((est.get("archivos") or {}).items()):
+        try:
+            if ruta.lower() in en_manifiesto:
+                continue
+            dest = destino_seguro(raiz, ruta)
+        except ErrorActualizacion:
+            continue
+        if os.path.isfile(dest) and sha256_archivo(dest) == info.get("sha256"):
+            ops.append({"ruta": ruta, "tipo": "retirar", "tamano": 0, "sha256": None, "sha_antes": info["sha256"]})
+    return Plan(pub, servidor, ops, desde if desde is not None else est.get("version"))
+
+
+def espacio_libre(ruta):
+    return shutil.disk_usage(ruta).free
+
+
+def preparar(raiz, plan, red, progreso=None, claves=None, libre=espacio_libre):
+    """Descarga lo que haga falta a .actualizador\\preparacion\\<versión> y lo comprueba todo; no toca la
+    instalación. progreso(**datos) recibe la fase, el archivo y los bytes reales."""
+    progreso = progreso or (lambda **k: None)
+    raiz = os.path.realpath(raiz)
+    pub = plan.pub
+    carpeta = carpeta_interna(raiz, "preparacion", pub.version)
+    marca = os.path.join(carpeta, "publicacion.json")
+    previa = leer_json(marca, {}) or {}
+    if previa.get("huella") != pub.huella:
+        # otra publicación con el mismo número (o restos): se vacía, solo lo nuestro
+        for nombre in os.listdir(carpeta):
+            if re.fullmatch(r"[0-9a-f]{64}(\.parcial(\.json)?)?", nombre):
+                os.remove(os.path.join(carpeta, nombre))
+        escribir_json(marca, {"huella": pub.huella, "version": pub.version})
+    pendientes = []
+    for o in plan.descargas:
+        listo = os.path.join(carpeta, o["sha256"])
+        if os.path.isfile(listo) and os.path.getsize(listo) == o["tamano"] and sha256_archivo(listo) == o["sha256"]:
+            continue
+        pendientes.append(o)
+    respaldo = sum(os.path.getsize(destino_seguro(raiz, o["ruta"])) for o in plan.operaciones
+                   if o["tipo"] in ("sustituir", "retirar"))
+    falta = sum(o["tamano"] for o in pendientes) + sum(o["tamano"] for o in plan.descargas) + respaldo + (8 << 20)
+    hay = libre(raiz)
+    if hay < falta:
+        raise SinEspacio(f"No hay espacio suficiente en el disco del programa: hacen falta {tamano_legible(falta)} "
+                         f"y quedan {tamano_legible(hay)}.")
+    total = sum(o["tamano"] for o in plan.descargas)
+    hecho_total = total - sum(o["tamano"] for o in pendientes)
+    progreso(fase="descargando", archivo="", n=0, de=len(pendientes), hecho=0, tamano=0, hecho_total=hecho_total,
+             total=total)
+    servidores = _servidores_de(red, pub, plan.servidor, claves)
+    for n, o in enumerate(pendientes, 1):
+        listo = os.path.join(carpeta, o["sha256"])
+        parcial = listo + ".parcial"
+        base = hecho_total
+
+        def avisar(hecho=None, reintento=None, o=o, n=n, base=base):
+            if reintento:
+                progreso(fase="reintento", archivo=o["ruta"], mensaje=reintento)
+            else:
+                progreso(fase="descargando", archivo=o["ruta"], n=n, de=len(pendientes), hecho=hecho,
+                         tamano=o["tamano"], hecho_total=base + hecho, total=total)
+        ultimo = None
+        for s in servidores():
+            url = f"{s}versiones/{pub.version}/archivos/{o['sha256']}"
+            try:
+                red.descargar(url, parcial, o["tamano"], o["sha256"], avisar)
+                ultimo = None
+                break
+            except Cancelado:
+                raise
+            except ErrorActualizacion as e:
+                ultimo = e
+                red.registro(f"No se pudo descargar {o['ruta']} de {s}: {e.mensaje}")
+        if ultimo is not None:
+            raise ultimo
+        reemplazar(parcial, listo)
+        try:
+            os.remove(parcial + ".json")
+        except OSError:
+            pass
+        hecho_total += o["tamano"]
+    progreso(fase="verificando", archivo="", hecho_total=total, total=total)
+    for o in plan.descargas:
+        listo = os.path.join(carpeta, o["sha256"])
+        if not os.path.isfile(listo) or sha256_archivo(listo) != o["sha256"]:
+            raise ManifiestoInvalido(f"{o['ruta']}: lo descargado no coincide con el manifiesto.")
+        if o["ruta"].lower().endswith(".py"):
+            with open(listo, "rb") as f:
+                fuente = f.read()
+            try:
+                compile(fuente, o["ruta"], "exec", dont_inherit=True)
+            except SyntaxError as e:
+                raise ManifiestoInvalido(f"La versión {pub.version} trae {o['ruta']} con un error (línea {e.lineno}); "
+                                         "no se instala.", str(e))
+    progreso(fase="listo", archivo="", hecho_total=total, total=total)
+    return carpeta
+
+
+def _servidores_de(red, pub, primero, claves):
+    """Generador de servidores para descargar los archivos de pub: primero el que sirvió el manifiesto; los demás,
+    solo si sirven exactamente la misma publicación firmada (mismo manifiesto)."""
+    comprobados = {}
+
+    def gen():
+        orden = ([primero] if primero else []) + [s for s in red.servidores if s != primero]
+        for s in orden:
+            if s != primero and s not in comprobados:
+                try:
+                    otra, _ = obtener_publicacion(Red([s], contexto=red.contexto, registro=red.registro,
+                                                      cancelar=red.cancelar, t_conexion=red.t_conexion,
+                                                      intentos=red.intentos, espera_base=red.espera_base,
+                                                      avance=red.avance), claves, pub.version)
+                    comprobados[s] = otra.huella == pub.huella
+                    if not comprobados[s]:
+                        red.registro(f"El servidor {s} sirve otra publicación de la {pub.version}: no se usa.")
+                except Cancelado:
+                    raise
+                except ErrorActualizacion as e:
+                    comprobados[s] = False
+                    red.registro(f"El servidor {s} no sirve la {pub.version}: {e.mensaje}")
+            if s == primero or comprobados.get(s):
+                yield s
+    return gen
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Aplicar: respaldo, diario y sustitución; deshacer si falla o si se interrumpe
+
+def _sha_o_none(ruta):
+    return sha256_archivo(ruta) if os.path.isfile(ruta) else None
+
+
+def comprobar_escritura(raiz, ops):
+    """Antes de tocar nada: se puede escribir en cada carpeta y ningún archivo es de solo lectura."""
+    raiz = os.path.realpath(raiz)
+    carpetas = set()
+    for o in ops:
+        dest = destino_seguro(raiz, o["ruta"])
+        if o["tipo"] != "nuevo" and os.path.exists(dest):
+            atributos = getattr(os.stat(dest), "st_file_attributes", 0)
+            if atributos & getattr(stat, "FILE_ATTRIBUTE_READONLY", 1) or not os.access(dest, os.W_OK):
+                raise SinPermisos(f"No se puede sustituir {o['ruta']}: es de solo lectura.")
+        carpeta = os.path.dirname(dest)
+        while not os.path.isdir(carpeta):
+            carpeta = os.path.dirname(carpeta)
+        carpetas.add(carpeta)
+    for carpeta in carpetas:
+        prueba = os.path.join(carpeta, f".act-prueba-{os.getpid()}")
+        try:
+            with open(prueba, "wb") as f:
+                f.write(b"x")
+            os.remove(prueba)
+        except OSError as e:
+            if es_sin_espacio(e):
+                raise SinEspacio("No queda espacio en el disco del programa.")
+            raise SinPermisos(f"No se puede escribir en {carpeta}: la carpeta del programa necesita permisos que "
+                              "este usuario no tiene. Instala el programa en una carpeta tuya (Documentos, "
+                              "Escritorio) o actualiza con el paquete completo.", str(e))
+
+
+def _copiar_comprobado(origen, destino, sha):
+    tmp = destino + ".copia"
+    with open(origen, "rb") as fo, open(tmp, "wb") as fd:
+        shutil.copyfileobj(fo, fd, 1 << 20)
+        fd.flush()
+        os.fsync(fd.fileno())
+    if sha and sha256_archivo(tmp) != sha:
+        os.remove(tmp)
+        raise ErrorActualizacion(f"La copia de {os.path.basename(destino)} no coincide; no se sigue.")
+    return tmp
+
+
+def _poner(tmp, dest, ruta):
+    """Sustituye dest por tmp de una vez; si el archivo está abierto por otro programa, reintenta unos segundos."""
+    try:
+        reemplazar(tmp, dest, ESPERA_EN_USO)
+    except PermissionError as e:
+        raise ArchivoEnUso(f"No se pudo sustituir {ruta}: está abierto por otro programa o protegido.", str(e))
+    except OSError as e:
+        if es_sin_espacio(e):
+            raise SinEspacio("No queda espacio en el disco del programa.")
+        raise
+
+
+def aplicar(raiz, plan_datos, registro=None, progreso=None, fallo=None):
+    """Aplica el plan (de lanzar_ayudante / plan.json) como una transacción anotada en el diario. Si algo falla,
+    deshace lo hecho y vuelve a lanzar el error. `fallo(i, op)` es para las pruebas."""
+    reg = registro or Registro(raiz)
+    progreso = progreso or (lambda *a: None)
+    raiz = os.path.realpath(raiz)
+    r = Rutas(raiz)
+    id_ = plan_datos["id"]
+    ops = plan_datos["operaciones"]
+    preparacion = plan_datos["preparacion"]
+    if not dentro(raiz, preparacion):
+        raise SinPermisos("La carpeta de preparación queda fuera de la instalación.")
+    comprobar_escritura(raiz, ops)
+    resp = carpeta_interna(raiz, "respaldos", id_)
+    carpeta_interna(raiz, "respaldos", id_, "archivos")
+    diario = {"id": id_, "estado": "respaldando", "desde": plan_datos.get("desde"), "hacia": plan_datos["hacia"],
+              "respaldo": os.path.relpath(resp, raiz), "operaciones": ops, "hechas": 0, "carpetas_creadas": [],
+              "inicio": ahora(), "estado_previo": os.path.exists(r.json_estado),
+              "relanzar": plan_datos.get("relanzar"), "cwd": plan_datos.get("cwd")}
+    escribir_json(r.diario, diario)
+    escribir_json(os.path.join(resp, "respaldo.json"), {"id": id_, "desde": diario["desde"],
+                                                         "hacia": diario["hacia"], "fecha": ahora()})
+    reg(f"Actualizando de la {diario['desde']} a la {diario['hacia']} ({len(ops)} cambios); respaldo en {resp}")
+    try:
+        if os.path.exists(r.json_estado):
+            shutil.copy2(r.json_estado, os.path.join(resp, "estado.json"))
+        for o in ops:
+            dest = destino_seguro(raiz, o["ruta"])
+            if o["tipo"] == "nuevo":
+                if os.path.exists(dest):
+                    raise ErrorActualizacion(f"{o['ruta']} ha aparecido mientras se preparaba la actualización; "
+                                             "vuelve a intentarlo.")
+                continue
+            try:
+                if _sha_o_none(dest) != o["sha_antes"]:
+                    raise ErrorActualizacion(f"{o['ruta']} ha cambiado mientras se preparaba la actualización; "
+                                             "vuelve a intentarlo.")
+                copia = os.path.join(resp, "archivos", *o["ruta"].split("/"))
+                os.makedirs(os.path.dirname(copia), exist_ok=True)
+                reemplazar(_copiar_comprobado(dest, copia, o["sha_antes"]), copia)
+            except PermissionError as e:
+                raise ArchivoEnUso(f"No se puede leer {o['ruta']} para respaldarlo: está abierto por otro "
+                                   "programa.", str(e))
+        for o in ops:
+            if o["tipo"] != "retirar":
+                origen = os.path.join(preparacion, o["sha256"])
+                if not os.path.isfile(origen) or sha256_archivo(origen) != o["sha256"]:
+                    raise ManifiestoInvalido(f"{o['ruta']}: lo preparado ya no coincide con el manifiesto.")
+        diario["estado"] = "aplicando"
+        escribir_json(r.diario, diario)
+        for i, o in enumerate(ops):
+            if fallo:
+                fallo(i, o)
+            dest = destino_seguro(raiz, o["ruta"])
+            progreso(i + 1, len(ops), o["ruta"])
+            if o["tipo"] == "retirar":
+                try:
+                    os.remove(dest)
+                except PermissionError as e:
+                    raise ArchivoEnUso(f"No se pudo retirar {o['ruta']}: está abierto por otro programa.", str(e))
+            else:
+                carpeta = os.path.dirname(dest)
+                nuevas = []
+                while not os.path.isdir(carpeta):
+                    nuevas.append(carpeta)
+                    carpeta = os.path.dirname(carpeta)
+                for c in reversed(nuevas):
+                    os.mkdir(c)
+                    diario["carpetas_creadas"].append(os.path.relpath(c, raiz))
+                    escribir_json(r.diario, diario)
+                tmp = f"{dest}.act-{id_}.tmp"
+                with open(os.path.join(preparacion, o["sha256"]), "rb") as fo, open(tmp, "wb") as fd:
+                    shutil.copyfileobj(fo, fd, 1 << 20)
+                    fd.flush()
+                    os.fsync(fd.fileno())
+                if sha256_archivo(tmp) != o["sha256"]:
+                    raise ErrorActualizacion(f"La copia de {o['ruta']} no coincide; no se sigue.")
+                t = time.time()
+                os.utime(tmp, (t, t))
+                _poner(tmp, dest, o["ruta"])
+            diario["hechas"] = i + 1
+            escribir_json(r.diario, diario)
+        archivos = {a["ruta"]: {"sha256": a["sha256"], "tamano": a["tamano"]}
+                    for a in plan_datos["manifiesto"]["archivos"]}
+        for a in plan_datos["manifiesto"]["archivos"]:
+            if _sha_o_none(destino_seguro(raiz, a["ruta"])) != a["sha256"]:
+                raise ErrorActualizacion(f"Tras sustituirlo, {a['ruta']} no coincide con el manifiesto.")
+        est = leer_estado(raiz)
+        est.update(version=plan_datos["hacia"], archivos=archivos, instalado=ahora(),
+                   esquema_ajustes=est.get("esquema_ajustes", 1))
+        escribir_json(r.json_estado, est)
+        diario["estado"] = "comprobando"
+        escribir_json(r.diario, diario)
+        reg("Archivos sustituidos y comprobados; falta ver que la versión nueva arranca.")
+        return diario
+    except BaseException as e:
+        reg(f"Fallo al aplicar: {type(e).__name__}: {mensaje_de(e) if isinstance(e, Exception) else e}")
+        if isinstance(e, (KeyboardInterrupt, SystemExit)):
+            raise
+        revertir(raiz, reg)
+        raise
+
+
+def revertir(raiz, registro=None):
+    """Deja la instalación como antes de la actualización del diario (se puede repetir sin peligro)."""
+    reg = registro or Registro(raiz)
+    raiz = os.path.realpath(raiz)
+    r = Rutas(raiz)
+    d = leer_json(r.diario)
+    if not d:
+        return []
+    resp = os.path.join(raiz, d["respaldo"])
+    problemas = []
+    for o in reversed(d["operaciones"]):
+        try:
+            dest = destino_seguro(raiz, o["ruta"])
+        except ErrorActualizacion as e:
+            problemas.append(e.mensaje)
+            continue
+        tmp = f"{dest}.act-{d['id']}.tmp"
+        for resto in (tmp, dest + ".copia"):
+            if os.path.exists(resto):
+                try:
+                    os.remove(resto)
+                except OSError:
+                    pass
+        try:
+            if o["tipo"] == "nuevo":
+                if os.path.isfile(dest) and sha256_archivo(dest) == o["sha256"]:
+                    os.remove(dest)
+                continue
+            if _sha_o_none(dest) == o["sha_antes"]:
+                continue
+            copia = os.path.join(resp, "archivos", *o["ruta"].split("/"))
+            if not os.path.isfile(copia):
+                problemas.append(f"{o['ruta']}: no hay respaldo")
+                continue
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            _poner(_copiar_comprobado(copia, dest, o["sha_antes"]), dest, o["ruta"])
+        except Exception as e:
+            problemas.append(f"{o['ruta']}: {mensaje_de(e)}")
+    for c in reversed(d.get("carpetas_creadas") or []):
+        try:
+            os.rmdir(os.path.join(raiz, c))
+        except OSError:
+            pass
+    copia_estado = os.path.join(resp, "estado.json")
+    try:
+        if os.path.exists(copia_estado):
+            shutil.copy2(copia_estado, r.json_estado + ".copia")
+            reemplazar(r.json_estado + ".copia", r.json_estado, 3.0)
+        elif not d.get("estado_previo") and os.path.exists(r.json_estado):
+            os.remove(r.json_estado)
+    except OSError as e:
+        problemas.append(f"estado.json: {e}")
+    datos = os.path.join(resp, "datos")
+    if os.path.isdir(datos):
+        for nombre in os.listdir(datos):
+            try:
+                dest = os.path.join(raiz, nombre)
+                shutil.copy2(os.path.join(datos, nombre), dest + ".copia")
+                reemplazar(dest + ".copia", dest, 3.0)
+            except OSError as e:
+                problemas.append(f"{nombre}: {e}")
+    for o in d["operaciones"]:
+        try:
+            dest = destino_seguro(raiz, o["ruta"])
+        except ErrorActualizacion:
+            continue
+        esperado = None if o["tipo"] == "nuevo" else o["sha_antes"]
+        if _sha_o_none(dest) != esperado:
+            problemas.append(f"{o['ruta']}: no ha quedado como antes")
+    d["estado"] = "revertido"
+    d["problemas"] = problemas
+    d["fin"] = ahora()
+    escribir_json(os.path.join(resp, "diario.json"), d)
+    os.remove(r.diario)
+    reg(f"Deshecha la actualización a la {d['hacia']}: instalada otra vez la {d['desde']}"
+        + (f"; PROBLEMAS: {'; '.join(problemas)}" if problemas else "."))
+    return problemas
+
+
+def confirmar(raiz, registro=None):
+    """La versión nueva ha arrancado: se cierra el diario y se limpian la preparación y los respaldos viejos."""
+    reg = registro or Registro(raiz)
+    r = Rutas(raiz)
+    d = leer_json(r.diario)
+    if not d:
+        return
+    resp = os.path.join(r.raiz, d["respaldo"])
+    d["estado"] = "confirmado"
+    d["fin"] = ahora()
+    escribir_json(os.path.join(resp, "diario.json"), d)
+    os.remove(r.diario)
+    shutil.rmtree(os.path.join(r.preparacion, d["hacia"]), ignore_errors=True)
+    limpiar_respaldos(r.raiz)
+    reg(f"Actualizado a la {d['hacia']} y comprobado que arranca.")
+
+
+def respaldos(raiz):
+    """[(carpeta, datos de respaldo.json, diario archivado)] de los respaldos del actualizador, del más nuevo al
+    más viejo."""
+    r = Rutas(raiz)
+    out = []
+    try:
+        nombres = os.listdir(r.respaldos)
+    except OSError:
+        return out
+    for n in nombres:
+        c = os.path.join(r.respaldos, n)
+        datos = leer_json(os.path.join(c, "respaldo.json"))
+        if datos and not es_enlace(c):
+            out.append((c, datos, leer_json(os.path.join(c, "diario.json"))))
+    out.sort(key=lambda x: (x[1].get("fecha", ""), x[0]), reverse=True)
+    return out
+
+
+def limpiar_respaldos(raiz, conservar=RESPALDOS_CONSERVADOS):
+    """Borra los respaldos más viejos (solo carpetas del actualizador con su respaldo.json)."""
+    for c, _, diario in respaldos(raiz)[conservar:]:
+        if diario and diario.get("estado") in ("confirmado", "revertido"):
+            shutil.rmtree(c, ignore_errors=True)
+
+
+def migrar_ajustes(raiz, ruta_ajustes, migraciones=None, esquema=None):
+    """Pasa los ajustes al esquema actual con las MIGRACIONES; antes los respalda junto a la actualización en curso
+    (y se restauran si se deshace). Nunca rompe el arranque: si falla, se dejan como estaban."""
+    migraciones = MIGRACIONES if migraciones is None else migraciones
+    esquema = ESQUEMA_AJUSTES if esquema is None else esquema
+    r = Rutas(raiz)
+    try:
+        est = leer_estado(raiz)
+        actual = est.get("esquema_ajustes", 1)
+        if actual >= esquema or not os.path.exists(ruta_ajustes):
+            return None
+        with open(ruta_ajustes, encoding="utf-8") as f:
+            ajustes = json.load(f)
+        d = leer_json(r.diario) or {}
+        destino = (os.path.join(r.raiz, d["respaldo"], "datos") if d.get("respaldo")
+                   else carpeta_interna(r.raiz, "respaldos", "ajustes-" + time.strftime("%Y%m%d-%H%M%S"), "datos"))
+        os.makedirs(destino, exist_ok=True)
+        if not os.path.exists(os.path.join(destino, os.path.basename(ruta_ajustes))):
+            shutil.copy2(ruta_ajustes, os.path.join(destino, os.path.basename(ruta_ajustes)))
+        for n in range(actual + 1, esquema + 1):
+            ajustes = migraciones[n](dict(ajustes))
+        escribir_atomico(ruta_ajustes, json.dumps(ajustes, ensure_ascii=False, indent=1).encode("utf-8"))
+        est["esquema_ajustes"] = esquema
+        escribir_json(r.json_estado, est)
+        Registro(raiz)(f"Ajustes pasados del esquema {actual} al {esquema} (respaldo en {destino}).")
+        return esquema
+    except Exception as e:
+        Registro(raiz)(f"No se pudieron migrar los ajustes: {mensaje_de(e)}")
+        return None
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Comprobar que la versión instalada arranca
+
+def python_consola(exe=None):
+    exe = exe or sys.executable
+    carpeta, nombre = os.path.split(exe)
+    if nombre.lower() == "pythonw.exe" and os.path.exists(os.path.join(carpeta, "python.exe")):
+        return os.path.join(carpeta, "python.exe")
+    return exe
+
+
+def python_ventana(exe=None):
+    exe = exe or sys.executable
+    carpeta, nombre = os.path.split(exe)
+    if nombre.lower() == "python.exe" and os.path.exists(os.path.join(carpeta, "pythonw.exe")):
+        return os.path.join(carpeta, "pythonw.exe")
+    return exe
+
+
+SIN_CONSOLA = 0x08000000 if os.name == "nt" else 0
+
+
+def versiones_instaladas(raiz, python=None, tiempo=90):
+    """{componente: VERSION} leyendo cada .py del programa en un proceso aparte (importa el motor como lo haría la
+    GUI), o ErrorActualizacion con lo que falló."""
+    codigo = ("import sys, json, os; sys.dont_write_bytecode = True; sys.path.insert(0, sys.argv[1]); "
+              "import importlib; v = {}\n"
+              "for n in ('sincronizar_doblaje', 'limpiar_vhs', 'actualizador', 'actualizador_ventana'):\n"
+              "    v[n] = importlib.import_module(n).VERSION\n"
+              "import ast\n"
+              "for n in ('Sincronizar_Doblaje_Gui.py',):\n"
+              "    t = ast.parse(open(os.path.join(sys.argv[1], n), encoding='utf-8').read())\n"
+              "    v[n[:-3]] = next(x.value.value for x in t.body if isinstance(x, ast.Assign) and "
+              "any(getattr(y, 'id', '') == 'VERSION' for y in x.targets))\n"
+              "print('VERSIONES ' + json.dumps(v))\n")
+    try:
+        p = subprocess.run([python_consola(python), "-I", "-c", codigo, os.path.realpath(raiz)], capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", timeout=tiempo, creationflags=SIN_CONSOLA)
+    except subprocess.TimeoutExpired:
+        raise ErrorActualizacion("La versión nueva no termina de cargar (más de 90 s).")
+    for linea in p.stdout.splitlines():
+        if linea.startswith("VERSIONES "):
+            return json.loads(linea[10:])
+    error = (p.stderr or p.stdout).strip().splitlines()
+    raise ErrorActualizacion("La versión nueva no carga: " + (error[-1] if error else f"código {p.returncode}"),
+                             "\n".join(error[-15:]))
+
+
+def comprobar_versiones(versiones, esperada):
+    malas = {k: v for k, v in versiones.items() if v != esperada}
+    if malas:
+        raise ErrorActualizacion("Componentes de versiones distintas: " +
+                                 ", ".join(f"{k} {v}" for k, v in sorted(malas.items())) + f" (se esperaba {esperada}).")
+
+
+def pendiente_de_salud(raiz):
+    """(id, versión) de la actualización recién aplicada que espera a que el programa arranque, o None."""
+    d = leer_json(Rutas(raiz).diario)
+    if d and d.get("estado") == "comprobando":
+        return d["id"], d["hacia"]
+    return None
+
+
+def escribir_salud(raiz, id_, versiones):
+    r = Rutas(raiz)
+    carpeta_interna(r.raiz, "salud")
+    escribir_json(os.path.join(r.salud, f"{id_}.json"), {"versiones": versiones, "pid": os.getpid(),
+                                                          "cuando": ahora()})
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Lanzar el ayudante (proceso aparte que aplica la actualización con la ventana cerrada) y volver a abrir
+
+def orden_de_arranque(script=None):
+    """Cómo volver a abrir el programa: el mismo intérprete y el mismo script (los archivos que se soltaron sobre el
+    acceso directo no: la lista de episodios se recupera con la sesión)."""
+    script = script or (sys.argv[0] if sys.argv and sys.argv[0] else None)
+    return [sys.executable, os.path.abspath(script)]
+
+
+def _lanzar(orden, cwd=None, env=None, salida=None):
+    flags = 0
+    if os.name == "nt":
+        flags = 0x00000008 | 0x00000200          # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    kw = dict(cwd=cwd, env=env, close_fds=True, stdin=subprocess.DEVNULL,
+              stdout=salida or subprocess.DEVNULL, stderr=salida or subprocess.DEVNULL)
+    if os.name == "nt":
+        try:
+            return subprocess.Popen(orden, creationflags=flags | 0x01000000, **kw)   # fuera del trabajo del padre
+        except OSError:
+            return subprocess.Popen(orden, creationflags=flags, **kw)
+    return subprocess.Popen(orden, start_new_session=True, **kw)
+
+
+def copiar_ayudante(raiz):
+    r = Rutas(raiz)
+    carpeta = carpeta_interna(r.raiz, "ayudante")
+    aqui = os.path.dirname(os.path.abspath(__file__))
+    for nombre in ("actualizador.py", "actualizador_ventana.py"):
+        origen = os.path.join(aqui, nombre)
+        if os.path.exists(origen):
+            shutil.copy2(origen, os.path.join(carpeta, nombre + ".copia"))
+            reemplazar(os.path.join(carpeta, nombre + ".copia"), os.path.join(carpeta, nombre), 3.0)
+    return os.path.join(carpeta, "actualizador.py")
+
+
+def lanzar_ayudante(raiz, plan, carpeta, relanzar, instancia=None, sesion=None, cwd=None, ventana=True):
+    """Escribe plan.json y lanza el ayudante (copia de este archivo) para que aplique la actualización en cuanto se
+    cierre la ventana. Devuelve el id de la actualización."""
+    r = Rutas(raiz)
+    id_ = time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
+    datos = {"id": id_, "desde": plan.desde, "hacia": plan.pub.version, "sobre": plan.pub.sobre.decode("utf-8"),
+             "huella": plan.pub.huella, "manifiesto": plan.pub.manifiesto, "operaciones": plan.operaciones,
+             "preparacion": carpeta, "relanzar": relanzar, "cwd": cwd or os.getcwd(), "instancia": instancia,
+             "sesion": sesion, "python": sys.executable, "creado": ahora()}
+    escribir_json(r.plan, datos)
+    ayudante = copiar_ayudante(raiz)
+    orden = [python_ventana(), "-I", ayudante, "ayudante", "--instalacion", r.raiz]
+    if not ventana:
+        orden.append("--sin-ventana")
+    _lanzar(orden, cwd=r.raiz)
+    Registro(raiz)(f"Ayudante lanzado para pasar de la {plan.desde} a la {plan.pub.version} (id {id_}).")
+    return id_
+
+
+def esperar_cierre(raiz, ids, tiempo=T_CIERRE):
+    """Espera a que se cierren las instancias `ids` (la ventana que pidió actualizar)."""
+    fin = time.time() + tiempo
+    while time.time() < fin:
+        vivas = {i["id"] for i in instancias(raiz)}
+        if not vivas & set(ids):
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def cerrar_otras(raiz, excepto=(), tiempo=T_CIERRE, registro=None):
+    """Pide a las demás ventanas del programa que se cierren (solo lo hacen si no tienen nada en marcha). Error si
+    alguna tiene un trabajo en marcha o no se cierra."""
+    reg = registro or (lambda t: None)
+    otras = [i for i in instancias(raiz) if i.get("id") not in excepto]
+    for i in otras:
+        if i.get("ocupado") or i.get("tipo") == "motor":
+            raise Ocupado(f"No se actualiza: hay {describir_instancia(i)} con un trabajo en marcha. Vuelve a "
+                          "intentarlo cuando termine.")
+    for i in otras:
+        reg(f"Pidiendo que se cierre {describir_instancia(i)}")
+        try:
+            escribir_json(i["base"] + ".cerrar", {"por": "actualizacion", "cuando": ahora()})
+        except OSError:
+            pass
+    fin = time.time() + tiempo
+    while otras and time.time() < fin:
+        vivas = {x["id"]: x for x in instancias(raiz)}
+        otras = [vivas[i["id"]] for i in otras if i["id"] in vivas]
+        for i in otras:
+            resp = leer_json(i["base"] + ".respuesta")
+            if resp and resp.get("respuesta") == "ocupado":
+                raise Ocupado(f"No se actualiza: {describir_instancia(i)} tiene un trabajo en marcha.")
+        time.sleep(0.25)
+    if otras:
+        raise Ocupado(f"No se actualiza: {describir_instancia(otras[0])} no se ha cerrado.")
+
+
+def esperar_salud(raiz, id_, esperada, proceso=None, tiempo=T_SALUD, al_esperar=None):
+    """Espera la señal de arranque de la versión nueva (la escribe la GUI ya abierta con su VERSION y la de los
+    componentes que ha cargado). Error si no llega, si el proceso termina antes o si las versiones no cuadran."""
+    r = Rutas(raiz)
+    ruta = os.path.join(r.salud, f"{id_}.json")
+    t0 = time.time()
+    salida_temprana = None
+    while time.time() - t0 < tiempo:
+        s = leer_json(ruta)
+        if s:
+            comprobar_versiones(s.get("versiones") or {}, esperada)
+            return s
+        if proceso is not None and proceso.poll() is not None and salida_temprana is None:
+            salida_temprana = time.time()
+        if salida_temprana is not None and time.time() - salida_temprana > 10:
+            raise ErrorActualizacion(f"La versión {esperada} se cerró al arrancar (código {proceso.returncode}).")
+        if al_esperar:
+            al_esperar(time.time() - t0)
+        time.sleep(0.25)
+    raise ErrorActualizacion(f"La versión {esperada} no ha dado señales de arrancar en {tiempo} s.")
+
+
+def guardar_resultado(raiz, ok, mensaje, version, desde=None, detalle=""):
+    try:
+        carpeta_interna(raiz)
+        escribir_json(Rutas(raiz).resultado, {"ok": ok, "mensaje": mensaje, "version": version, "desde": desde,
+                                              "detalle": sin_secretos(detalle), "cuando": ahora()})
+    except OSError:
+        pass
+
+
+def leer_resultado(raiz, consumir=True):
+    r = Rutas(raiz)
+    res = leer_json(r.resultado)
+    if res and consumir:
+        try:
+            os.remove(r.resultado)
+        except OSError:
+            pass
+    return res
+
+
+def _ocupada_por(raiz, pid):
+    """La instancia viva del proceso pid si tiene un trabajo en marcha, o None."""
+    for i in instancias(raiz):
+        if i.get("pid") == pid and i.get("equipo") == socket.gethostname() and i.get("ocupado"):
+            return i
+    return None
+
+
+def _volver_a_abrir(diario_o_plan, reg):
+    orden = (diario_o_plan or {}).get("relanzar")
+    if not orden:
+        return
+    try:
+        env = dict(os.environ, SINCRONIZAR_ACTUALIZACION=diario_o_plan["id"])
+        env.pop("SINCRO_GUI_RELANZADA", None)
+        _lanzar(orden, cwd=diario_o_plan.get("cwd"), env=env)
+    except OSError as e:
+        reg(f"No se pudo volver a abrir el programa: {e}")
+
+
+def _vigilar(raiz, id_, pid, ui, reg, t_salud):
+    """Espera la señal de arranque de una actualización ya aplicada cuyo ayudante desapareció."""
+    r = Rutas(raiz)
+    d = leer_json(r.diario) or {}
+    if d.get("id") != id_ or d.get("estado") != "comprobando":
+        ui.fin(True, "")
+        return 0
+    ui.fase(f"Comprobando que arranca la versión {d['hacia']}...")
+    try:
+        esperar_salud(raiz, d["id"], d["hacia"], tiempo=t_salud, al_esperar=lambda t: ui.esperando(d["hacia"], t))
+    except ErrorActualizacion as e:
+        if pid and _proceso_vivo(pid):
+            # sigue abierta sin dar la señal: no se le quita el programa de debajo; se mirará en el próximo arranque
+            reg(f"Sin señal de arranque de la {d['hacia']}, pero el programa sigue abierto: no se deshace todavía.")
+            ui.fin(False, "")
+            return 1
+        reg(f"La versión {d['hacia']} no ha arrancado: {e.mensaje}")
+        problemas = revertir(raiz, reg)
+        guardar_resultado(raiz, False, f"No se ha actualizado a la {d['hacia']}: {e.mensaje} Se ha vuelto a la "
+                          f"{d.get('desde')}.", d.get("desde"), d["hacia"], "; ".join(problemas))
+        _volver_a_abrir(d, reg)
+        ui.fin(False, f"{e.mensaje}\nSe ha vuelto a la versión {d.get('desde')}.")
+        return 1
+    confirmar(raiz, reg)
+    guardar_resultado(raiz, True, f"Actualizado a la versión {d['hacia']}.", d["hacia"], d.get("desde"))
+    ui.fin(True, f"Actualizado a la versión {d['hacia']}.")
+    return 0
+
+
+def _proceso_vivo(pid):
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    import ctypes
+    h = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)      # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return False
+    try:
+        codigo = ctypes.c_ulong()
+        ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(codigo))
+        return codigo.value == 259                                  # STILL_ACTIVE
+    finally:
+        ctypes.windll.kernel32.CloseHandle(h)
+
+
+def ejecutar_ayudante(raiz, ui=None, vigilar=None, pid=None, t_salud=T_SALUD):
+    """El proceso ayudante: aplica plan.json con la ventana del programa cerrada, comprueba que la versión nueva
+    arranca y, si no, vuelve a la anterior y abre esa. Con `vigilar` (id) solo espera la señal de arranque de una
+    actualización ya aplicada (el ayudante de entonces desapareció). Devuelve el código de salida."""
+    ui = ui or _UiNula()
+    reg = Registro(raiz, eco=ui.linea)
+    r = Rutas(raiz)
+    cerrojo = Cerrojo(r.cerrojo)
+    if not cerrojo.tomar(10):
+        reg("Ya hay otra actualización en marcha; esta no hace nada.")
+        ui.fin(False, "Ya hay otra actualización en marcha.")
+        return 3
+    if vigilar:
+        try:
+            return _vigilar(raiz, vigilar, pid, ui, reg, t_salud)
+        except Exception as e:
+            reg(f"Fallo al vigilar el arranque: {mensaje_de(e)}")
+            ui.fin(False, mensaje_de(e))
+            return 1
+        finally:
+            cerrojo.soltar()
+    plan = leer_json(r.plan)
+    if not plan:
+        cerrojo.soltar()
+        ui.fin(False, "No hay ninguna actualización preparada.")
+        return 2
+    abrir_viejo = True       # la ventana se cerró para actualizar: si no queda abierta la nueva, se abre la de antes
+    try:
+        pub = abrir_sobre(plan["sobre"].encode("utf-8"))
+        if pub.huella != plan["huella"] or pub.version != plan["hacia"]:
+            raise ManifiestoInvalido("El plan de la actualización no coincide con el manifiesto firmado.")
+        plan["manifiesto"] = pub.manifiesto
+        ui.fase("Esperando a que se cierre el programa...")
+        if plan.get("instancia") and not esperar_cierre(raiz, [plan["instancia"]]):
+            abrir_viejo = False
+            raise Ocupado("La ventana del programa no se ha cerrado; no se actualiza.")
+        cerrar_otras(raiz, registro=reg)
+        ui.fase(f"Instalando la versión {plan['hacia']}...")
+        aplicar(raiz, plan, reg, progreso=ui.aplicando)
+        ui.fase(f"Comprobando que arranca la versión {plan['hacia']}...")
+        carpeta_interna(r.raiz, "salud")
+        salida = os.path.join(r.salud, f"{plan['id']}.salida.txt")
+        try:
+            comprobar_versiones(versiones_instaladas(raiz, plan.get("python")), plan["hacia"])
+            with open(salida, "w", encoding="utf-8") as err:
+                env = dict(os.environ, SINCRONIZAR_ACTUALIZACION=plan["id"])
+                env.pop("SINCRO_GUI_RELANZADA", None)
+                proceso = _lanzar(plan["relanzar"], cwd=plan.get("cwd"), env=env, salida=err)
+            try:
+                esperar_salud(raiz, plan["id"], plan["hacia"], proceso, tiempo=t_salud,
+                              al_esperar=lambda t: ui.esperando(plan["hacia"], t))
+            except ErrorActualizacion:
+                if proceso.poll() is None:
+                    if _ocupada_por(raiz, proceso.pid):
+                        # alguien ya está trabajando con ella: no se cierra ni se deshace; lo resuelve el próximo arranque
+                        abrir_viejo = False
+                        reg("Sin señal de arranque, pero la ventana nueva ya tiene un trabajo en marcha: se deja.")
+                        ui.fin(False, "La versión nueva está abierta pero no ha confirmado que arranca bien.")
+                        return 1
+                    proceso.terminate()          # recién abierta, sin trabajos y sin arrancar del todo
+                    try:
+                        proceso.wait(10)
+                    except subprocess.TimeoutExpired:
+                        proceso.kill()
+                raise
+        except ErrorActualizacion as e:
+            try:
+                with open(salida, encoding="utf-8", errors="replace") as f:
+                    e.detalle = (e.detalle + "\n" + f.read()[-3000:]).strip()
+            except OSError:
+                pass
+            reg(f"La versión nueva no arranca bien: {e.mensaje} {e.detalle}")
+            revertir(raiz, reg)
+            raise
+        abrir_viejo = False
+        confirmar(raiz, reg)
+        guardar_resultado(raiz, True, f"Actualizado a la versión {plan['hacia']}.", plan["hacia"], plan.get("desde"))
+        ui.fin(True, f"Actualizado a la versión {plan['hacia']}.")
+        return 0
+    except Exception as e:
+        texto = mensaje_de(e)
+        reg(f"Actualización no hecha: {texto}")
+        desde = plan.get("desde")
+        guardar_resultado(raiz, False, f"No se ha actualizado a la {plan.get('hacia')}: {texto}"
+                          + (f" Sigue instalada la {desde}." if desde else ""), desde, plan.get("hacia"),
+                          getattr(e, "detalle", ""))
+        ui.fin(False, texto)
+        return 1
+    finally:
+        try:
+            os.remove(r.plan)
+        except OSError:
+            pass
+        if not os.path.exists(r.diario):
+            shutil.rmtree(r.salud, ignore_errors=True)
+        cerrojo.soltar()
+        if abrir_viejo:
+            _volver_a_abrir(plan, reg)
+
+
+class _UiNula:
+    def linea(self, t):
+        pass
+
+    def fase(self, t):
+        pass
+
+    def aplicando(self, i, n, ruta):
+        pass
+
+    def esperando(self, version, t):
+        pass
+
+    def fin(self, ok, texto):
+        pass
+
+
+class _UiConsola(_UiNula):
+    def fase(self, t):
+        print(t, flush=True)
+
+    def aplicando(self, i, n, ruta):
+        print(f"  {i}/{n} {ruta}", flush=True)
+
+    def fin(self, ok, texto):
+        if texto:
+            print(("Hecho: " if ok else "ERROR: ") + texto, flush=True)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Al arrancar el programa
+
+def al_arrancar(raiz, version):
+    """Lo primero que hace la GUI. Si la última actualización se quedó a medias (corte de luz, el ayudante murió),
+    la deshace y vuelve a abrir el programa; si espera la señal de arranque y no hay ayudante, lanza uno que vigile.
+    Devuelve None, o {"salud": id, "hacia": versión} si este arranque tiene que dar la señal."""
+    r = Rutas(raiz)
+    if not os.path.exists(r.diario):
+        if os.path.isdir(r.salud):          # la salida de la ventana de la última actualización, ya cerrada
+            shutil.rmtree(r.salud, ignore_errors=True)
+        return None
+    d = leer_json(r.diario)
+    if not d:
+        return None
+    cerrojo = Cerrojo(r.cerrojo)
+    if not cerrojo.tomar():
+        # un ayudante está trabajando: si espera la señal, la da este arranque
+        return {"salud": d["id"], "hacia": d["hacia"]} if d.get("estado") == "comprobando" else None
+    try:
+        if d.get("estado") in ESTADOS_APLICANDO:
+            reg = Registro(raiz)
+            reg(f"La actualización a la {d['hacia']} se quedó a medias ({d['estado']}): se deshace.")
+            try:
+                problemas = revertir(raiz, reg)
+            except Exception as e:
+                problemas = [mensaje_de(e)]
+            guardar_resultado(raiz, False, f"La actualización a la {d['hacia']} se interrumpió (¿se apagó el equipo?) "
+                              f"y se ha vuelto a la {d.get('desde')}." +
+                              (" Ha habido problemas al restaurar: revisa .actualizador\\registro.txt."
+                               if problemas else ""), d.get("desde"), d["hacia"], "; ".join(problemas))
+            if not problemas:
+                # este proceso puede tener cargada una mezcla de las dos versiones: se abre de nuevo, ya restaurado
+                cerrojo.soltar()
+                _lanzar(orden_de_arranque(), cwd=os.getcwd())
+                sys.exit(0)
+            return None
+        if d.get("estado") == "comprobando":
+            cerrojo.soltar()
+            ayudante = copiar_ayudante(raiz)
+            _lanzar([python_ventana(), "-I", ayudante, "vigilar", "--instalacion", r.raiz, "--id", d["id"],
+                     "--pid", str(os.getpid())]
+                    + ([] if os.environ.get("SINCRONIZAR_ACTUALIZADOR_SIN_VENTANA") != "1" else ["--sin-ventana"]),
+                    cwd=r.raiz)
+            Registro(raiz)(f"Arranque con la actualización a la {d['hacia']} sin confirmar: se vigila.")
+            return {"salud": d["id"], "hacia": d["hacia"]}
+    finally:
+        cerrojo.soltar()
+    return None
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Operaciones a mano (consola)
+
+def _instalar_publicacion(raiz, pub, servidor, red, permitir_bajada=False, mismo=False):
+    """Para reparar y restaurar-version desde la consola: descarga, aplica y comprueba (sin la GUI)."""
+    instalada = leer_estado(raiz).get("version") or VERSION
+    if not mismo and not permitir_bajada and orden_version(pub.version) <= orden_version(instalada):
+        raise ErrorActualizacion(f"La {pub.version} no es posterior a la instalada ({instalada}).")
+    plan = calcular_plan(raiz, pub, servidor, instalada)
+    if plan.vacio():
+        print("Todos los archivos están bien; no hay nada que cambiar.")
+        return 0
+    for o in plan.operaciones:
+        print(f"  {o['tipo']:9s} {o['ruta']}")
+    if ocupadas(raiz):
+        raise Ocupado("Hay una ventana o un análisis del programa con un trabajo en marcha; ciérralo antes.")
+    cerrojo = Cerrojo(Rutas(raiz).cerrojo)
+    if not cerrojo.tomar():
+        raise Ocupado("Ya hay otra actualización en marcha.")
+    try:
+        carpeta = preparar(raiz, plan, red, progreso=lambda **k: None)
+        cerrar_otras(raiz, tiempo=30)
+        datos = {"id": time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}", "desde": instalada, "hacia": pub.version,
+                 "manifiesto": pub.manifiesto, "operaciones": plan.operaciones, "preparacion": carpeta}
+        aplicar(raiz, datos, Registro(raiz, eco=print), progreso=lambda i, n, ruta: print(f"  {i}/{n} {ruta}"))
+        try:
+            comprobar_versiones(versiones_instaladas(raiz), pub.version)
+        except ErrorActualizacion as e:
+            revertir(raiz, Registro(raiz, eco=print))
+            raise ErrorActualizacion(f"{e.mensaje} Se ha deshecho.", e.detalle)
+        confirmar(raiz, Registro(raiz, eco=print))
+        print(f"Instalada la {pub.version}. Abre el programa para comprobarlo.")
+        return 0
+    finally:
+        cerrojo.soltar()
+
+
+def deshacer_ultima(raiz):
+    """Vuelve a dejar la instalación como estaba antes de la última actualización confirmada, con su respaldo."""
+    lista = [x for x in respaldos(raiz) if x[2] and x[2].get("estado") == "confirmado"]
+    if not lista:
+        raise ErrorActualizacion("No hay ninguna actualización que deshacer (no quedan respaldos).")
+    carpeta, datos, diario = lista[0]
+    if ocupadas(raiz):
+        raise Ocupado("Hay una ventana o un análisis del programa con un trabajo en marcha; ciérralo antes.")
+    r = Rutas(raiz)
+    cerrojo = Cerrojo(r.cerrojo)
+    if not cerrojo.tomar():
+        raise Ocupado("Ya hay otra actualización en marcha.")
+    try:
+        cerrar_otras(raiz, tiempo=30)
+        id_ = time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
+        prep = carpeta_interna(r.raiz, "preparacion", "deshacer-" + id_)
+        ops, archivos = [], {}
+        est_viejo = leer_json(os.path.join(carpeta, "estado.json"), {}) or {}
+        for o in diario["operaciones"]:
+            dest = destino_seguro(raiz, o["ruta"])
+            actual = _sha_o_none(dest)
+            if o["tipo"] == "nuevo":
+                if actual == o["sha256"]:
+                    ops.append({"ruta": o["ruta"], "tipo": "retirar", "tamano": 0, "sha256": None, "sha_antes": actual})
+                continue
+            copia = os.path.join(carpeta, "archivos", *o["ruta"].split("/"))
+            if not os.path.isfile(copia):
+                raise ErrorActualizacion(f"Falta el respaldo de {o['ruta']}.")
+            shutil.copy2(copia, os.path.join(prep, o["sha_antes"]))
+            ops.append({"ruta": o["ruta"], "tipo": "sustituir" if actual else "nuevo",
+                        "tamano": os.path.getsize(copia), "sha256": o["sha_antes"], "sha_antes": actual})
+        for ruta, info in (est_viejo.get("archivos") or {}).items():
+            archivos[ruta] = info
+        manifiesto = {"archivos": [{"ruta": k, "sha256": v["sha256"], "tamano": v["tamano"]}
+                                   for k, v in archivos.items()]}
+        datos_plan = {"id": id_, "desde": diario["hacia"], "hacia": diario.get("desde") or "?", "manifiesto": manifiesto,
+                      "operaciones": ops, "preparacion": prep}
+        if not manifiesto["archivos"]:
+            manifiesto["archivos"] = []
+        aplicar(raiz, datos_plan, Registro(raiz, eco=print), progreso=lambda i, n, ruta: print(f"  {i}/{n} {ruta}"))
+        confirmar(raiz, Registro(raiz, eco=print))
+        if not est_viejo:
+            try:
+                os.remove(r.json_estado)
+            except OSError:
+                pass
+        else:
+            escribir_json(r.json_estado, est_viejo)
+        shutil.rmtree(prep, ignore_errors=True)
+        print(f"Vuelta a la versión {diario.get('desde')}.")
+        return 0
+    finally:
+        cerrojo.soltar()
+
+
+def main(argv=None):
+    import argparse
+    ap = argparse.ArgumentParser(description="Actualizaciones de Sincronizar Doblaje.")
+    ap.add_argument("orden", choices=("estado", "comprobar", "recuperar", "deshacer", "reparar", "restaurar-version",
+                                      "ayudante", "vigilar"))
+    ap.add_argument("version", nargs="?")
+    ap.add_argument("--instalacion", default=os.path.dirname(os.path.abspath(__file__)))
+    ap.add_argument("--confirmo", action="store_true")
+    ap.add_argument("--sin-ventana", action="store_true")
+    ap.add_argument("--id")
+    ap.add_argument("--pid", type=int)
+    args = ap.parse_args(argv)
+    raiz = os.path.realpath(args.instalacion)
+    if args.orden in ("ayudante", "vigilar"):
+        vigilar = args.id if args.orden == "vigilar" else None
+        ventana = None
+        if not args.sin_ventana and os.environ.get("SINCRONIZAR_ACTUALIZADOR_SIN_VENTANA") != "1":
+            try:
+                sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+                import actualizador_ventana
+                ventana = actualizador_ventana.VentanaAyudante()
+            except Exception as e:
+                Registro(raiz)(f"Sin ventana para el ayudante: {e}")
+        if ventana is not None:
+            return ventana.ejecutar(lambda ui: ejecutar_ayudante(raiz, ui, vigilar, args.pid))
+        return ejecutar_ayudante(raiz, None, vigilar, args.pid)
+    gui = os.path.join(raiz, GUI)
+    version_inst = leer_estado(raiz).get("version") or _version_de(gui) or VERSION
+    try:
+        if args.orden == "estado":
+            est = leer_estado(raiz)
+            print(f"Instalación: {raiz}\nVersión del programa: {_version_de(gui) or '?'}"
+                  f"\nVersión según el actualizador: {est.get('version') or '(nunca actualizado)'}")
+            d = leer_json(Rutas(raiz).diario)
+            print("Actualización pendiente: " + (f"{d['estado']} de la {d.get('desde')} a la {d['hacia']}" if d
+                                                  else "ninguna"))
+            for c, datos, diario in respaldos(raiz):
+                print(f"Respaldo {os.path.basename(c)}: {datos.get('desde')} -> {datos.get('hacia')}, "
+                      f"{(diario or {}).get('estado', '?')}")
+            for i in instancias(raiz):
+                print(f"Abierto: {describir_instancia(i)}" + (" (con un trabajo en marcha)" if i.get("ocupado") else ""))
+            return 0
+        if args.orden == "recuperar":
+            d = leer_json(Rutas(raiz).diario)
+            if not d:
+                print("No hay ninguna actualización a medias.")
+                return 0
+            with Cerrojo(Rutas(raiz).cerrojo) as c:
+                if not c.tomar():
+                    raise Ocupado("Hay una actualización en marcha ahora mismo; espera a que termine.")
+                revertir(raiz, Registro(raiz, eco=print))
+            return 0
+        if args.orden == "deshacer":
+            return deshacer_ultima(raiz)
+        red = Red(registro=Registro(raiz, eco=print))
+        if args.orden == "comprobar":
+            c = comprobar(raiz, version_inst, red)
+            print({"al_dia": f"Al día: la publicada es la {c.pub.version}.",
+                   "disponible": f"Hay una versión nueva: {c.pub.version}.",
+                   "incompatible": f"Hay una versión nueva ({c.pub.version}) pero {c.motivo}."}[c.estado])
+            return 0
+        if args.orden == "reparar":
+            pub, s = obtener_publicacion(red, version=version_inst)
+            return _instalar_publicacion(raiz, pub, s, red, mismo=True)
+        if args.orden == "restaurar-version":
+            if not args.version or not args.confirmo:
+                ap.error("indica la versión y --confirmo (instalar una versión anterior es una decisión explícita)")
+            pub, s = obtener_publicacion(red, version=args.version)
+            return _instalar_publicacion(raiz, pub, s, red, permitir_bajada=True, mismo=True)
+    except ErrorActualizacion as e:
+        print(f"ERROR: {e.mensaje}")
+        return 1
+    return 0
+
+
+def _version_de(ruta_py):
+    """La VERSION que declara un .py sin ejecutarlo."""
+    import ast
+    try:
+        with open(ruta_py, encoding="utf-8") as f:
+            arbol = ast.parse(f.read())
+    except (OSError, SyntaxError, ValueError):
+        return None
+    for x in arbol.body:
+        if isinstance(x, ast.Assign) and any(getattr(t, "id", "") == "VERSION" for t in x.targets):
+            if isinstance(x.value, ast.Constant) and isinstance(x.value.value, str):
+                return x.value.value
+    return None
+
+
+if __name__ == "__main__":
+    sys.exit(main())
