@@ -1,0 +1,2524 @@
+#!/usr/bin/env python3
+"""
+Sincronizar_Doblaje_Gui.py - GUI de sincronizar_doblaje.py
+
+Sincroniza pistas de audio dobladas con la pista original de cada vídeo guiándose
+por la música y los efectos (no por el diálogo): detecta las cortinillas y cambios
+de escena en los que el doblaje dura más o menos, corta en sus silencios y aplica el
+retraso que tenga la pista original, de modo que el resultado se muxea con delay 0. Si
+van a distinta velocidad, se adapta el original; el doblaje no se estira nunca. Los
+subtítulos (del doblaje, del original o de otra versión: se averigua con la voz) se
+corrigen y se llevan al resultado.
+
+Se añaden (o se arrastran a la ventana) los audios doblados, los vídeos originales
+y, si los hay, los subtítulos .srt. Se emparejan por episodio
+(6x05 <-> S06E05) y cada pareja se procesa con sincronizar_doblaje.py en un proceso
+aparte, de uno en uno.
+
+Requiere Python 3 con tkinter. Lo demás lo descarga la propia GUI la primera vez que se
+abre si no está en el equipo: numpy, scipy y tkinterdnd2 en un entorno .venv junto a
+este script (sin tocar el Python del usuario), y ffmpeg/ffprobe en una carpeta "ffmpeg"
+junto a él. Si se abre con un Python sin numpy/scipy y ese .venv ya existe, se relanza
+con él. Para un equipo sin Python: "Iniciar Sincronizar Doblaje.bat".
+"""
+
+import hashlib
+import importlib.util
+import json
+import os
+import queue
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+import zipfile
+
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+VERSION = '1.1'
+AQUI = os.path.dirname(os.path.abspath(__file__))
+SCRIPT = os.path.join(AQUI, "sincronizar_doblaje.py")
+VENV_DIR = os.path.join(AQUI, ".venv")
+VENV_PY = os.path.join(VENV_DIR, "Scripts", "python.exe")
+VENV_PYW = os.path.join(VENV_DIR, "Scripts", "pythonw.exe")
+FFMPEG_LOCAL = os.path.join(AQUI, "ffmpeg")
+if os.path.isfile(os.path.join(FFMPEG_LOCAL, "ffmpeg.exe")) and FFMPEG_LOCAL not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = FFMPEG_LOCAL + os.pathsep + os.environ.get("PATH", "")
+
+sys.path.insert(0, AQUI)
+# Actualizaciones (actualizador.py): lo primero, por si la última se quedó a medias (se deshace y se vuelve a abrir).
+# Sin esos archivos, o si fallan, el programa funciona igual, solo que sin actualizaciones.
+try:
+    import actualizador
+    import actualizador_ventana
+except Exception:
+    actualizador = actualizador_ventana = None
+ARRANQUE_ACT = None
+if actualizador is not None:
+    try:
+        ARRANQUE_ACT = actualizador.al_arrancar(AQUI, VERSION)
+    except Exception:
+        ARRANQUE_ACT = None
+try:
+    import sincronizar_doblaje as sd
+    ERROR_IMPORT = None
+except ImportError as error_import:
+    # Abierta con un Python sin numpy/scipy: se relanza con el entorno .venv de al lado.
+    if (os.path.exists(VENV_PYW) and not os.environ.get("SINCRO_GUI_RELANZADA")
+            and os.path.normcase(sys.executable) != os.path.normcase(VENV_PYW)):
+        subprocess.Popen([VENV_PYW, os.path.abspath(__file__)] + sys.argv[1:],
+                         env=dict(os.environ, SINCRO_GUI_RELANZADA="1"))
+        sys.exit(0)
+    sd = None
+    ERROR_IMPORT = str(error_import)
+
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+except ImportError:
+    DND_FILES = TkinterDnD = None
+
+EXTENSIONES_VIDEO = ('.mkv', '.mp4', '.m4v', '.avi', '.mov', '.wmv', '.ts', '.m2ts')
+FORMATOS_AUDIO = {"flac": "FLAC", "aac": "AAC", "ac3": "AC3", "opus": "Opus"}     # --formato del motor
+EXTENSIONES_SUB = ('.srt',)
+EN_CURSO = ("En cola", "Analizando…", "Montando…", "Forzados…", "Codificando…", "Otras pistas…", "Subtítulos…",
+            "Muxeando…")
+
+
+def open_subprocess(command, **kwargs):
+    kwargs.setdefault('text', True)
+    kwargs.setdefault('encoding', 'utf-8')
+    kwargs.setdefault('errors', 'replace')
+    if os.name == 'nt':
+        try:
+            kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+        except AttributeError:
+            pass
+    return subprocess.Popen(command, **kwargs)
+
+
+def run_subprocess(command, **kwargs):
+    kwargs.setdefault('text', True)
+    if os.name == 'nt':
+        try:
+            kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+        except AttributeError:
+            pass
+    return subprocess.run(command, **kwargs)
+
+
+def python_analisis():
+    """python.exe del mismo entorno. Con pythonw.exe cada ffmpeg que lanza el análisis
+    abriría su propia ventana de consola; python.exe con CREATE_NO_WINDOW no."""
+    carpeta, exe = os.path.split(sys.executable)
+    consola = os.path.join(carpeta, "python.exe")
+    if exe.lower() == "pythonw.exe" and os.path.exists(consola):
+        return consola
+    return sys.executable
+
+
+def borrar(rutas):
+    """Borra archivos a medias; reintenta un momento si ffmpeg aún los tiene abiertos."""
+    for ruta in rutas:
+        for _ in range(10):
+            try:
+                if ruta and os.path.exists(ruta):
+                    os.remove(ruta)
+                break
+            except PermissionError:
+                time.sleep(0.3)
+            except OSError:
+                break
+
+
+# --- Registro del análisis en curso, para poder terminarlo de inmediato con
+# "Detener" o si se cierra la ventana a mitad de un episodio ---
+_current_process_lock = threading.Lock()
+_current_process = None
+
+
+def _registrar_proceso_activo(proceso):
+    global _current_process
+    with _current_process_lock:
+        _current_process = proceso
+
+
+def _limpiar_proceso_activo():
+    global _current_process
+    with _current_process_lock:
+        _current_process = None
+
+
+def terminar_proceso_activo():
+    """Termina (o mata si no responde) el análisis en curso ahora mismo, si lo hay."""
+    with _current_process_lock:
+        proceso = _current_process
+    if proceso and proceso.poll() is None:
+        try:
+            if os.name == 'nt':
+                # /T: también los ffmpeg que haya lanzado el análisis
+                run_subprocess(["taskkill", "/F", "/T", "/PID", str(proceso.pid)], capture_output=True)
+            else:
+                proceso.terminate()
+            proceso.wait(timeout=5)
+            if proceso.poll() is None:
+                proceso.kill()
+                proceso.wait(timeout=5)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Comprobación de dependencias (ffmpeg / ffprobe / módulos de Python)
+# ---------------------------------------------------------------------------
+
+DEPENDENCIES = [
+    {'key': 'ffmpeg', 'label': 'ffmpeg', 'desc': 'decodificar y codificar el audio (imprescindible)'},
+    {'key': 'ffprobe', 'label': 'ffprobe', 'desc': 'leer códec, canales y retraso de cada pista (imprescindible)'},
+    {'key': 'mkvmerge', 'label': 'mkvmerge (MKVToolNix)', 'opcional': True,
+     'desc': 'muxear con la etiqueta de idioma es-ES (opcional: sin él se muxea con ffmpeg y el idioma queda «spa»)'},
+]
+MODULOS = [
+    {'key': 'numpy', 'label': 'numpy', 'opcional': False, 'desc': 'análisis del audio (imprescindible)'},
+    {'key': 'scipy', 'label': 'scipy', 'opcional': False, 'desc': 'correlación y remuestreo (imprescindible)'},
+    {'key': 'tkinterdnd2', 'label': 'tkinterdnd2', 'opcional': True,
+     'desc': 'arrastrar y soltar archivos (opcional: sin él, usa los botones Añadir)'},
+]
+
+
+def check_dependency_binary(command, version_flags=("--version", "-V", "-version")):
+    path = shutil.which(command)
+    result = {'found': path is not None, 'path': path, 'version': None}
+    if not result['found']:
+        return result
+    for flag in version_flags:
+        try:
+            proc = run_subprocess([command, flag], capture_output=True, check=False, timeout=3)
+            if proc.returncode != 0:
+                continue
+            output = ((proc.stdout or "") + (proc.stderr or "")).strip()
+            if output:
+                result['version'] = output.splitlines()[0][:120]
+                break
+        except Exception:
+            continue
+    return result
+
+
+def check_module(nombre):
+    if importlib.util.find_spec(nombre) is None:
+        return {'found': False, 'version': None}
+    try:
+        modulo = __import__(nombre)
+        return {'found': True, 'version': getattr(modulo, '__version__', None)}
+    except Exception:
+        return {'found': False, 'version': None}
+
+
+# ---------------------------------------------------------------------------
+# Primera ejecución: descargar lo que falte
+# ---------------------------------------------------------------------------
+
+PAQUETES = ["numpy", "scipy", "tkinterdnd2"]
+# (zip, lista de sumas SHA-256); si falla la primera fuente se prueba la segunda
+FUENTES_FFMPEG = [
+    ("https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
+     "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip.sha256"),
+    ("https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip",
+     "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/checksums.sha256"),
+]
+
+
+def ffmpeg_disponible():
+    return bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
+
+
+def ejecutar(cmd, log):
+    """Ejecuta un comando mandando su salida a log; error si no termina bien."""
+    proceso = open_subprocess(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
+    for linea in iter(proceso.stdout.readline, ''):
+        if linea.strip():
+            log("  " + linea.rstrip())
+    if proceso.wait() != 0:
+        raise RuntimeError(f"falló: {' '.join(os.path.basename(c) if i == 0 else c for i, c in enumerate(cmd))}")
+
+
+def instalar_modulos(log, progreso):
+    """numpy, scipy y tkinterdnd2 en un entorno .venv junto al programa (el Python del usuario no se toca)."""
+    if not os.path.exists(VENV_PY):
+        log(f"Creando el entorno {VENV_DIR} ...")
+        ejecutar([python_analisis(), "-m", "venv", VENV_DIR], log)
+    log("Descargando e instalando " + ", ".join(PAQUETES) + " ...")
+    ejecutar([VENV_PY, "-m", "pip", "install", "--disable-pip-version-check", "--progress-bar", "off"]
+             + PAQUETES, log)
+    ejecutar([VENV_PY, "-c", "import numpy, scipy.signal; print('numpy', numpy.__version__, 'listo')"], log)
+
+
+def _abrir_url(url, timeout=60):
+    return urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "Sincronizar-Doblaje"}),
+                                  timeout=timeout)
+
+
+def _suma_publicada(url_sumas, nombre):
+    with _abrir_url(url_sumas, 30) as r:
+        texto = r.read().decode("utf-8", "replace")
+    for linea in texto.splitlines():
+        partes = linea.split()
+        if len(partes) == 1 and re.fullmatch(r"[0-9a-fA-F]{64}", partes[0]):
+            return partes[0].lower()                    # archivo con solo la suma (gyan.dev)
+        if len(partes) >= 2 and partes[-1].lstrip("*") == nombre:
+            return partes[0].lower()                    # "suma  nombre" (GitHub)
+    raise RuntimeError("no se encontró la suma SHA-256 publicada")
+
+
+def instalar_ffmpeg(log, progreso):
+    """ffmpeg.exe y ffprobe.exe en la carpeta "ffmpeg" junto al programa; se comprueba su SHA-256."""
+    os.makedirs(FFMPEG_LOCAL, exist_ok=True)
+    zip_tmp = os.path.join(FFMPEG_LOCAL, "descarga.zip")
+    ultimo_error = None
+    for url, url_sumas in FUENTES_FFMPEG:
+        nombre = url.rsplit("/", 1)[1]
+        try:
+            log(f"Descargando {url}")
+            esperada = _suma_publicada(url_sumas, nombre)
+            suma = hashlib.sha256()
+            with _abrir_url(url) as r, open(zip_tmp, "wb") as f:
+                total, hecho = int(r.headers.get("Content-Length") or 0), 0
+                while True:
+                    bloque = r.read(1 << 20)
+                    if not bloque:
+                        break
+                    f.write(bloque)
+                    suma.update(bloque)
+                    hecho += len(bloque)
+                    progreso(hecho, total)
+            if suma.hexdigest() != esperada:
+                raise RuntimeError("la suma SHA-256 no coincide con la publicada")
+            log("  Suma SHA-256 comprobada. Extrayendo ffmpeg.exe y ffprobe.exe ...")
+            extraidos = set()
+            with zipfile.ZipFile(zip_tmp) as z:
+                for miembro in z.namelist():
+                    base = os.path.basename(miembro)
+                    if base in ("ffmpeg.exe", "ffprobe.exe") and base not in extraidos:
+                        with z.open(miembro) as origen, open(os.path.join(FFMPEG_LOCAL, base), "wb") as destino:
+                            shutil.copyfileobj(origen, destino)
+                        extraidos.add(base)
+            if len(extraidos) < 2:
+                raise RuntimeError("el zip no trae ffmpeg.exe y ffprobe.exe")
+            break
+        except Exception as e:
+            ultimo_error = e
+            log(f"  No se pudo con esta fuente: {e}")
+        finally:
+            borrar([zip_tmp])
+    else:
+        raise RuntimeError(f"no se pudo descargar ffmpeg ({ultimo_error})")
+    if FFMPEG_LOCAL not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = FFMPEG_LOCAL + os.pathsep + os.environ.get("PATH", "")
+    log(f"ffmpeg listo en {FFMPEG_LOCAL}")
+
+
+class Instalador:
+    """Pregunta si descargar lo que falta y, si se acepta, lo hace enseñando el progreso.
+    al_terminar(ok) recibe True si todo fue bien, False si falló y None si se rechazó."""
+
+    def __init__(self, ventana, mensaje, tareas, palette, al_terminar):
+        self.win, self.tareas, self.pal, self.al_terminar = ventana, tareas, palette, al_terminar
+        self.q = queue.Queue()
+        self.ok = None
+        ventana.title("Sincronizar Doblaje · componentes")
+        ventana.configure(background=palette['bg'])
+        ventana.resizable(False, False)
+        self.marco = tk.Frame(ventana, background=palette['bg'], padx=22, pady=16)
+        self.marco.pack(fill="both", expand=True)
+        self.titulo = tk.StringVar(value=mensaje)
+        tk.Label(self.marco, textvariable=self.titulo, background=palette['bg'], foreground=palette['fg'],
+                 wraplength=560, justify="left").pack(anchor="w")
+        self.botones = tk.Frame(self.marco, background=palette['bg'])
+        self.botones.pack(pady=(16, 0))
+        ttk.Button(self.botones, text="Descargar e instalar", command=self._empezar).pack(side="left", padx=5)
+        ttk.Button(self.botones, text="Ahora no", command=lambda: self._cerrar(None)).pack(side="left", padx=5)
+        ventana.protocol("WM_DELETE_WINDOW", lambda: self._cerrar(None))
+
+    def _empezar(self):
+        self.botones.destroy()
+        self.detalle = tk.StringVar(value="")
+        self.barra = ttk.Progressbar(self.marco, mode="indeterminate", length=560)
+        self.barra.pack(fill="x", pady=(12, 2))
+        tk.Label(self.marco, textvariable=self.detalle, background=self.pal['bg'], foreground=self.pal['muted'],
+                 anchor="w").pack(fill="x")
+        self.texto = tk.Text(self.marco, height=14, width=78, state=tk.DISABLED, wrap="word",
+                             background=self.pal['entry_bg'], foreground=self.pal['entry_fg'])
+        self.texto.pack(fill="both", expand=True, pady=(6, 0))
+        self.cerrar = ttk.Button(self.marco, text="Cerrar", state=tk.DISABLED, command=lambda: self._cerrar(self.ok))
+        self.cerrar.pack(pady=(10, 0))
+        self.win.protocol("WM_DELETE_WINDOW", lambda: None)     # no se cierra a medias
+        self.barra.start(12)
+        threading.Thread(target=self._trabajar, daemon=True).start()
+        self.win.after(100, self._sondear)
+
+    def _trabajar(self):
+        for titulo, funcion in self.tareas:
+            self.q.put(("titulo", titulo))
+            try:
+                funcion(lambda m: self.q.put(("log", m)), lambda h, t: self.q.put(("prog", (h, t))))
+            except Exception as e:
+                self.q.put(("log", f"ERROR: {e}"))
+                self.q.put(("fin", False))
+                return
+        self.q.put(("fin", True))
+
+    def _sondear(self):
+        try:
+            while True:
+                tipo, dato = self.q.get_nowait()
+                if tipo == "titulo":
+                    self.titulo.set(dato)
+                    self.detalle.set("")
+                    self.barra.configure(mode="indeterminate")
+                    self.barra.start(12)
+                elif tipo == "log":
+                    self.texto.config(state=tk.NORMAL)
+                    self.texto.insert(tk.END, dato + "\n")
+                    self.texto.see(tk.END)
+                    self.texto.config(state=tk.DISABLED)
+                elif tipo == "prog":
+                    hecho, total = dato
+                    if total:
+                        self.barra.stop()
+                        self.barra.configure(mode="determinate", maximum=total, value=hecho)
+                        self.detalle.set(f"{hecho / 1048576:.1f} de {total / 1048576:.1f} MB")
+                elif tipo == "fin":
+                    self.ok = dato
+                    self.barra.stop()
+                    self.barra.configure(mode="determinate", maximum=1, value=1 if dato else 0)
+                    self.titulo.set("Listo: ya está todo lo necesario." if dato else
+                                    "No se pudo completar la descarga; el detalle está abajo.")
+                    self.cerrar.config(state=tk.NORMAL)
+                    self.win.protocol("WM_DELETE_WINDOW", lambda: self._cerrar(self.ok))
+                    if dato:
+                        self.win.after(1200, lambda: self._cerrar(True))
+                    return
+        except queue.Empty:
+            pass
+        self.win.after(100, self._sondear)
+
+    def _cerrar(self, ok):
+        if self.win is not None:
+            self.win, ventana = None, self.win
+            self.al_terminar(ok)
+            try:
+                ventana.destroy()
+            except tk.TclError:
+                pass
+
+
+def mensaje_componentes(modulos, ffmpeg):
+    partes = []
+    if modulos:
+        partes.append("numpy y scipy, para analizar el audio (unos 60 MB). Se instalan en una carpeta "
+                      "«.venv» junto al programa, sin tocar el Python del equipo.")
+    if ffmpeg:
+        partes.append("ffmpeg y ffprobe, para leer y escribir el audio (unos 110 MB, de gyan.dev). "
+                      "Se guardan en una carpeta «ffmpeg» junto al programa.")
+    return ("Faltan componentes para que el programa funcione:\n\n• " + "\n• ".join(partes) +
+            "\n\n¿Descargarlos ahora? Solo hace falta la primera vez.")
+
+
+# ---------------------------------------------------------------------------
+# Informe de sincronizar_doblaje.py -> datos para la GUI
+# ---------------------------------------------------------------------------
+
+RE_CORTE = re.compile(r"^Corte\s+(\S+)\s+(inserta|recorta)\s+(\d+) ms\s+\[(.+?), suelo (-?\d+) dB\]")
+RE_MUSICA = re.compile(r"^Sin corte\s+(\S+)-(\S+)\s+la música del doblaje va ([+-]?[\d.]+) s")
+RE_DERIVA = re.compile(r"^Deriva de velocidad: ([+-]?[\d.]+) ppm \(([+-]?\d+) ms")
+RE_INICIO = re.compile(r"^Inicio: (recortados|añadidos) (\d+) ms")
+RE_RETRASO = re.compile(r"^Retraso de la pista original aplicado al principio: (\d+) ms")
+RE_VERIF = re.compile(r"^Verificación(?: \((?:con la pista guía|con el vídeo)\))?: "
+                      r"desviación típica ([\d.]+) ms, p90 ([\d.]+) ms")
+RE_PISTA = re.compile(r"^Se sincroniza la pista (\d+)(?:; guía: pista (\d+))?")
+RE_SUBS = re.compile(r"^Subtítulos: (\d+) líneas .*-> (.+)$")
+RE_MUX = re.compile(r"^Muxeado: (.+) \((primer audio.+)\)$")     # la ruta puede llevar paréntesis
+RE_RELLENO = re.compile(r"^Relleno\s+(\S+)\s+(\d+) ms\s+con el audio original \((\S+)-(\S+) del original, "
+                        r"([+-]?[\d.]+) dB\)")
+RE_MUX_EXISTE = re.compile(r"^Ya existe el vídeo muxeado, no se toca: (.+)$")
+RE_MUX_ERROR = re.compile(r"^No se pudo muxear: (.+)$")
+RE_FORZ = re.compile(r"^Forzados quemados: (\d+) subtítulos .*-> (.+)$")
+RE_TIEMPO = re.compile(r"^Tiempo(?: total, con el muxeado| hasta el error)?: (.+)$")
+RE_FORZ_EXISTE = re.compile(r"^Forzados: ya existe (.+); se usa ese$")
+RE_PISTA_EXTRA = re.compile(r"^Pista del doblaje (\d+): (.+?): sincronizada con los mismos cortes -> (.+?)"
+                            r"(?: \((?:intacta|FLAC|AAC|AC3|E-AC3|Opus)[^)]*\))?$")
+RE_VELOCIDAD = re.compile(r"^Velocidad(?: \([^)]*\))?: (.+?); se adapta el original")
+RE_VARIABLE = re.compile(r"^Velocidad variable: el castellano se estira siguiendo la del original \((.+?)\)")
+RE_REPARTO = re.compile(r"^Deriva(?: que queda)?: ([+-]?\d+) ms en todo el episodio; se reparte.*±(\d+) ms\)$")
+RE_AUDIO_DOBLADO = re.compile(r"^Audio doblado: (.+)$")
+RE_SUB_DOB = re.compile(r"^Subtítulo del doblaje (\d+): (.+?): (?:(\d+) líneas ajustadas -> (.+)|ya existe (.+); se usa ese"
+                        r"|(es de imagen).*|no se ha podido extraer.*)$")
+
+
+def a_segundos(texto):
+    minutos, segundos = texto.split(":")
+    return int(minutos) * 60 + float(segundos)
+
+
+def leer_lineas(ruta):
+    try:
+        with open(ruta, encoding="utf-8", errors="replace") as f:
+            return f.read().splitlines()
+    except OSError:
+        return []
+
+
+class Globo:
+    """Texto de ayuda que aparece al dejar el cursor quieto sobre un control, y se va al salir o al pulsar. Las
+    explicaciones de cada opción iban escritas al lado y formaban un ladrillo (pedido del usuario, 21-10-2026).
+    paleta: función que da los colores del tema del momento (claro u oscuro)."""
+
+    def __init__(self, widget, texto, paleta, espera=450, ancho=460):
+        self.widget, self.texto, self.paleta, self.espera, self.ancho = widget, texto, paleta, espera, ancho
+        self.ventana = self.pendiente = None
+        widget.bind("<Enter>", self._programar, add="+")
+        widget.bind("<Leave>", self._ocultar, add="+")
+        widget.bind("<ButtonPress>", self._ocultar, add="+")
+
+    def _programar(self, _=None):
+        self._cancelar()
+        self.pendiente = self.widget.after(self.espera, self._mostrar)
+
+    def _cancelar(self):
+        if self.pendiente:
+            self.widget.after_cancel(self.pendiente)
+            self.pendiente = None
+
+    def _mostrar(self):
+        self.pendiente = None
+        if self.ventana or not self.widget.winfo_viewable():
+            return
+        pal = self.paleta()
+        self.ventana = v = tk.Toplevel(self.widget)
+        v.wm_overrideredirect(True)
+        v.attributes("-topmost", True)
+        tk.Label(v, text=self.texto, justify="left", wraplength=self.ancho, background=pal['entry_bg'],
+                 foreground=pal['fg'], relief="solid", borderwidth=1, padx=8, pady=6).pack()
+        v.update_idletasks()
+        # debajo del control y sin salirse de la pantalla (si no cabe debajo, encima)
+        w, h = v.winfo_width(), v.winfo_height()
+        x = min(self.widget.winfo_rootx() + 12, v.winfo_screenwidth() - w - 8)
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        if y + h > v.winfo_screenheight() - 8:
+            y = self.widget.winfo_rooty() - h - 4
+        v.wm_geometry(f"+{max(0, x)}+{max(0, y)}")
+
+    def _ocultar(self, _=None):
+        self._cancelar()
+        if self.ventana:
+            self.ventana.destroy()
+            self.ventana = None
+
+
+def leer_informe(lineas):
+    """Extrae del informe (o de la salida en vivo) los cortes, avisos y el mapa de tiempos."""
+    r = dict(cortes=[], musica=[], rellenos=[], avisos=[], mapa=None, deriva=None, inicio=None,
+             retraso=None, verif=None, subs=None, error=None, pista=None, guia=None, pistas=None, video=False,
+             mux=None, mux_info=None, mux_error=None, forzados=None, forz_nota=None, subs_dob=[], pistas_extra=[],
+             velocidad=None, audio_doblado=None, reparto=None, pista_ori=None, variable=None, tiempo=None)
+    en_avisos = False
+    for linea in lineas:
+        if linea.startswith("Señal de análisis: vídeo"):
+            r['video'] = True
+        elif (m := RE_VELOCIDAD.match(linea)):
+            r['velocidad'] = m[1]
+        elif (m := RE_VARIABLE.match(linea)):
+            r['variable'] = m[1]
+        elif (m := RE_REPARTO.match(linea)):
+            r['reparto'] = (int(m[1]), int(m[2]))
+        elif (m := RE_AUDIO_DOBLADO.match(linea)):
+            r['audio_doblado'] = m[1]
+        elif (m := RE_PISTA_EXTRA.match(linea)):
+            r['pistas_extra'].append((int(m[1]), m[2], m[3]))
+        elif (m := RE_SUB_DOB.match(linea)):
+            # (n.º, descripción, ruta ajustada o None, de imagen)
+            r['subs_dob'].append((int(m[1]), m[2], m[4] or m[5], bool(m[6])))
+        elif (m := RE_FORZ.match(linea)):
+            r['forzados'] = (int(m[1]), m[2])
+        elif (m := RE_FORZ_EXISTE.match(linea)):
+            r['forzados'] = (None, m[1])
+        elif linea.startswith("Forzados: "):
+            r['forz_nota'] = linea[len("Forzados: "):]
+        elif (m := RE_MUX.match(linea)):
+            r['mux'], r['mux_info'], r['mux_error'] = m[1], m[2], None
+        elif (m := RE_RELLENO.match(linea)):
+            r['rellenos'].append(dict(t=a_segundos(m[1]), txt=m[1], ms=int(m[2]), o0=m[3], o1=m[4], db=float(m[5])))
+        elif (m := RE_MUX_EXISTE.match(linea)):
+            r['mux'], r['mux_info'] = m[1], "ya existía; no se ha tocado"
+        elif (m := RE_MUX_ERROR.match(linea)):
+            r['mux_error'] = m[1]
+        elif (m := RE_CORTE.match(linea)):
+            r['cortes'].append(dict(t=a_segundos(m[1]), txt=m[1], accion=m[2], ms=int(m[3]),
+                                    tipo=m[4], suelo=int(m[5])))
+        elif (m := RE_MUSICA.match(linea)):
+            r['musica'].append(dict(t0=a_segundos(m[1]), t1=a_segundos(m[2]),
+                                    txt=f"{m[1]}-{m[2]}", d=float(m[3])))
+        elif (m := RE_DERIVA.match(linea)):
+            r['deriva'] = (float(m[1]), int(m[2]))
+        elif (m := RE_INICIO.match(linea)):
+            r['inicio'] = (m[1], int(m[2]))
+        elif (m := RE_RETRASO.match(linea)):
+            r['retraso'] = int(m[1])
+        elif (m := RE_VERIF.match(linea)):
+            r['verif'] = (float(m[1]), float(m[2]))
+        elif (m := RE_SUBS.match(linea)):
+            r['subs'] = (int(m[1]), m[2])
+        elif (m := RE_PISTA.match(linea)):
+            r['pista'], r['guia'] = int(m[1]), (int(m[2]) if m[2] else None)
+        elif linea.startswith("Pistas del doblaje: "):
+            r['pistas'] = linea[len("Pistas del doblaje: "):]
+        elif (m := re.match(r"Pista del original: (\d+):", linea)):
+            r['pista_ori'] = int(m[1])
+        elif (m := RE_TIEMPO.match(linea)):
+            # el del análisis, con su desglose; si luego se muxea, el total con el muxeado delante
+            if linea.startswith("Tiempo hasta el error"):
+                r['tiempo'] = f"hasta el error, {m[1]}"
+            elif linea.startswith("Tiempo total") and r['tiempo']:
+                r['tiempo'] = f"{m[1]} en total con el muxeado; el análisis, {r['tiempo']}"
+            else:
+                r['tiempo'] = m[1]
+        elif linea.startswith("Mapa: "):
+            try:
+                r['mapa'] = json.loads(linea[6:])
+            except ValueError:
+                pass
+        elif linea.startswith("ERROR"):
+            r['error'] = linea
+        elif linea.startswith("Avisos:"):
+            en_avisos = True
+        elif en_avisos and linea.startswith("  - "):
+            r['avisos'].append(linea[4:])
+        else:
+            en_avisos = False
+    for c in r['cortes']:
+        c['aviso'] = any(a.startswith(f"corte {c['txt']}") for a in r['avisos'])
+    return r
+
+
+def resumen_corto(res):
+    if not res:
+        return ""
+    if res['error']:
+        return res['error'].replace("ERROR: ", "")[:90] + (
+            f" · al cabo de {tiempo_corto(res['tiempo'])}" if res['tiempo'] else "")
+    n = len(res['cortes'])
+    # sin mapa no hay análisis en el informe (p. ej. solo se ha muxeado un audio hecho fuera)
+    partes = [f"{n} corte{'s' if n != 1 else ''}"] if res['mapa'] or n else []
+    if res['subs'] and not res['mapa']:         # solo subtítulos
+        partes.append(f"{res['subs'][0]} subtítulos")
+    if res['verif']:
+        partes.append(f"{res['verif'][0]:.1f} ms" + (" (vídeo)" if res['video'] else ""))
+    if res['musica']:
+        partes.append("música desplazada")
+    if res['rellenos']:
+        partes.append(f"{sum(r['ms'] for r in res['rellenos']) / 1000:.0f} s de la RAW")
+    if res['forzados'] and res['forzados'][0]:
+        partes.append(f"{res['forzados'][0]} forzados")
+    if res['mux_error']:
+        partes.append("sin muxear")
+    elif res['mux']:
+        partes.append("muxeado")
+    if res['tiempo']:
+        partes.append(tiempo_corto(res['tiempo']))
+    return " · ".join(partes)
+
+
+def texto_avisos(res):
+    """« · 1 a revisar · 3 avisos» (los que dicen que algo puede estar mal y los que solo piden escuchar)."""
+    n_rev = sum(1 for a in res['avisos'] if a.startswith("[revisar] "))
+    n = len(res['avisos']) - n_rev
+    return ((f" · {n_rev} a revisar" if n_rev else "") + (f" · {n} aviso{'s' if n > 1 else ''}" if n else ""))
+
+
+def tiempo_corto(t):
+    """La primera duración del texto del tiempo («14 min 5 s»): la total, o la del análisis si no se muxeó."""
+    m = re.search(r"\d+ min \d+ s|\d+ s", t)
+    return m[0] if m else t
+
+
+# ---------------------------------------------------------------------------
+# Lista de trabajos
+# ---------------------------------------------------------------------------
+
+class Trabajo:
+    """Una fila de la lista: un doblaje con su original y, si lo hay, su subtítulo."""
+
+    def __init__(self, clave):
+        self.clave = clave              # (temporada, episodio) o None
+        self.doblaje = self.original = self.sub = None
+        self.sub_quitado = False        # el usuario quitó el subtítulo: no se vuelve a poner solo
+        self.sub_auto = False           # el subtítulo lo ha puesto el programa (el .srt que se llama como el original)
+        self.nombre_mux = None         # nombre y título del vídeo muxeado puestos a mano; None = plantilla
+        self.correcciones = ""          # ajustes a mano del castellano (sd.leer_correcciones), p. ej. "-100; 15:44-16:09 +700"
+        self.plan_mux = None            # el que se usa al procesar (se calcula al empezar)
+        self.estado = None              # None = según lo que falte
+        self.log = []
+        self.res = None
+        self.salida = None
+        self.inicio = None
+        self.quitado = False
+
+    def completo(self):
+        return bool(self.doblaje and self.original)
+
+    def solo_subs(self):
+        """Vídeo y subtítulo sin doblaje: el vídeo ya está hecho (un final con su audio) y solo se le ajusta el
+        subtítulo, comparándolo con su voz, y se muxea en un MKV nuevo si está marcado muxear. Solo si el subtítulo
+        lo ha puesto el usuario: un original sin doblaje con su .srt al lado no se procesa por su cuenta."""
+        return bool(self.original and self.sub and not self.doblaje and not self.sub_auto)
+
+    def procesable(self):
+        return self.completo() or self.solo_subs()
+
+    def texto_estado(self):
+        if self.estado:
+            return self.estado
+        if self.solo_subs():
+            return "Solo subtítulos"
+        if not self.doblaje:
+            return "Falta doblaje"
+        if not self.original:
+            return "Falta la RAW"
+        return "Listo · con correcciones a mano" if self.correcciones else "Listo"
+
+    def etiqueta(self):
+        return f"{self.clave[0]}x{self.clave[1]:02d}" if self.clave else "—"
+
+
+def rol_por_extension(ruta):
+    ext = os.path.splitext(ruta)[1].lower()
+    if ext in EXTENSIONES_SUB:
+        return "sub"
+    if ext in EXTENSIONES_VIDEO:
+        return "original"
+    if ext in sd.AUDIO_EXT:
+        return "doblaje"
+    return None
+
+
+# ===========================================================================
+# GUI
+# ===========================================================================
+
+LIGHT_PALETTE = {
+    'bg': '#f0f0f0', 'fg': '#000000',
+    'entry_bg': '#ffffff', 'entry_fg': '#000000',
+    'button_bg': '#e1e1e1',
+    'select_bg': '#0078d7', 'select_fg': '#ffffff',
+    'muted': '#555555', 'grid': '#e3e3e3', 'curva': '#0078d7',
+    'ok': '#2e8b1f', 'error': '#C62828', 'aviso': '#c46a00', 'zona': '#f6dfb0', 'relleno': '#7b5cc4',
+}
+DARK_PALETTE = {
+    'bg': '#2b2b2b', 'fg': '#f5f5f5',
+    'entry_bg': '#3c3f41', 'entry_fg': '#f5f5f5',
+    'button_bg': '#3c3f41',
+    'select_bg': '#4a90d9', 'select_fg': '#ffffff',
+    'muted': '#a8a8a8', 'grid': '#4a4d50', 'curva': '#5aa2f0',
+    'ok': '#5cc74a', 'error': '#ef5350', 'aviso': '#f0a030', 'zona': '#5b4a26', 'relleno': '#b39ddb',
+}
+
+
+def themed_messagebox(parent, title, message, palette, buttons="ok"):
+    """
+    Cuadro de diálogo modal dibujado a mano con los colores del tema actual
+    (claro/oscuro). tkinter.messagebox SIEMPRE usa el aspecto nativo del
+    sistema operativo y no respeta los estilos ttk de la app.
+
+    buttons: "ok" (un solo botón; siempre devuelve True), "okcancel"
+    (Aceptar/Cancelar) o "yesno" (Sí/No); en los dos últimos devuelve True si
+    se acepta/Sí, False si se cancela/No o se cierra la ventana.
+    """
+    dialog = tk.Toplevel(parent)
+    dialog.title(title)
+    dialog.configure(background=palette['bg'])
+    dialog.transient(parent)
+    dialog.resizable(False, False)
+
+    resultado = {"value": False}
+
+    frame = tk.Frame(dialog, background=palette['bg'], padx=25, pady=20)
+    frame.pack(fill="both", expand=True)
+
+    tk.Label(frame, text=message, background=palette['bg'], foreground=palette['fg'],
+             wraplength=420, justify="left").pack(pady=(0, 20))
+
+    btn_frame = tk.Frame(frame, background=palette['bg'])
+    btn_frame.pack()
+
+    def aceptar():
+        resultado["value"] = True
+        dialog.destroy()
+
+    def cancelar():
+        resultado["value"] = False
+        dialog.destroy()
+
+    if buttons == "okcancel":
+        ttk.Button(btn_frame, text="Aceptar", command=aceptar, width=10).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="Cancelar", command=cancelar, width=10).pack(side="left", padx=5)
+        dialog.protocol("WM_DELETE_WINDOW", cancelar)
+    elif buttons == "yesno":
+        ttk.Button(btn_frame, text="Sí", command=aceptar, width=10).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="No", command=cancelar, width=10).pack(side="left", padx=5)
+        dialog.protocol("WM_DELETE_WINDOW", cancelar)
+    else:
+        ttk.Button(btn_frame, text="Aceptar", command=aceptar, width=10).pack()
+        dialog.protocol("WM_DELETE_WINDOW", aceptar)
+
+    dialog.update_idletasks()
+    try:
+        x = parent.winfo_rootx() + (parent.winfo_width() // 2) - (dialog.winfo_width() // 2)
+        y = parent.winfo_rooty() + (parent.winfo_height() // 2) - (dialog.winfo_height() // 2)
+        dialog.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+    except Exception:
+        pass
+
+    dialog.grab_set()
+    dialog.wait_window()
+    return resultado["value"]
+
+
+def themed_askstring(parent, title, message, initial, palette, auto_label=None):
+    """Pide un texto con los colores del tema. Devuelve el texto, "" si se pulsa auto_label
+    (volver a lo automático) o None si se cancela."""
+    dialog = tk.Toplevel(parent)
+    dialog.title(title)
+    dialog.configure(background=palette['bg'])
+    dialog.transient(parent)
+    dialog.resizable(False, False)
+    resultado = {"value": None}
+    frame = tk.Frame(dialog, background=palette['bg'], padx=25, pady=20)
+    frame.pack(fill="both", expand=True)
+    tk.Label(frame, text=message, background=palette['bg'], foreground=palette['fg'],
+             wraplength=640, justify="left").pack(anchor="w", pady=(0, 10))
+    texto = tk.StringVar(value=initial)
+    entrada = ttk.Entry(frame, textvariable=texto, width=95)
+    entrada.pack(fill="x", pady=(0, 20))
+    btn_frame = tk.Frame(frame, background=palette['bg'])
+    btn_frame.pack()
+
+    def cerrar(valor):
+        resultado["value"] = valor
+        dialog.destroy()
+
+    ttk.Button(btn_frame, text="Aceptar", width=10, command=lambda: cerrar(texto.get().strip())).pack(side="left", padx=5)
+    if auto_label:
+        ttk.Button(btn_frame, text=auto_label, command=lambda: cerrar("")).pack(side="left", padx=5)
+    ttk.Button(btn_frame, text="Cancelar", width=10, command=lambda: cerrar(None)).pack(side="left", padx=5)
+    dialog.protocol("WM_DELETE_WINDOW", lambda: cerrar(None))
+    dialog.bind("<Return>", lambda e: cerrar(texto.get().strip()))
+    dialog.bind("<Escape>", lambda e: cerrar(None))
+    dialog.update_idletasks()
+    try:
+        x = parent.winfo_rootx() + (parent.winfo_width() // 2) - (dialog.winfo_width() // 2)
+        y = parent.winfo_rooty() + (parent.winfo_height() // 2) - (dialog.winfo_height() // 2)
+        dialog.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+    except Exception:
+        pass
+    entrada.focus_set()
+    entrada.icursor("end")
+    dialog.grab_set()
+    dialog.wait_window()
+    return resultado["value"]
+
+
+AJUSTES = os.path.join(AQUI, "Sincronizar_Doblaje_ajustes.json")
+
+
+# --- Función para manejar el cierre de la ventana ---
+def on_closing(root, app):
+    """Se llama al intentar cerrar la ventana principal."""
+    ocupado = app.worker_thread is not None and app.worker_thread.is_alive()
+    mensaje = ("Hay un episodio sincronizándose; se detendrá y se borrará lo que lleve a medias.\n"
+               "¿Seguro que quieres salir?") if ocupado else "¿Seguro que quieres salir?"
+    if themed_messagebox(root, "Salir", mensaje, app._get_palette(), buttons="okcancel"):
+        app.stop_event.set()
+        terminar_proceso_activo()
+        borrar(app.en_curso_salidas)
+        root.destroy()
+
+
+class App:
+
+    def _get_palette(self):
+        return DARK_PALETTE if self.dark_mode_var.get() else LIGHT_PALETTE
+
+    def _show_info(self, title, message):
+        themed_messagebox(self.master, title, message, self._get_palette(), buttons="ok")
+
+    def _show_warning(self, title, message):
+        themed_messagebox(self.master, title, message, self._get_palette(), buttons="ok")
+
+    def _show_error(self, title, message):
+        themed_messagebox(self.master, title, message, self._get_palette(), buttons="ok")
+
+    def _ask_yesno(self, title, message):
+        return themed_messagebox(self.master, title, message, self._get_palette(), buttons="yesno")
+
+    def _ask_okcancel(self, title, message):
+        return themed_messagebox(self.master, title, message, self._get_palette(), buttons="okcancel")
+
+    def __init__(self, master, dnd=False):
+        self.master = master
+        # la versión del código cargado al abrir: una ventana abierta antes de actualizar sigue con el código de antes
+        # (23-10-2026: una ventana del Servidor seguía con el fallo de la tanda ya arreglado y no había forma de verlo).
+        # En la copia de desarrollo el número no cambia hasta publicar: ahí va también la fecha del código.
+        version = VERSION
+        if os.path.isfile(os.path.join(AQUI, "publicacion", "publicar_version.py")):
+            try:
+                version += " · desarrollo, código del " + time.strftime("%d-%m-%Y %H:%M", time.localtime(max(
+                    os.path.getmtime(__file__), os.path.getmtime(sd.__file__))))
+            except OSError:
+                pass
+        master.title(f"Sincronizar Doblaje con la RAW · versión {version}")
+        master.geometry("1060x900")
+        master.minsize(860, 600)
+
+        self.dnd = dnd
+        self.dark_mode_var = tk.BooleanVar(value=True)       # tema oscuro de serie (pedido del usuario, 13-10-2026)
+        self.dependency_status = {}
+        self.dependency_row_vars = {}
+        self.dependency_icon_labels = {}
+
+        self.trabajos = []
+        self._por_iid = {}
+        self.output_folder = tk.StringVar()
+        self.sobrescribir = tk.BooleanVar(value=False)
+        self.rellenar = tk.BooleanVar(value=True)
+        self.otras_pistas = tk.BooleanVar(value=True)
+        self.estirar_variable = tk.BooleanVar(value=False)    # velocidad variable (VHS): estirar en vez de cortar
+        self.forzados = tk.BooleanVar(value=False)
+        self.limpiar = tk.BooleanVar(value=False)     # VHS: quitar el ruido de la cinta del castellano (limpiar_vhs)
+        self.decodificar = tk.StringVar(value="cpu")      # clave de sd.DECODIFICADORES
+        self.formato = tk.StringVar(value="flac")         # clave de FORMATOS_AUDIO
+        self.respuesta_tanda = None     # «hacer lo mismo con el resto de esta tanda» al preguntar sin cortes
+        self.muxear = tk.BooleanVar(value=True)
+        self.mux_idioma = tk.StringVar(value="es-ES")
+        self.mux_titulo = tk.StringVar(value="Castellano")
+        self.plantilla = tk.StringVar(value="")
+        self._cache_nombres = {}        # (función, archivo) -> nombre del episodio o título del archivo
+        if actualizador is not None:
+            try:                        # si no puede, los deja como estaban
+                actualizador.migrar_ajustes(AQUI, AJUSTES)
+            except Exception:
+                pass
+        self._cargar_ajustes()
+        self.act = None                 # actualizaciones: versión, botón «Actualizar» y su ventana
+        if actualizador is not None:
+            try:
+                versiones = {"Sincronizar_Doblaje_Gui": VERSION, "sincronizar_doblaje": getattr(sd, "VERSION", None),
+                             "limpiar_vhs": getattr(getattr(sd, "limpiar_vhs", None), "VERSION", None),
+                             "actualizador": actualizador.VERSION, "actualizador_ventana": actualizador_ventana.VERSION}
+                self.act = actualizador_ventana.Integracion(self, actualizador, AQUI, versiones, ARRANQUE_ACT,
+                                                            Trabajo, leer_informe, EN_CURSO, self._get_palette)
+            except Exception:
+                self.act = None
+
+        self.progress_queue = queue.Queue()
+        self.stop_event = threading.Event()
+        self.worker_thread = None
+        self.actual = None              # (trabajo, n, total) del episodio en curso
+        self.en_curso_salidas = []      # salidas del episodio en curso, para borrarlas si se cancela
+        self._terminados = 0
+
+        self._setup_gui()
+        self.apply_theme()
+        self.check_dependencies()
+        self.master.after(150, self._poll_queue)
+        if not ffmpeg_disponible():
+            self.master.after(600, self._offer_downloads)
+        if self.act is not None:
+            try:
+                self.act.empezar()
+            except Exception:
+                pass
+
+    def _offer_downloads(self):
+        """Descarga ffmpeg si falta (numpy/scipy ya están: si faltaran, la GUI no habría llegado a abrirse)."""
+        if ffmpeg_disponible():
+            self._show_info("Nada que descargar", "Ya está todo lo necesario.")
+            return
+        ventana = tk.Toplevel(self.master)
+        ventana.transient(self.master)
+
+        def fin(ok):
+            ventana.grab_release()
+            self.check_dependencies()
+            if ok:
+                self.status_text.set("ffmpeg descargado. Ya se puede sincronizar.")
+
+        Instalador(ventana, mensaje_componentes(False, True),
+                   [("Descargando ffmpeg...", instalar_ffmpeg)], self._get_palette(), fin)
+        ventana.update_idletasks()
+        try:
+            x = self.master.winfo_rootx() + (self.master.winfo_width() - ventana.winfo_width()) // 2
+            y = self.master.winfo_rooty() + 120
+            ventana.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        except tk.TclError:
+            pass
+        ventana.grab_set()
+
+    # ------------------------------------------------------------------
+    def _setup_gui(self):
+        self.canvas = canvas = tk.Canvas(self.master, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(self.master, orient="vertical", command=canvas.yview)
+        self.scrollable_frame = ttk.Frame(canvas)
+        self.scrollable_frame.bind(
+            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        ventana = canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        # el contenido ocupa todo el ancho de la ventana
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(ventana, width=e.width))
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        self.master.bind_all("<MouseWheel>", self._on_mousewheel)
+
+        master = self.scrollable_frame
+        master.grid_columnconfigure(0, weight=1)
+        row = 0
+
+        # --- Barra de tema ---
+        theme_bar_frame = ttk.Frame(master)
+        theme_bar_frame.grid(row=row, column=0, padx=10, pady=(5, 0), sticky="e")
+        ttk.Label(theme_bar_frame, text="Tema:").pack(side="left", padx=(0, 5))
+        self.theme_mode_var = tk.StringVar(value="Oscuro" if self.dark_mode_var.get() else "Claro")
+        self.theme_menu = ttk.OptionMenu(
+            theme_bar_frame, self.theme_mode_var, self.theme_mode_var.get(),
+            "Claro", "Oscuro", command=self._on_theme_mode_change
+        )
+        self.theme_menu.pack(side="right")
+        if self.act is not None:        # a la izquierda de la misma fila: la versión y, si hay una nueva, «Actualizar»
+            try:
+                self.act.crear_barra(master).grid(row=row, column=0, padx=10, pady=(5, 0), sticky="w")
+            except Exception:
+                pass
+        row += 1
+
+        # --- Dependencias externas: plegadas en una línea con el resumen; «Mostrar» despliega el detalle (pedido del
+        # usuario, 21-10-2026: ocupaban mucho). Si falta algo obligatorio, se despliegan solas ---
+        deps_frame = ttk.LabelFrame(master, text="Dependencias Externas")
+        deps_frame.grid(row=row, column=0, padx=10, pady=5, sticky="ew")
+        deps_frame.grid_columnconfigure(0, weight=1)
+        cabecera = ttk.Frame(deps_frame)
+        cabecera.grid(row=0, column=0, padx=5, pady=2, sticky="ew")
+        self.deps_resumen = tk.StringVar(value="⏳ Comprobando...")
+        self.deps_resumen_label = ttk.Label(cabecera, textvariable=self.deps_resumen, cursor="hand2")
+        self.deps_resumen_label.pack(side="left")
+        self.deps_resumen_label.bind("<Button-1>", lambda e: self._plegar_dependencias())
+        self.deps_boton = ttk.Button(cabecera, text="Mostrar ▾", width=11, command=self._plegar_dependencias)
+        self.deps_boton.pack(side="right")
+        self.deps_abiertas = False
+        deps_frame = self.deps_detalle = ttk.Frame(deps_frame)      # (el detalle, que es lo que se pliega)
+        deps_frame.grid_columnconfigure(1, weight=1)
+        for i, dep in enumerate(DEPENDENCIES + MODULOS):
+            icon_var = tk.StringVar(value="⏳")
+            text_var = tk.StringVar(value=f"{dep['label']}: comprobando...")
+            self.dependency_row_vars[dep['key']] = {'icon': icon_var, 'text': text_var}
+            icon_label = tk.Label(deps_frame, textvariable=icon_var, width=2, anchor="w")
+            icon_label.grid(row=i, column=0, padx=(5, 0), pady=1, sticky="w")
+            self.dependency_icon_labels[dep['key']] = icon_label
+            ttk.Label(deps_frame, textvariable=text_var, wraplength=900, justify="left").grid(
+                row=i, column=1, padx=(0, 5), pady=1, sticky="w"
+            )
+        n = len(DEPENDENCIES + MODULOS)
+        ttk.Label(deps_frame, text=f"Análisis con: {python_analisis()}", style="Muted.TLabel").grid(
+            row=n, column=0, columnspan=2, padx=5, pady=(2, 0), sticky="w")
+        botones_deps = ttk.Frame(deps_frame)
+        botones_deps.grid(row=n + 1, column=0, columnspan=2, padx=5, pady=(5, 5), sticky="w")
+        ttk.Button(botones_deps, text="Verificar de nuevo", command=self.check_dependencies).pack(side="left")
+        self.descargar_button = ttk.Button(botones_deps, text="Descargar lo que falta",
+                                           command=self._offer_downloads)
+        self.descargar_button.pack(side="left", padx=(8, 0))
+        row += 1
+
+        # --- Archivos: un recuadro para los doblajes, otro para los originales, y la lista ---
+        files_frame = ttk.LabelFrame(master, text="Episodios")
+        files_frame.grid(row=row, column=0, padx=10, pady=5, sticky="ew")
+        files_frame.grid_columnconfigure(0, weight=1)
+
+        zonas = ttk.Frame(files_frame)
+        zonas.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
+        zonas.grid_columnconfigure(0, weight=1, uniform="zona")
+        zonas.grid_columnconfigure(1, weight=1, uniform="zona")
+        self.zonas = {}
+        for col, (rol, titulo, texto) in enumerate((
+                ("doblaje", "Doblajes", "audio o vídeo con el doblaje (y sus subtítulos, dentro o en .srt)"),
+                ("original", "RAW", "vídeo (o audio) en versión original, con el que se sincroniza"))):
+            zona = ttk.LabelFrame(zonas, text=titulo)
+            zona.grid(row=0, column=col, padx=(0, 5) if col == 0 else (5, 0), sticky="ew")
+            zona.grid_columnconfigure(0, weight=1)
+            aviso = tk.Label(zona, text=("Arrastra aquí: " if self.dnd else "") + texto,
+                             anchor="w", justify="left", padx=8, pady=8)
+            aviso.grid(row=0, column=0, padx=5, pady=(3, 3), sticky="ew")
+            botones_zona = ttk.Frame(zona)
+            botones_zona.grid(row=1, column=0, padx=5, pady=(0, 5), sticky="w")
+            ttk.Button(botones_zona, text="Añadir archivos...",
+                       command=lambda r=rol: self._browse_files(r)).pack(side="left", padx=(0, 5))
+            ttk.Button(botones_zona, text="Añadir carpeta...",
+                       command=lambda r=rol: self._browse_folder(r)).pack(side="left")
+            self.zonas[rol] = aviso
+            if self.dnd:
+                for widget in (zona, aviso):
+                    widget.drop_target_register(DND_FILES)
+                    widget.dnd_bind("<<Drop>>", lambda e, r=rol: self._on_drop(e, r))
+                    widget.dnd_bind("<<DropEnter>>", lambda e, a=aviso: self._drop_highlight(e, a, True))
+                    widget.dnd_bind("<<DropLeave>>", lambda e, a=aviso: self._drop_highlight(e, a, False))
+
+        acciones = ttk.Frame(files_frame)
+        acciones.grid(row=1, column=0, padx=5, pady=(0, 3), sticky="ew")
+        ttk.Label(acciones, style="Muted.TLabel",
+                  text="Se emparejan por episodio (6x05 ↔ S06E05 ↔ S06 E05).").pack(side="left")
+        como = ttk.Label(acciones, style="Muted.TLabel", text="   ⓘ Cómo funciona", cursor="question_arrow")
+        como.pack(side="left")
+        Globo(como, "Todo es automático: el programa averigua cuál es la pista en castellano, si el archivo trae también "
+                    "la versión original y si los dos van a distinta velocidad.\n\nSi no añades subtítulo, se usa el "
+                    ".srt con el mismo nombre que la RAW; sea para la versión que sea (el doblaje, la RAW u "
+                    "otra), el programa averigua para cuál está hecho, corrige sus erratas de tiempos y lo ajusta.\n\n"
+                    "Para solo ajustar un subtítulo a un vídeo ya hecho (un final con su audio), añade el vídeo como "
+                    "RAW y el .srt, sin doblaje: la fila queda en «Solo subtítulos».\n\nClic derecho en una fila "
+                    "para cambiar sus archivos o quitarla.", self._get_palette, ancho=520)
+        ttk.Button(acciones, text="Vaciar lista", command=self._clear_list).pack(side="right")
+        ttk.Button(acciones, text="Quitar seleccionados", command=self._remove_selected).pack(side="right", padx=5)
+
+        tree_frame = ttk.Frame(files_frame)
+        tree_frame.grid(row=2, column=0, padx=5, pady=(0, 5), sticky="ew")
+        tree_frame.grid_columnconfigure(0, weight=1)
+        columnas = ("ep", "doblaje", "original", "sub", "estado", "resultado")
+        self.tree = ttk.Treeview(tree_frame, columns=columnas, show="headings", height=9, selectmode="extended")
+        for col, titulo, ancho, estirar in (
+                ("ep", "Ep.", 50, False), ("doblaje", "Doblaje", 250, True), ("original", "RAW", 250, True),
+                ("sub", "Subtítulo", 160, True), ("estado", "Estado", 115, False), ("resultado", "Resultado", 160, False)):
+            self.tree.heading(col, text=titulo, anchor="w")
+            self.tree.column(col, width=ancho, minwidth=40, stretch=estirar, anchor="w")
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.grid(row=0, column=0, sticky="ew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        self.tree.bind("<<TreeviewSelect>>", lambda e: self._mostrar_detalle())
+        self.tree.bind("<Button-3>", self._on_right_click)
+        self.tree.bind("<Delete>", lambda e: self._remove_selected())
+
+        pista = "Añade los doblajes y las RAW en los recuadros de arriba"
+        if self.dnd:
+            pista += "\n(o suéltalos aquí: los audios cuentan como doblaje y los vídeos como RAW)"
+        self.lista_vacia = tk.Label(tree_frame, text=pista, justify="center")
+
+
+        self.menu_fila = tk.Menu(self.master, tearoff=0)
+        self.menu_fila.add_command(label="Cambiar doblaje...", command=lambda: self._change_file("doblaje"))
+        self.menu_fila.add_command(label="Cambiar RAW...", command=lambda: self._change_file("original"))
+        self.menu_fila.add_command(label="Cambiar subtítulo...", command=lambda: self._change_file("sub"))
+        self.menu_fila.add_command(label="Quitar subtítulo", command=self._remove_sub)
+        self.menu_fila.add_separator()
+        self.menu_fila.add_command(label="Nombre y título del vídeo muxeado...", command=self._edit_mux_name)
+        self.menu_fila.add_command(label="Correcciones a mano...", command=self._edit_correcciones)
+        self.menu_fila.add_separator()
+        self.menu_fila.add_command(label="Volver a procesar", command=self._reset_selected)
+        self.menu_fila.add_command(label="Abrir carpeta del resultado", command=self._open_folder)
+        self.menu_fila.add_separator()
+        self.menu_fila.add_command(label="Quitar de la lista", command=self._remove_selected)
+
+        if self.dnd:
+            for widget in (self.tree, self.lista_vacia):
+                widget.drop_target_register(DND_FILES)
+                widget.dnd_bind("<<Drop>>", lambda e: self._on_drop(e, None))
+        row += 1
+
+        # --- Carpeta de salida y opciones ---
+        output_frame = ttk.LabelFrame(master, text="Carpeta de Salida y Opciones")
+        output_frame.grid(row=row, column=0, padx=10, pady=5, sticky="ew")
+        output_frame.grid_columnconfigure(0, weight=1)
+        ttk.Entry(output_frame, textvariable=self.output_folder).grid(row=0, column=0, padx=5, pady=5, sticky="ew")
+        ttk.Button(output_frame, text="Explorar...", command=self._browse_output).grid(row=0, column=1, padx=5, pady=5)
+        salida_info = ttk.Label(output_frame, style="Muted.TLabel", text="ⓘ", cursor="question_arrow")
+        salida_info.grid(row=0, column=2, padx=(0, 5), pady=5)
+        Globo(salida_info, "Si se deja vacío, se guarda junto a cada audio doblado. Se crean el audio sincronizado "
+                           "(…_[es-ES]_SYNC, con el idioma de «Idioma»), sus subtítulos ajustados (los que traiga el doblaje dentro y el .srt "
+                           "suelto) y un _informe.txt; al muxear, los subtítulos van al vídeo y no se deja copia "
+                           "aparte.", self._get_palette)
+        opciones = ttk.Frame(output_frame)
+        opciones.grid(row=2, column=0, columnspan=2, padx=5, pady=(0, 5), sticky="w")
+        cb = ttk.Checkbutton(opciones, text="Sobrescribir resultados que ya existan", variable=self.sobrescribir)
+        cb.pack(side="left")
+        Globo(cb, "Vuelve a procesar aunque ya exista el audio sincronizado. Un .mkv muxeado que ya exista no se "
+                  "toca: cámbiale el nombre o bórralo antes.", self._get_palette)
+        cb = ttk.Checkbutton(opciones, text="Rellenar con el audio de la RAW lo que le falte al doblaje (1 s o más)",
+                             variable=self.rellenar)
+        cb.pack(side="left", padx=(20, 0))
+        Globo(cb, "Si al doblaje le falta un trozo (una intro, parte de una escena, el final), ese hueco va con el "
+                  "audio de la RAW en vez de en silencio. El informe lista cada relleno para escuchar las uniones.",
+              self._get_palette)
+        otras = ttk.Frame(output_frame)
+        otras.grid(row=3, column=0, columnspan=2, padx=5, pady=(0, 2), sticky="w")
+        cb = ttk.Checkbutton(otras, text="Sincronizar también las demás pistas dobladas del doblaje",
+                             variable=self.otras_pistas)
+        cb.pack(side="left")
+        Globo(cb, "Por ejemplo latino o catalán, con los mismos cortes. No la versión original, que ya va en la "
+                  "RAW.", self._get_palette)
+        mux = ttk.Frame(output_frame)
+        mux.grid(row=4, column=0, columnspan=2, padx=5, pady=(0, 2), sticky="w")
+        cb = ttk.Checkbutton(mux, text="Muxear en la RAW (primer audio y predeterminado)",
+                             variable=self.muxear)
+        cb.pack(side="left")
+        Globo(cb, "Crea un .mkv nuevo con el vídeo de la RAW, el castellano como primer audio y predeterminado (con "
+                  "el idioma y el título de al lado) y sus subtítulos.\n\nSi el doblaje va a otra velocidad, en ese "
+                  ".mkv el vídeo de la RAW lleva los fps del doblaje, sin recodificar (solo cambian sus marcas de "
+                  "tiempo), y sus audios se aceleran. Las diferencias de montaje (un fundido más largo en el doblaje) "
+                  "se arreglan cortando el castellano en sus silencios: la imagen no se edita.\n\nEl archivo de la RAW "
+                  "no se modifica.", self._get_palette)
+        etiqueta_idioma = ttk.Label(mux, text="Idioma:")
+        etiqueta_idioma.pack(side="left", padx=(15, 0))
+        entrada_idioma = ttk.Entry(mux, textvariable=self.mux_idioma, width=7)
+        entrada_idioma.pack(side="left", padx=(5, 10))
+        for w in (etiqueta_idioma, entrada_idioma):
+            Globo(w, "El idioma del castellano (es-ES; latino, es-419): con él se elige la pista doblada si el "
+                     "archivo trae varias, se etiqueta al muxear y va en el nombre del audio sincronizado "
+                     "(…_[es-ES]_SYNC.mka).", self._get_palette)
+        ttk.Label(mux, text="Título:").pack(side="left")
+        ttk.Entry(mux, textvariable=self.mux_titulo, width=14).pack(side="left", padx=5)
+        forz = ttk.Frame(output_frame)
+        forz.grid(row=5, column=0, columnspan=2, padx=5, pady=(2, 0), sticky="w")
+        cb = ttk.Checkbutton(forz, text="Leer los forzados quemados en la imagen del doblaje (OCR de Windows)",
+                             variable=self.forzados)
+        cb.pack(side="left")
+        Globo(cb, "Se guardan en _forzados.srt; al muxear van como subtítulo forzado y predeterminado. No se usa si "
+                  "el doblaje ya trae subtítulos.", self._get_palette)
+        variable = ttk.Frame(output_frame)
+        variable.grid(row=6, column=0, columnspan=2, padx=5, pady=(2, 0), sticky="w")
+        cb = ttk.Checkbutton(variable, text="Si la velocidad del doblaje varía (VHS), estirar el castellano en vez de "
+                                            "cortarlo", variable=self.estirar_variable)
+        cb.pack(side="left")
+        Globo(cb, "Marcado: el castellano sigue la velocidad de la RAW, sin cortes salvo los saltos de verdad, y el "
+                  "vídeo de la RAW conserva sus fps.\nSin marcar: los fps de la RAW se adaptan a la velocidad "
+                  "media del doblaje (sin recodificar) y lo que varía se corrige con cortes pequeños en el "
+                  "castellano.\nSolo actúa si la velocidad del doblaje varía.",
+              self._get_palette)
+        limpieza = ttk.Frame(output_frame)
+        limpieza.grid(row=7, column=0, columnspan=2, padx=5, pady=(2, 0), sticky="w")
+        cb = ttk.Checkbutton(limpieza, text="Limpiar el ruido de la cinta del castellano (VHS)",
+                             variable=self.limpiar)
+        cb.pack(side="left")
+        Globo(cb, "Quita la continua, los cortes de la captura, los chasquidos, el zumbido y el siseo antes de "
+                  "montarlo. Tarda unos minutos y el informe dice cuánto ha bajado el ruido.", self._get_palette)
+        formato = ttk.Frame(output_frame)
+        formato.grid(row=8, column=0, columnspan=2, padx=5, pady=(4, 0), sticky="w")
+        etiqueta_formato = ttk.Label(formato, text="Formato del audio doblado:")
+        etiqueta_formato.pack(side="left")
+        claves_f = list(FORMATOS_AUDIO)
+        combo_f = ttk.Combobox(formato, state="readonly", values=[FORMATOS_AUDIO[c] for c in claves_f], width=8)
+        combo_f.pack(side="left", padx=(5, 8))
+        combo_f.set(FORMATOS_AUDIO.get(self.formato.get(), FORMATOS_AUDIO["flac"]))
+        combo_f.bind("<<ComboboxSelected>>", lambda e: self.formato.set(claves_f[combo_f.current()]))
+        for w in (etiqueta_formato, combo_f):
+            Globo(w, "Cuando hay que recodificarlo (cortes o rellenos), con los kb/s del doblaje si ya iba en ese "
+                     "formato. Si no hay cortes, se pregunta si dejarlo intacto o convertirlo.", self._get_palette)
+        deco = ttk.Frame(output_frame)
+        deco.grid(row=9, column=0, columnspan=2, padx=5, pady=(4, 0), sticky="w")
+        etiqueta_deco = ttk.Label(deco, text="Decodificar el vídeo con:")
+        etiqueta_deco.pack(side="left")
+        nombres = [v[0] for v in sd.DECODIFICADORES.values()]
+        claves = list(sd.DECODIFICADORES)
+        combo = ttk.Combobox(deco, state="readonly", values=nombres, width=20)
+        combo.pack(side="left", padx=(5, 8))
+        combo.set(sd.DECODIFICADORES.get(self.decodificar.get(), sd.DECODIFICADORES["cpu"])[0])
+        combo.bind("<<ComboboxSelected>>", lambda e: self.decodificar.set(claves[combo.current()]))
+        for w in (etiqueta_deco, combo):
+            Globo(w, "Solo al medir con los cambios de plano o al leer forzados. Si la GPU falla, se usa la CPU. El "
+                     "informe dice con qué y cuánto ha tardado.", self._get_palette)
+        plantilla = ttk.Frame(output_frame)
+        plantilla.grid(row=10, column=0, columnspan=2, padx=5, pady=(4, 2), sticky="ew")
+        plantilla.grid_columnconfigure(1, weight=1)
+        etiqueta_plantilla = ttk.Label(plantilla, text="Nombre y título del vídeo:")
+        etiqueta_plantilla.grid(row=0, column=0, sticky="w")
+        entrada_plantilla = ttk.Entry(plantilla, textvariable=self.plantilla)
+        entrada_plantilla.grid(row=0, column=1, padx=(5, 0), sticky="ew")
+        for w in (etiqueta_plantilla, entrada_plantilla):
+            Globo(w, "Ej.: Infelices para siempre (1995) {ep} {nombre} [Dual][480p]\n\n{ep} = 1x03, {sxe} = S01E03, "
+                     "{temporada}, {episodio} = 03, {nombre} = nombre del episodio (del título del castellano o, si no "
+                     "tiene, de su nombre de archivo; clic derecho en la fila para corregirlo).\n\nVacío: el .mkv se "
+                     "llama como la RAW y lleva el título del castellano si lo tiene. El archivo de la RAW no se "
+                     "modifica (el resultado es un .mkv nuevo), ni un .mkv que ya exista. Si el audio ya estaba sincronizado, solo se muxea.", self._get_palette,
+                  ancho=520)
+        self.plantilla.trace_add("write", lambda *a: self._mostrar_detalle())
+        self.muxear.trace_add("write", lambda *a: self._mostrar_detalle())
+        row += 1
+
+        # --- Botones y progreso ---
+        buttons_frame = ttk.Frame(master)
+        buttons_frame.grid(row=row, column=0, padx=10, pady=10, sticky="ew")
+        buttons_frame.grid_columnconfigure(2, weight=1)
+        self.start_button = ttk.Button(buttons_frame, text="Iniciar Proceso", command=self._start_thread)
+        self.start_button.grid(row=0, column=0, padx=5)
+        self.stop_button = ttk.Button(buttons_frame, text="Detener", command=self._stop, state=tk.DISABLED)
+        self.stop_button.grid(row=0, column=1, padx=5)
+        self.progress = ttk.Progressbar(buttons_frame, orient="horizontal", mode="determinate")
+        self.progress.grid(row=0, column=2, padx=(15, 5), sticky="ew")
+        row += 1
+
+        self.status_text = tk.StringVar(value="Listo. Añade los doblajes y sus RAW.")
+        ttk.Label(master, textvariable=self.status_text, wraplength=1000).grid(
+            row=row, column=0, padx=10, pady=(0, 5), sticky="w")
+        row += 1
+
+        # --- Resultado del episodio seleccionado ---
+        result_frame = ttk.LabelFrame(master, text="Episodio Seleccionado")
+        result_frame.grid(row=row, column=0, padx=10, pady=(0, 10), sticky="ew")
+        result_frame.grid_columnconfigure(0, weight=1)
+        self.detalle_titulo = tk.StringVar(value="Selecciona un episodio de la lista.")
+        ttk.Label(result_frame, textvariable=self.detalle_titulo, style="Bold.TLabel").grid(
+            row=0, column=0, padx=8, pady=(5, 3), sticky="w")
+
+        self.notebook = ttk.Notebook(result_frame)
+        self.notebook.grid(row=1, column=0, padx=5, pady=(0, 5), sticky="ew")
+
+        resumen_tab = ttk.Frame(self.notebook)
+        resumen_tab.grid_columnconfigure(0, weight=1)
+        self.notebook.add(resumen_tab, text="Resumen")
+
+        info = ttk.Frame(resumen_tab)
+        info.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
+        info.grid_columnconfigure(1, weight=1)
+        info.grid_columnconfigure(3, weight=1)
+        self.info_vars = {}
+        # lo que le interesa a quien lo usa: sus archivos y qué ha salido; lo técnico está en el registro
+        campos = (("doblaje", "Doblaje"), ("original", "RAW"), ("sub", "Subtítulo"),
+                  ("audio", "Castellano"), ("velocidad", "Velocidad"), ("subs", "Subtítulos"), ("mux", "Vídeo muxeado"),
+                  ("tiempo", "Tiempo"))
+        for fila, (clave, etiqueta) in enumerate(campos):
+            self.info_vars[clave] = tk.StringVar(value="—")
+            ttk.Label(info, text=etiqueta + ":", style="Muted.TLabel").grid(
+                row=fila, column=0, padx=(0, 6), pady=1, sticky="nw")
+            ttk.Label(info, textvariable=self.info_vars[clave], wraplength=880,
+                      justify="left").grid(row=fila, column=1, columnspan=3, padx=(0, 15), pady=1, sticky="w")
+
+        # (sin la gráfica de cortes: el usuario no la miraba y ocupaba media pantalla, 21-10-2026)
+        cortes_frame = ttk.Frame(resumen_tab)
+        cortes_frame.grid(row=1, column=0, padx=5, pady=(0, 5), sticky="ew")
+        cortes_frame.grid_columnconfigure(0, weight=1)
+        columnas = ("min", "accion", "dur", "tipo", "suelo", "aviso")
+        self.cortes_tree = ttk.Treeview(cortes_frame, columns=columnas, show="headings", height=6, selectmode="none")
+        for col, titulo, ancho in (("min", "Minuto (doblaje)", 150), ("accion", "Acción", 90), ("dur", "Duración", 80),
+                                   ("tipo", "Tipo", 260), ("suelo", "Suelo", 70), ("aviso", "Aviso", 160)):
+            self.cortes_tree.heading(col, text=titulo, anchor="w")
+            self.cortes_tree.column(col, width=ancho, minwidth=40, anchor="w", stretch=(col == "tipo"))
+        vsb2 = ttk.Scrollbar(cortes_frame, orient="vertical", command=self.cortes_tree.yview)
+        self.cortes_tree.configure(yscrollcommand=vsb2.set)
+        self.cortes_tree.grid(row=0, column=0, sticky="ew")
+        vsb2.grid(row=0, column=1, sticky="ns")
+
+        self.otros_avisos = tk.StringVar(value="")
+        ttk.Label(resumen_tab, textvariable=self.otros_avisos, style="Aviso.TLabel", wraplength=980,
+                  justify="left").grid(row=2, column=0, padx=8, pady=(0, 3), sticky="w")
+
+        acciones = ttk.Frame(resumen_tab)
+        acciones.grid(row=3, column=0, padx=5, pady=(0, 5), sticky="w")
+        ttk.Button(acciones, text="Abrir carpeta", command=self._open_folder).pack(side="left", padx=(0, 5))
+        ttk.Button(acciones, text="Abrir informe", command=self._open_report).pack(side="left", padx=5)
+        ttk.Button(acciones, text="Abrir carpeta del vídeo muxeado", command=self._open_mux).pack(side="left", padx=5)
+
+        log_tab = ttk.Frame(self.notebook)
+        log_tab.grid_columnconfigure(0, weight=1)
+        log_tab.grid_rowconfigure(0, weight=1)
+        self.notebook.add(log_tab, text="Progreso / Log")
+        self.log_text = tk.Text(log_tab, height=18, state=tk.DISABLED, wrap="none")
+        log_scroll = ttk.Scrollbar(log_tab, orient="vertical", command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=log_scroll.set)
+        self.log_text.grid(row=0, column=0, padx=(5, 0), pady=5, sticky="nsew")
+        log_scroll.grid(row=0, column=1, padx=(0, 5), pady=5, sticky="ns")
+
+        self._update_empty_hint()
+
+    # ------------------------------------------------------------------
+    def _on_mousewheel(self, event):
+        """La rueda desplaza la página salvo encima de listas y textos, que se desplazan solos."""
+        try:
+            widget = self.master.winfo_containing(event.x_root, event.y_root)
+        except (KeyError, tk.TclError):
+            return
+        while widget is not None:
+            if isinstance(widget, (ttk.Treeview, tk.Text)):
+                return
+            if widget is self.master:
+                break
+            widget = widget.master
+        if widget is self.master:
+            self.canvas.yview_scroll(int(-event.delta / 120), "units")
+
+    def _on_theme_mode_change(self, *_args):
+        """Se llama al elegir 'Claro'/'Oscuro' en el desplegable de tema."""
+        self.dark_mode_var.set(self.theme_mode_var.get() == "Oscuro")
+        self.apply_theme()
+
+    def apply_theme(self):
+        """Aplica la paleta clara u oscura a toda la GUI (ttk + widgets tk sueltos)."""
+        palette = self._get_palette()
+
+        style = ttk.Style()
+        try:
+            style.theme_use('clam')
+        except tk.TclError:
+            pass
+        style.configure(".", background=palette['bg'], foreground=palette['fg'])
+        style.configure("TFrame", background=palette['bg'])
+        style.configure("TLabelframe", background=palette['bg'], foreground=palette['fg'])
+        style.configure("TLabelframe.Label", background=palette['bg'], foreground=palette['fg'])
+        style.configure("TLabel", background=palette['bg'], foreground=palette['fg'])
+        style.configure("Muted.TLabel", background=palette['bg'], foreground=palette['muted'])
+        style.configure("Aviso.TLabel", background=palette['bg'], foreground=palette['aviso'])
+        style.configure("Bold.TLabel", background=palette['bg'], foreground=palette['fg'],
+                        font=("TkDefaultFont", 10, "bold"))
+        style.configure("TCheckbutton", background=palette['bg'], foreground=palette['fg'])
+        style.map("TCheckbutton", background=[('active', palette['bg'])], foreground=[('active', palette['fg'])])
+        style.configure("TRadiobutton", background=palette['bg'], foreground=palette['fg'])
+        style.map("TRadiobutton", background=[('active', palette['bg'])], foreground=[('active', palette['fg'])])
+        style.configure("TButton", background=palette['button_bg'], foreground=palette['fg'])
+        style.map("TButton", background=[('active', palette['select_bg'])])
+        style.configure("TEntry", fieldbackground=palette['entry_bg'], foreground=palette['entry_fg'])
+        style.configure("TMenubutton", background=palette['button_bg'], foreground=palette['fg'])
+        style.map("TMenubutton",
+                  background=[('active', palette['select_bg'])],
+                  foreground=[('active', palette['select_fg'])])
+        style.configure("TScrollbar", background=palette['button_bg'], troughcolor=palette['bg'])
+        style.configure("Treeview", background=palette['entry_bg'], fieldbackground=palette['entry_bg'],
+                        foreground=palette['entry_fg'])
+        style.map("Treeview", background=[('selected', palette['select_bg'])],
+                  foreground=[('selected', palette['select_fg'])])
+        style.configure("Treeview.Heading", background=palette['button_bg'], foreground=palette['fg'])
+        style.map("Treeview.Heading", background=[('active', palette['select_bg'])])
+        style.configure("TNotebook", background=palette['bg'])
+        style.configure("TNotebook.Tab", background=palette['button_bg'], foreground=palette['fg'], padding=(10, 3))
+        style.map("TNotebook.Tab", background=[('selected', palette['bg'])])
+        style.configure("Horizontal.TProgressbar", background=palette['select_bg'], troughcolor=palette['entry_bg'])
+
+        self.master.configure(background=palette['bg'])
+        if hasattr(self, 'canvas'):
+            self.canvas.configure(background=palette['bg'])
+        if hasattr(self, 'log_text'):
+            self.log_text.configure(
+                background=palette['entry_bg'], foreground=palette['entry_fg'],
+                insertbackground=palette['fg'],
+            )
+        if hasattr(self, 'lista_vacia'):
+            self.lista_vacia.configure(background=palette['entry_bg'], foreground=palette['muted'])
+        for aviso in getattr(self, 'zonas', {}).values():
+            aviso.configure(background=palette['entry_bg'], foreground=palette['muted'])
+        for arbol in (getattr(self, 'tree', None), getattr(self, 'cortes_tree', None)):
+            if arbol is not None:
+                arbol.tag_configure("ok", foreground=palette['ok'])
+                arbol.tag_configure("aviso", foreground=palette['aviso'])
+                arbol.tag_configure("error", foreground=palette['error'])
+                arbol.tag_configure("curso", foreground=palette['curva'])
+                arbol.tag_configure("apagado", foreground=palette['muted'])
+                arbol.tag_configure("relleno", foreground=palette['relleno'])
+        for icon_label in self.dependency_icon_labels.values():
+            icon_label.configure(background=palette['bg'])
+
+        # --- Menús (son tk.Menu y no se colorean a través de ttk.Style) ---
+        menus = [getattr(self, 'menu_fila', None)]
+        if hasattr(self, 'theme_menu'):
+            try:
+                menus.append(self.theme_menu['menu'])
+            except tk.TclError:
+                pass
+        for menu in menus:
+            if menu is not None:
+                menu.configure(background=palette['entry_bg'], foreground=palette['fg'],
+                               activebackground=palette['select_bg'], activeforeground=palette['select_fg'])
+
+    def _plegar_dependencias(self, abrir=None):
+        """Despliega o pliega el detalle de las dependencias (abrir: True o False para forzarlo)."""
+        self.deps_abiertas = (not self.deps_abiertas) if abrir is None else abrir
+        if self.deps_abiertas:
+            self.deps_detalle.grid(row=1, column=0, sticky="ew")
+            self.deps_boton.config(text="Ocultar ▴")
+        else:
+            self.deps_detalle.grid_remove()
+            self.deps_boton.config(text="Mostrar ▾")
+
+    def check_dependencies(self):
+        missing = []
+        palette = self._get_palette()
+        for dep in DEPENDENCIES + MODULOS:
+            if dep in DEPENDENCIES:
+                # MKVToolNix no siempre se añade al PATH: se busca también donde lo instala
+                ruta = sd.ruta_mkvmerge() if dep['key'] == 'mkvmerge' and sd else None
+                status = check_dependency_binary(ruta or dep['key'])
+                detail = status.get('version') or status.get('path')
+            else:
+                status = check_module(dep['key'])
+                detail = status['version'] or "instalado"
+            self.dependency_status[dep['key']] = status
+            if status['found']:
+                icon, color, text = "✔", "#35a127", f"{dep['label']}: {detail}"
+            elif dep.get('opcional'):
+                icon, color = "–", palette['muted']
+                text = f"{dep['label']}: no instalado — {dep['desc']}"
+            else:
+                icon, color = "✘", "#C62828"
+                text = f"{dep['label']}: NO encontrado — {dep['desc']}"
+                missing.append(dep['label'])
+            row_vars = self.dependency_row_vars.get(dep['key'])
+            if row_vars:
+                row_vars['icon'].set(icon)
+                row_vars['text'].set(text)
+            icon_label = self.dependency_icon_labels.get(dep['key'])
+            if icon_label:
+                icon_label.config(fg=color)
+        if missing:
+            self.status_text.set(
+                "Aviso: faltan dependencias obligatorias: " + ", ".join(missing) +
+                ". Pulsa «Descargar lo que falta» o instálalas y usa «Verificar de nuevo»."
+            )
+        if hasattr(self, 'descargar_button'):
+            self.descargar_button.config(state=tk.DISABLED if ffmpeg_disponible() else tk.NORMAL)
+        if hasattr(self, 'deps_resumen'):
+            opcionales = [d['label'] for d in DEPENDENCIES + MODULOS if d.get('opcional')
+                          and not self.dependency_status.get(d['key'], {}).get('found')]
+            if missing:
+                self.deps_resumen.set("✘ Falta: " + ", ".join(missing))
+                self.deps_resumen_label.configure(style="Aviso.TLabel")
+                self._plegar_dependencias(True)
+            else:
+                self.deps_resumen.set("✔ Todo lo necesario está instalado"
+                                      + (f" (sin instalar, opcional: {', '.join(opcionales)})" if opcionales else ""))
+                self.deps_resumen_label.configure(style="TLabel")
+        return missing
+
+    # ------------------------------------------------------------------
+    # Lista de episodios
+    # ------------------------------------------------------------------
+    def _browse_files(self, rol):
+        patrones = " ".join("*" + e for e in sd.AUDIO_EXT + EXTENSIONES_VIDEO + EXTENSIONES_SUB)
+        que = "los doblajes (y sus subtítulos)" if rol == "doblaje" else "las RAW"
+        rutas = filedialog.askopenfilenames(
+            title=f"Selecciona {que}",
+            filetypes=[("Audio, vídeo y subtítulos", patrones), ("Todos los archivos", "*.*")])
+        if rutas:
+            self._add_paths(rutas, rol)
+
+    def _browse_folder(self, rol):
+        que = "los doblajes" if rol == "doblaje" else "las RAW"
+        carpeta = filedialog.askdirectory(title=f"Selecciona la carpeta con {que}")
+        if carpeta:
+            self._add_paths([carpeta], rol)
+
+    def _browse_output(self):
+        path = filedialog.askdirectory(title="Selecciona la carpeta de salida")
+        if path:
+            self.output_folder.set(path)
+
+    def _on_drop(self, event, rol):
+        for aviso in self.zonas.values():
+            self._drop_highlight(event, aviso, False)
+        self._add_paths(self.master.tk.splitlist(event.data), rol)
+        return event.action
+
+    def _drop_highlight(self, event, aviso, activo):
+        pal = self._get_palette()
+        aviso.configure(background=pal['select_bg'] if activo else pal['entry_bg'],
+                        foreground=pal['select_fg'] if activo else pal['muted'])
+        return event.action
+
+    def _add_paths(self, rutas, rol=None):
+        """Añade archivos y carpetas (sin subcarpetas) y los empareja por episodio. `rol` fuerza
+        'doblaje' u 'original' (los .srt siempre son subtítulos); sin él, se decide por la
+        extensión: audio = doblaje, vídeo = original."""
+        archivos = []
+        for ruta in rutas:
+            ruta = os.path.normpath(ruta)
+            if os.path.isdir(ruta):
+                archivos += [os.path.join(ruta, f) for f in sorted(os.listdir(ruta))
+                             if os.path.isfile(os.path.join(ruta, f))]
+            elif os.path.isfile(ruta):
+                archivos.append(ruta)
+        ya = {os.path.normcase(x) for j in self.trabajos for x in (j.doblaje, j.original, j.sub) if x}
+        nuevos = 0
+        for ruta in archivos:
+            ext = os.path.splitext(ruta)[1].lower()
+            if ext in EXTENSIONES_SUB:
+                rol_archivo = "sub"
+            elif rol:
+                rol_archivo = rol if ext in sd.AUDIO_EXT + EXTENSIONES_VIDEO else None
+            else:
+                rol_archivo = rol_por_extension(ruta)
+            # (fuera también lo que crea el programa: el audio sincronizado y el vídeo «[con subtítulos]», que si no
+            # entraba como otra RAW del mismo episodio y se volvía a procesar: Becker 1x01, 23-10-2026)
+            nombre = os.path.basename(ruta)
+            if rol_archivo is None or "_SYNC" in nombre or " [con subtítulos]" in nombre or os.path.normcase(ruta) in ya:
+                continue
+            self._place(ruta, rol_archivo, sd.episodio(os.path.basename(ruta)))
+            ya.add(os.path.normcase(ruta))
+            nuevos += 1
+        self._auto_subs()
+        self.trabajos.sort(key=lambda j: (j.clave is None, j.clave or (0, 0), j.doblaje or j.original or ""))
+        self._refresh_list()
+        listos = sum(1 for j in self.trabajos if j.completo() and not j.estado)
+        solo_subs = sum(1 for j in self.trabajos if j.solo_subs() and not j.estado)
+        incompletos = sum(1 for j in self.trabajos if not j.procesable())
+        mensaje = f"{nuevos} archivo(s) añadido(s). {listos} episodio(s) listos para sincronizar."
+        if solo_subs:
+            mensaje += f" {solo_subs} de solo subtítulos (vídeo y subtítulo sin doblaje)."
+        if incompletos:
+            mensaje += f" {incompletos} fila(s) incompletas (les falta el doblaje o la RAW)."
+        self.status_text.set(mensaje)
+
+    def _place(self, ruta, rol, clave):
+        """Coloca un archivo en la fila de su episodio (o en una nueva)."""
+        mismos = [j for j in self.trabajos if j.clave == clave and not j.estado]
+        if rol == "doblaje":
+            fila = next((j for j in mismos if j.doblaje is None), None)
+            if fila is None:
+                fila = Trabajo(clave)
+                if mismos:      # otro doblaje del mismo episodio: comparte original y subtítulo
+                    fila.original, fila.sub = mismos[0].original, mismos[0].sub
+                self.trabajos.append(fila)
+            fila.doblaje = ruta
+            return
+        if not mismos:
+            fila = Trabajo(clave)
+            self.trabajos.append(fila)
+            mismos = [fila]
+        for fila in mismos:
+            actual = getattr(fila, rol)
+            # si hay MKV y MP4 del mismo episodio, manda el MKV
+            if actual is None or (rol == "original" and ruta.lower().endswith(".mkv")
+                                  and not actual.lower().endswith(".mkv")):
+                setattr(fila, rol, ruta)
+                if rol == "sub":
+                    fila.sub_quitado = fila.sub_auto = False
+
+    def _auto_subs(self):
+        for j in self.trabajos:
+            if j.original and not j.sub and not j.sub_quitado:
+                candidato = os.path.splitext(j.original)[0] + ".srt"
+                if os.path.exists(candidato):
+                    j.sub, j.sub_auto = candidato, True
+
+    def _valores(self, j):
+        nombre = lambda r: os.path.basename(r) if r else "—"
+        return (j.etiqueta(), nombre(j.doblaje), nombre(j.original), nombre(j.sub),
+                j.texto_estado(), resumen_corto(j.res))
+
+    def _tag(self, j):
+        estado = j.texto_estado()
+        if estado in EN_CURSO:
+            return "curso"
+        if estado in ("Hecho", "Muxeado"):
+            return "ok"
+        if estado.startswith("Hecho"):
+            return "aviso"
+        if estado in ("Error", "Sin muxear"):
+            return "error"
+        if estado in ("Ya existe", "Cancelado", "Falta doblaje", "Falta la RAW"):
+            return "apagado"
+        return ""
+
+    def _refresh_list(self):
+        seleccion = [self._por_iid[i] for i in self.tree.selection() if i in self._por_iid]
+        self.tree.delete(*self.tree.get_children())
+        self._por_iid = {}
+        for j in self.trabajos:
+            iid = str(id(j))
+            self._por_iid[iid] = j
+            self.tree.insert("", "end", iid=iid, values=self._valores(j), tags=(self._tag(j),))
+        vivos = [str(id(j)) for j in seleccion if str(id(j)) in self._por_iid]
+        if vivos:
+            self.tree.selection_set(vivos)
+        self._update_empty_hint()
+        self._mostrar_detalle()
+
+    def _update_row(self, j):
+        iid = str(id(j))
+        if self.tree.exists(iid):
+            self.tree.item(iid, values=self._valores(j), tags=(self._tag(j),))
+
+    def _update_empty_hint(self):
+        if self.trabajos:
+            self.lista_vacia.place_forget()
+        else:
+            self.lista_vacia.place(relx=0.5, rely=0.55, anchor="center")
+
+    def _selected(self):
+        return [self._por_iid[i] for i in self.tree.selection() if i in self._por_iid]
+
+    def _selected_one(self):
+        sel = self._selected()
+        return sel[0] if sel else None
+
+    def _on_right_click(self, event):
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return
+        if iid not in self.tree.selection():
+            self.tree.selection_set(iid)
+        self.menu_fila.tk_popup(event.x_root, event.y_root)
+
+    def _change_file(self, rol):
+        j = self._selected_one()
+        if not j:
+            return
+        if j.estado in EN_CURSO:
+            self._show_warning("En proceso", "Ese episodio se está procesando; espera a que termine.")
+            return
+        tipos = {"doblaje": [("Audio o vídeo doblado", " ".join("*" + e for e in sd.AUDIO_EXT + EXTENSIONES_VIDEO))],
+                 "original": [("Vídeo o audio de la RAW", " ".join("*" + e for e in EXTENSIONES_VIDEO + sd.AUDIO_EXT))],
+                 "sub": [("Subtítulos SRT", "*.srt")]}[rol] + [("Todos los archivos", "*.*")]
+        ruta = filedialog.askopenfilename(title="Selecciona el archivo", filetypes=tipos)
+        if not ruta:
+            return
+        setattr(j, rol, os.path.normpath(ruta))
+        if rol == "sub":
+            j.sub_quitado = j.sub_auto = False
+        if j.clave is None:
+            j.clave = sd.episodio(os.path.basename(ruta))
+        j.estado, j.res, j.log = None, None, []
+        self._auto_subs()
+        self._refresh_list()
+
+    def _remove_sub(self):
+        for j in self._selected():
+            if j.estado not in EN_CURSO:
+                j.sub, j.sub_quitado = None, True
+                self._update_row(j)
+        self._mostrar_detalle()
+
+    def _reset_selected(self):
+        for j in self._selected():
+            if j.estado not in EN_CURSO:
+                j.estado = None
+                self._update_row(j)
+        self.status_text.set("Marcados para volver a procesar. Si sus resultados ya existen, "
+                             "marca «Sobrescribir resultados que ya existan».")
+
+    def _remove_selected(self):
+        quitar = [j for j in self._selected() if j.estado not in EN_CURSO[1:]]
+        for j in quitar:
+            j.quitado = True
+            self.trabajos.remove(j)
+        if quitar:
+            self._refresh_list()
+
+    def _clear_list(self):
+        for j in list(self.trabajos):
+            if j.estado not in EN_CURSO[1:]:
+                j.quitado = True
+                self.trabajos.remove(j)
+        self._refresh_list()
+
+    def _open_folder(self):
+        j = self._selected_one()
+        ruta = (j.salida or j.doblaje or j.original) if j else None
+        if not ruta:
+            return
+        if os.path.exists(ruta):
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(ruta)])
+        elif os.path.isdir(os.path.dirname(ruta)):
+            os.startfile(os.path.dirname(ruta))
+
+    # ------------------------------------------------------------------
+    # Vídeo muxeado: ajustes, nombre y título
+    # ------------------------------------------------------------------
+    def _cargar_ajustes(self):
+        """Opciones de muxeado de la última vez (la plantilla suele valer para toda una serie)."""
+        try:
+            with open(AJUSTES, encoding="utf-8") as f:
+                a = json.load(f)
+        except (OSError, ValueError):
+            return
+        # los forzados (OCR) y la limpieza del ruido no se recuerdan: son de uso puntual y siempre empiezan desmarcados
+        for clave, var in (("rellenar", self.rellenar), ("otras_pistas", self.otras_pistas), ("muxear", self.muxear),
+                           ("estirar_variable", self.estirar_variable),
+                           ("decodificar", self.decodificar), ("formato", self.formato),
+                           ("mux_idioma", self.mux_idioma), ("mux_titulo", self.mux_titulo),
+                           ("plantilla", self.plantilla)):
+            if clave in a:
+                try:
+                    var.set(a[clave])
+                except (tk.TclError, ValueError):
+                    pass
+        if self.formato.get() not in FORMATOS_AUDIO:
+            self.formato.set("flac")
+
+    def _guardar_ajustes(self):
+        try:
+            with open(AJUSTES, "w", encoding="utf-8") as f:
+                json.dump({"rellenar": self.rellenar.get(), "otras_pistas": self.otras_pistas.get(),
+                           "muxear": self.muxear.get(), "estirar_variable": self.estirar_variable.get(),
+                           "decodificar": self.decodificar.get(), "formato": self.formato.get(),
+                           "mux_idioma": self.mux_idioma.get(),
+                           "mux_titulo": self.mux_titulo.get(), "plantilla": self.plantilla.get()},
+                          f, ensure_ascii=False, indent=1)
+        except OSError:
+            pass
+
+    def _leer_una_vez(self, funcion, ruta):
+        """Nombre del episodio o título de un archivo (ffprobe); se lee una sola vez por archivo."""
+        clave = (funcion.__name__, ruta)
+        if clave not in self._cache_nombres:
+            try:
+                self._cache_nombres[clave] = funcion(ruta) if ruta else ""
+            except Exception:
+                self._cache_nombres[clave] = ""
+        return self._cache_nombres[clave]
+
+    def _plan_mux(self, j):
+        """Nombre y título del vídeo muxeado: el puesto a mano, el de la plantilla o None (se queda el
+        nombre del original y el título del castellano)."""
+        if j.nombre_mux:
+            return j.nombre_mux
+        plantilla = self.plantilla.get().strip()
+        if not plantilla or not j.doblaje:
+            return None
+        ep = j.clave or sd.episodio(os.path.basename(j.doblaje))
+        return sd.expandir_plantilla(plantilla, ep, self._leer_una_vez(sd.nombre_episodio, j.doblaje))
+
+    def _texto_plan_mux(self, j):
+        nombre = self._plan_mux(j)
+        ruta = sd.ruta_mux(j.original, self.output_folder.get().strip() or None,
+                           self.mux_titulo.get().strip() or "Castellano", nombre)
+        if os.path.exists(ruta):
+            return f"ya existe {os.path.basename(ruta)}; no se tocará"
+        # el mismo orden que usa el script: plantilla o mano, título del castellano, título del original
+        titulo = (nombre or self._leer_una_vez(sd.titulo_contenedor, j.doblaje)
+                  or self._leer_una_vez(sd.titulo_contenedor, j.original))
+        return (f"se creará al procesar: {os.path.basename(ruta)}   ·   título: " + (titulo or "ninguno")
+                + ("   (puesto a mano)" if j.nombre_mux else ""))
+
+    def _edit_mux_name(self):
+        j = self._selected_one()
+        if not j or not j.completo():
+            self._show_info("Nombre del vídeo", "Selecciona un episodio con doblaje y RAW.")
+            return
+        if j.estado in EN_CURSO:
+            self._show_warning("En proceso", "Ese episodio se está procesando; espera a que termine.")
+            return
+        actual = self._plan_mux(j) or os.path.splitext(os.path.basename(
+            sd.ruta_mux(j.original, None, self.mux_titulo.get().strip() or "Castellano")))[0]
+        nuevo = themed_askstring(
+            self.master, "Nombre y título del vídeo",
+            "Nombre del .mkv muxeado de este episodio, que también será su título. Los caracteres que Windows "
+            "no admite en un nombre de archivo (como las comillas) solo se quitan del nombre, no del título.",
+            actual, self._get_palette(), auto_label="Automático (plantilla)")
+        if nuevo is None:
+            return
+        j.nombre_mux = nuevo or None
+        if j.estado not in EN_CURSO:
+            j.estado, j.res, j.log = None, None, []
+        self._update_row(j)
+        self._mostrar_detalle()
+
+    def _edit_correcciones(self):
+        """Ajustes a mano del castellano para lo que la medida no puede ver (sd.leer_correcciones)."""
+        j = self._selected_one()
+        if not j or not j.completo():
+            self._show_info("Correcciones a mano", "Selecciona un episodio con doblaje y RAW.")
+            return
+        if j.estado in EN_CURSO:
+            self._show_warning("En proceso", "Ese episodio se está procesando; espera a que termine.")
+            return
+        texto = j.correcciones
+        while True:
+            texto = themed_askstring(
+                self.master, "Correcciones a mano",
+                "Para lo que la imagen no puede medir. Milisegundos que se retrasa (+) o se adelanta (-) el castellano, "
+                "en todo el episodio o entre dos tiempos del vídeo final (mm:ss), separados con punto y coma. Por "
+                "ejemplo: -100; 15:44-16:09 +700\nLos cortes que hagan falta se ponen en el silencio más cercano. Para "
+                "aplicarlas, vuelve a procesar el episodio con «Sobrescribir» marcado (el .mkv que ya exista no se "
+                "toca: cámbiale el nombre o bórralo antes).",
+                texto, self._get_palette(), auto_label="Sin correcciones")
+            if texto is None:
+                return
+            try:
+                sd.leer_correcciones(texto)
+                break
+            except ValueError as e:
+                self._show_warning("Correcciones a mano", str(e))
+        j.correcciones = texto.strip()
+        if j.estado not in EN_CURSO:
+            j.estado, j.res, j.log = None, None, []
+        self._update_row(j)
+        self._mostrar_detalle()
+
+    def _open_mux(self):
+        j = self._selected_one()
+        mkv = j.res.get('mux') if j and j.res else None
+        if mkv and os.path.exists(mkv):
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(mkv)])
+        else:
+            self._show_info("Sin vídeo muxeado", "Este episodio todavía no se ha muxeado en su RAW.")
+
+    def _open_report(self):
+        j = self._selected_one()
+        informe = os.path.splitext(j.salida)[0] + "_informe.txt" if j and j.salida else None
+        if informe and os.path.exists(informe):
+            os.startfile(informe)
+        else:
+            self._show_info("Sin informe", "Este episodio todavía no tiene informe.")
+
+    # ------------------------------------------------------------------
+    # Detalle del episodio seleccionado
+    # ------------------------------------------------------------------
+    def _mostrar_detalle(self):
+        j = self._selected_one()
+        res = j.res if j else None
+        v = self.info_vars
+        for var in v.values():
+            var.set("—")
+        self.cortes_tree.delete(*self.cortes_tree.get_children())
+        self.otros_avisos.set("")
+        if not j:
+            self.detalle_titulo.set("Selecciona un episodio de la lista.")
+        else:
+            self.detalle_titulo.set(f"{j.etiqueta()} · {j.texto_estado()}")
+            v['doblaje'].set(j.doblaje or "—")
+            v['original'].set(j.original or "—")
+            v['sub'].set(j.sub or "—")
+            v['audio'].set("se elige solo al procesar")
+            if self.muxear.get() and j.completo():
+                v['mux'].set(self._texto_plan_mux(j))
+            if j.solo_subs():
+                v['audio'].set("solo subtítulos: el vídeo ya está hecho; el subtítulo se compara con su voz")
+                if self.muxear.get():
+                    ruta = sd.ruta_mux(j.original, self.output_folder.get().strip() or None, "con subtítulos")
+                    v['mux'].set(f"se creará al procesar: {os.path.basename(ruta)} (el vídeo con el subtítulo "
+                                 "añadido; el de partida no se toca)")
+        if res:
+            if res['pista']:
+                # la descripción de la pista sincronizada, sacada de la línea de pistas del registro
+                desc = next((x.split(" (")[0] for x in (res['pistas'] or "").split(" · ")
+                             if x.startswith(f"{res['pista']}: ")), str(res['pista']))
+                texto = f"pista {desc}" if res['pistas'] else "la única pista del doblaje"
+                if res['audio_doblado']:
+                    texto += f": {res['audio_doblado']}"
+                if res['pistas_extra']:
+                    texto += "   · también: " + ", ".join(f"pista {n} ({d})" for n, d, _ in res['pistas_extra'])
+                if res['video']:
+                    texto += "   · medido con los cambios de plano del vídeo"
+                v['audio'].set(texto)
+            if res['variable']:
+                v['velocidad'].set(f"variable (VHS): se estira el castellano ({res['variable']}); la RAW no se "
+                                   "toca")
+            elif res['velocidad']:
+                v['velocidad'].set(f"{res['velocidad']}: se adaptan los fps de la RAW; el castellano no se toca")
+            elif res['mapa']:
+                v['velocidad'].set("la misma que la RAW" + (
+                    f" (una diferencia de {abs(res['reparto'][0])} ms en todo el episodio, repartida)"
+                    if res['reparto'] else ""))
+            if res['subs']:
+                v['subs'].set(f"{res['subs'][0]} líneas ajustadas")
+            elif j.salida:
+                v['subs'].set("sin subtítulo")
+            if res['subs_dob']:
+                hechas = [s for s in res['subs_dob'] if s[2]]
+                imagen = [s for s in res['subs_dob'] if s[3]]
+                partes = [f"{len(hechas)} pista(s) del doblaje ajustada(s): " + ", ".join(s[1] for s in hechas)] \
+                    if hechas else []
+                partes += [f"{len(imagen)} de imagen fuera (no se pueden ajustar)"] if imagen else []
+                if partes:
+                    dob = "; ".join(partes)
+                    v['subs'].set(dob if v['subs'].get() in ("—", "sin subtítulo") else f"{v['subs'].get()} · {dob}")
+            if res['forzados']:
+                n, ruta = res['forzados']
+                forz = (f"{n} forzados leídos con OCR" if n else "forzados del .srt que ya había") + \
+                       f" ({os.path.basename(ruta)}; se puede corregir a mano antes de muxear)"
+                v['subs'].set(forz if v['subs'].get() in ("—", "sin subtítulo") else f"{v['subs'].get()} · {forz}")
+            elif res['forz_nota']:
+                v['subs'].set(f"{v['subs'].get()} · forzados: {res['forz_nota']}")
+            if res['mux_error']:
+                v['mux'].set(f"no se ha podido muxear: {res['mux_error']}")
+            elif res['mux']:
+                info = res['mux_info'] or ""
+                nota = ("ya existía; no se ha tocado" if "ya existía" in info else
+                        "con el vídeo adaptado a la velocidad del doblaje" if "original adaptado" in info else "")
+                v['mux'].set(os.path.basename(res['mux']) + (f"   ({nota})" if nota else ""))
+            if res['tiempo']:
+                v['tiempo'].set(res['tiempo'])
+            filas = [(c['t'], (c['txt'], c['accion'].capitalize(), f"{c['ms']} ms", c['tipo'], f"{c['suelo']} dB",
+                               "⚠ conviene escucharlo" if c['aviso'] else ""),
+                      "aviso" if c['aviso'] else ("ok" if c['accion'] == "inserta" else "error"))
+                     for c in res['cortes']]
+            filas += [(z['t0'], (z['txt'], "Sin corte", "", f"música del doblaje desplazada {z['d']:+.1f} s",
+                                 "", "⚠ conviene escucharlo"), "aviso") for z in res['musica']]
+            # 0.001: detrás del corte del mismo instante
+            filas += [(r['t'] + 0.001, (r['txt'], "Rellena", f"{r['ms']} ms",
+                                        f"audio de la RAW {r['o0']}-{r['o1']} ({r['db']:+.1f} dB)",
+                                        "", "⚠ escucha las uniones"), "relleno") for r in res['rellenos']]
+            for _, valores, tag in sorted(filas, key=lambda f: f[0]):
+                self.cortes_tree.insert("", "end", values=valores, tags=(tag,))
+            if not filas and res['mapa']:
+                self.cortes_tree.insert("", "end", tags=("apagado",), values=(
+                    "—", "Sin cortes", "", "el castellano se ha estirado siguiendo la velocidad de la RAW"
+                    if res['variable'] else "el doblaje solo necesitaba el desfase inicial"
+                    + (" y adaptar la velocidad de la RAW" if res['velocidad'] else ""),
+                    "", ""))
+            otros = [a for a in res['avisos'] if not a.startswith(("corte ", "relleno "))
+                     and "música desplazada" not in a]
+            # los que piden revisar, delante y destacados; los demás solo piden escuchar
+            otros = (["REVISAR: " + a[len("[revisar] "):] for a in otros if a.startswith("[revisar] ")]
+                     + [a for a in otros if not a.startswith("[revisar] ")])
+            if res['error']:
+                otros.insert(0, res['error'])
+            if res['velocidad'] and not res['mux'] and not res['error']:
+                # el audio va al tiempo del original adaptado, que solo existe al muxear con el programa (Pequeñas
+                # mentiras: muxeado a mano en el Blu-ray a 24 fps, el castellano iba un 4 % más rápido)
+                otros.insert(0, "el doblaje va a otra velocidad: este audio solo cuadra con la RAW adaptada, que "
+                                "el programa crea al muxear. Marca «Muxear en la RAW» y vuelve a procesar "
+                                "(como el audio ya existe, solo muxea). Metido a mano en la RAW tal cual NO cuadra")
+            if otros:
+                self.otros_avisos.set("⚠ " + "\n⚠ ".join(otros))
+        self._fill_log(j)
+
+    def _fill_log(self, j):
+        self.log_text.config(state=tk.NORMAL)
+        self.log_text.delete("1.0", tk.END)
+        if j and j.log:
+            self.log_text.insert(tk.END, "\n".join(j.log) + "\n")
+            self.log_text.see(tk.END)
+        self.log_text.config(state=tk.DISABLED)
+
+    def notify_finished(self, message):
+        """Avisa al usuario (sonido + ventana emergente) de que el proceso ha terminado."""
+        try:
+            self.master.bell()
+        except Exception:
+            pass
+        try:
+            self.master.deiconify()
+            self.master.lift()
+            self.master.focus_force()
+        except Exception:
+            pass
+        try:
+            themed_messagebox(self.master, "Proceso finalizado", message, self._get_palette(), buttons="ok")
+        except Exception:
+            pass
+
+    def _poll_queue(self):
+        try:
+            while True:
+                kind, payload = self.progress_queue.get_nowait()
+                if kind == "inicio":
+                    j, n, total = payload
+                    self.actual = payload
+                    j.estado, j.log, j.res, j.inicio = "Analizando…", [], None, time.time()
+                    self._update_row(j)
+                    iid = str(id(j))
+                    if self.tree.exists(iid):
+                        self.tree.selection_set(iid)
+                        self.tree.see(iid)
+                    self._mostrar_detalle()
+                elif kind == "linea":
+                    j, linea = payload
+                    j.log.append(linea)
+                    etapa = None
+                    if linea.startswith("Deriva de velocidad"):
+                        etapa = "Montando…"
+                    elif linea.startswith("Buscando subtítulos quemados"):
+                        etapa = "Forzados…"
+                    elif linea.startswith("Sincronizando también la pista"):
+                        etapa = "Otras pistas…"
+                    elif linea.startswith("Verificación"):
+                        etapa = "Codificando…"
+                    elif linea.startswith("Guardado") and j.sub:
+                        etapa = "Subtítulos…"
+                    elif linea.startswith("Muxeando en"):
+                        etapa = "Muxeando…"
+                    if etapa:
+                        j.estado = etapa
+                        self._update_row(j)
+                        if self._selected_one() is j:
+                            self.detalle_titulo.set(f"{j.etiqueta()} · {j.texto_estado()}")
+                    if self._selected_one() is j:
+                        self.log_text.config(state=tk.NORMAL)
+                        self.log_text.insert(tk.END, linea + "\n")
+                        self.log_text.see(tk.END)
+                        self.log_text.config(state=tk.DISABLED)
+                elif kind == "pregunta":
+                    j, actual, nuevo, caja = payload
+                    convertir, todos = self._dialogo_sin_cortes(j, actual, nuevo)
+                    if todos:
+                        self.respuesta_tanda = convertir
+                    caja["convertir"] = convertir
+                    caja["evento"].set()
+                elif kind == "fin":
+                    j, estado, lineas, salida = payload
+                    j.estado = estado
+                    if lineas is not None:
+                        j.log = list(lineas)
+                    j.res = leer_informe(j.log) if j.log and estado != "Cancelado" else None
+                    if salida:
+                        j.salida = salida
+                    self._terminados += 1
+                    self.progress['value'] = self._terminados
+                    self._update_row(j)
+                    if self._selected_one() is j:
+                        self._mostrar_detalle()
+                elif kind == "done":
+                    self.actual = None
+                    if self.act is not None:
+                        self.act.marcar_ocupado(False)
+                    for j in self.trabajos:
+                        if j.estado in EN_CURSO:
+                            j.estado = None
+                            self._update_row(j)
+                    self.status_text.set(str(payload))
+                    self.start_button.config(state=tk.NORMAL)
+                    self.stop_button.config(state=tk.DISABLED)
+                    self._mostrar_detalle()
+                    self.notify_finished(str(payload))
+        except queue.Empty:
+            pass
+        if self.actual:
+            j, n, total = self.actual
+            if j.inicio and j.estado in EN_CURSO:
+                s = int(time.time() - j.inicio)
+                self.status_text.set(f"Procesando ({n}/{total}): {j.etiqueta()} · {j.estado} · "
+                                     f"{s // 60}:{s % 60:02d}")
+        self.master.after(150, self._poll_queue)
+
+    def _start_thread(self):
+        if self.worker_thread is not None and self.worker_thread.is_alive():
+            return
+        trabajos = [j for j in self.trabajos
+                    if j.procesable() and not ((j.estado or "").startswith("Hecho") or j.estado == "Muxeado")]
+        if not trabajos:
+            incompletos = sum(1 for j in self.trabajos if not j.procesable())
+            self._show_warning("Nada que procesar",
+                               "No hay episodios listos: cada fila necesita un doblaje y su RAW (o, para "
+                               "solo ajustar un subtítulo, el vídeo y el subtítulo)." +
+                               (f"\n\nHay {incompletos} fila(s) incompletas." if incompletos else "") +
+                               "\n\nPara rehacer uno ya hecho: clic derecho → «Volver a procesar».")
+            return
+        missing = [d['label'] for d in DEPENDENCIES + MODULOS
+                   if not d.get('opcional') and not self.dependency_status.get(d['key'], {}).get('found')]
+        if missing:
+            if not self._ask_yesno(
+                "Faltan dependencias",
+                "Faltan: " + ", ".join(missing) + ".\n¿Quieres continuar de todas formas? (probablemente fallará)"
+            ):
+                return
+        carpeta = self.output_folder.get().strip()
+        if carpeta and not os.path.isdir(carpeta):
+            self._show_error("Carpeta de salida", f"La carpeta de salida no existe:\n{carpeta}")
+            return
+        # el idioma del castellano: el del muxeado, que va también en el nombre del audio sincronizado
+        idioma = self.mux_idioma.get().strip() or "es-ES"
+        if not re.fullmatch(r"[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*", idioma):
+            self._show_error("Idioma", "Usa una etiqueta de idioma como es-ES, es-419, ca-ES o spa.")
+            return
+        mux = None
+        if self.muxear.get():
+            mux = (idioma, self.mux_titulo.get().strip() or "Castellano")
+            for j in trabajos:          # aquí (hilo de la ventana): lee la plantilla y el título del castellano
+                j.plan_mux = self._plan_mux(j)
+        self._guardar_ajustes()
+
+        self.stop_event.clear()
+        for j in trabajos:
+            j.estado = "En cola"
+            self._update_row(j)
+        self._terminados = 0
+        self.progress.configure(maximum=len(trabajos), value=0)
+        self.start_button.config(state=tk.DISABLED)
+        self.stop_button.config(state=tk.NORMAL)
+        self.status_text.set(f"Sincronizando {len(trabajos)} episodio(s)...")
+
+        self.worker_thread = threading.Thread(
+            target=self._worker,
+            args=(trabajos, carpeta, idioma, self.sobrescribir.get(), mux, self.rellenar.get(),
+                  (self.mux_idioma.get().strip() or "es-ES") if self.forzados.get() else None,
+                  self.decodificar.get(), self.otras_pistas.get(), self.formato.get(), self.estirar_variable.get(),
+                  self.limpiar.get()),
+            daemon=True,
+        )
+        self.respuesta_tanda = None
+        if self.act is not None:        # con una tanda en marcha no se actualiza (ni desde otra ventana)
+            self.act.marcar_ocupado(True, f"una tanda de {len(trabajos)} episodio(s)")
+        self.worker_thread.start()
+
+    def _stop(self):
+        self.stop_event.set()
+        terminar_proceso_activo()
+        self.status_text.set("Deteniendo: se cancela el episodio en curso y se borra lo que llevaba...")
+
+    def _preguntar_sin_cortes(self, j, actual, nuevo):
+        """(Hilo de trabajo) El castellano de j no tiene cortes: ¿se convierte a `nuevo` o va intacto (`actual`)?
+        Lo pregunta la ventana (o se usa lo elegido para toda la tanda) y aquí se espera la respuesta."""
+        if self.respuesta_tanda is not None:
+            return self.respuesta_tanda
+        caja = {"evento": threading.Event(), "convertir": False}
+        self.progress_queue.put(("pregunta", (j, actual, nuevo, caja)))
+        while not caja["evento"].wait(0.2):
+            if self.stop_event.is_set():
+                return False
+        return caja["convertir"]
+
+    def _dialogo_sin_cortes(self, j, actual, nuevo):
+        """Ventana: dejar intacto el castellano sin cortes o convertirlo. Devuelve (convertir, para toda la tanda)."""
+        palette = self._get_palette()
+        dialog = tk.Toplevel(self.master)
+        dialog.title("Castellano sin cortes")
+        dialog.configure(background=palette['bg'])
+        dialog.transient(self.master)
+        dialog.resizable(False, False)
+        res = {"convertir": False}
+        todos = tk.BooleanVar(value=False)
+        frame = tk.Frame(dialog, background=palette['bg'], padx=25, pady=20)
+        frame.pack(fill="both", expand=True)
+        tk.Label(frame, background=palette['bg'], foreground=palette['fg'], wraplength=440, justify="left",
+                 text=f"{j.etiqueta()}: el castellano no necesita cortes ni rellenos, así que puede ir tal cual, sin "
+                      f"recodificar y sin perder nada ({actual}).\n\n¿Lo dejo intacto o lo convierto a {nuevo}?"
+                 ).pack(anchor="w", pady=(0, 12))
+        ttk.Checkbutton(frame, text="Hacer lo mismo con el resto de esta tanda", variable=todos).pack(anchor="w",
+                                                                                                    pady=(0, 15))
+        botones = tk.Frame(frame, background=palette['bg'])
+        botones.pack()
+
+        def cerrar(convertir):
+            res["convertir"] = convertir
+            dialog.destroy()
+
+        ttk.Button(botones, text=f"Dejar intacto ({actual})", command=lambda: cerrar(False)).pack(side="left", padx=5)
+        ttk.Button(botones, text=f"Convertir a {nuevo}", command=lambda: cerrar(True)).pack(side="left", padx=5)
+        dialog.protocol("WM_DELETE_WINDOW", lambda: cerrar(False))
+        dialog.update_idletasks()
+        try:
+            x = self.master.winfo_rootx() + (self.master.winfo_width() // 2) - (dialog.winfo_width() // 2)
+            y = self.master.winfo_rooty() + (self.master.winfo_height() // 2) - (dialog.winfo_height() // 2)
+            dialog.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        except Exception:
+            pass
+        dialog.lift()
+        self.master.bell()
+        dialog.grab_set()
+        dialog.wait_window()
+        return res["convertir"], todos.get()
+
+    # ------------------------------------------------------------------
+    def _ejecutar(self, cmd, j, entorno):
+        """(Hilo de trabajo) Lanza el script, pasa cada línea a la ventana y contesta sus preguntas. (líneas, código)."""
+        lineas = []
+        try:
+            proceso = open_subprocess(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                      stderr=subprocess.STDOUT, bufsize=1, env=entorno)
+            _registrar_proceso_activo(proceso)
+            try:
+                for linea in iter(proceso.stdout.readline, ''):
+                    linea = linea.rstrip("\r\n")
+                    if linea.startswith(sd.PREGUNTA_SIN_CORTES):
+                        # sin cortes: ¿intacto o al formato elegido? Se pregunta en la ventana y se contesta
+                        actual, _, nuevo = linea[len(sd.PREGUNTA_SIN_CORTES):].partition("|")
+                        convertir = self._preguntar_sin_cortes(j, actual, nuevo)
+                        try:
+                            proceso.stdin.write(("convertir" if convertir else "intacto") + "\n")
+                            proceso.stdin.flush()
+                        except OSError:
+                            pass
+                        continue
+                    lineas.append(linea)
+                    self.progress_queue.put(("linea", (j, linea)))
+                codigo = proceso.wait()
+            finally:
+                _limpiar_proceso_activo()
+                try:
+                    proceso.stdin.close()
+                except OSError:
+                    pass
+        except OSError as e:
+            lineas.append(f"ERROR: no se pudo lanzar el análisis: {e}")
+            codigo = -1
+        return lineas, codigo
+
+    def _solo_subs(self, j, carpeta, idioma, sobrescribir, mux, entorno):
+        """(Hilo de trabajo) Una fila de solo subtítulos: el subtítulo ajustado al vídeo, que ya está hecho, comparándolo
+        con su voz, y, si se muxea, un MKV nuevo con él (el vídeo de partida no se toca). Devuelve cómo ha ido:
+        "hecho", "avisos", "error", "existe" o "cancelado", y si se ha muxeado."""
+        salida = sd.ruta_subs_solo(j.original, idioma, carpeta or None)
+        informe = os.path.splitext(salida)[0] + "_informe.txt"
+        mkv = sd.ruta_mux(j.original, carpeta or None, "con subtítulos") if mux else None
+        hacer_mux = bool(mkv and not os.path.exists(mkv))
+        # hecho: el subtítulo o, si se muxea, el vídeo con él (al muxear no se deja copia del subtítulo)
+        if os.path.exists(salida) or (mkv and not hacer_mux):
+            if not sobrescribir:
+                lineas = leer_lineas(informe) + ([f"Ya existe el vídeo muxeado, no se toca: {mkv}"] if mkv else [])
+                self.progress_queue.put(("fin", (j, "Ya existe", lineas, salida)))
+                return "existe", False
+            borrar((salida, informe))
+        self.en_curso_salidas = [salida, informe] + ([mkv] if hacer_mux else [])
+        cmd = [python_analisis(), SCRIPT, "--solo-subs", j.original, "--subs", j.sub, "-o", salida, "--idioma", idioma]
+        if hacer_mux:
+            cmd += ["--muxear", mkv, "--mux-idioma", mux[0], "--mux-titulo", mux[1]]
+        lineas, codigo = self._ejecutar(cmd, j, entorno)
+        if self.stop_event.is_set():
+            borrar(self.en_curso_salidas)
+            self.en_curso_salidas = []
+            lineas.append("Cancelado por el usuario; se han borrado los archivos a medias.")
+            self.progress_queue.put(("fin", (j, "Cancelado", lineas, None)))
+            return "cancelado", False
+        self.en_curso_salidas = []
+        res = leer_informe(lineas)
+        muxeado = bool(hacer_mux and os.path.exists(mkv) and not res['mux_error'])
+        if codigo != 0 or res['error'] or not (os.path.exists(salida) or muxeado):
+            if not res['error']:
+                lineas.append(f"ERROR: el análisis terminó con código {codigo}")
+            borrar((salida, informe) + ((mkv,) if hacer_mux else ()))
+            self.progress_queue.put(("fin", (j, "Error", lineas, None)))
+            return "error", False
+        if mkv and not hacer_mux:
+            lineas.append(f"Ya existe el vídeo muxeado, no se toca: {mkv}")
+        estado = "Hecho" + texto_avisos(res)
+        if res['mux_error']:
+            estado += " · sin muxear"
+        self.progress_queue.put(("fin", (j, estado, lineas, salida)))
+        return ("avisos" if res['avisos'] else "hecho"), muxeado
+
+    def _worker(self, *args):
+        """(Hilo de trabajo) La tanda (_tanda). Pase lo que pase, la ventana recibe «done»: si el hilo muriera sin
+        avisar, se quedaría en «Analizando…» con el botón de empezar bloqueado (así se veía el fallo del 23-10-2026)."""
+        try:
+            self._tanda(*args)
+        except Exception as e:
+            import traceback
+            donde = traceback.extract_tb(e.__traceback__)[-1]
+            self.progress_queue.put(("done", f"Proceso parado por un fallo interno de la GUI: {type(e).__name__}: {e} "
+                                             f"[{donde.name}, línea {donde.lineno}]."))
+
+    def _tanda(self, trabajos, carpeta, idioma, sobrescribir, mux=None, rellenar=True, forzados=None, deco="cpu",
+               otras_pistas=True, formato="flac", estirar=False, limpiar=False):
+        """mux: (idioma, título) para meter el audio en el vídeo original, o None.
+        rellenar: lo que le falte al doblaje se rellena con el audio original.
+        forzados: idioma con el que leer (OCR) los forzados quemados en la imagen del doblaje, o None.
+        deco: con qué se decodifica el vídeo (clave de sd.DECODIFICADORES).
+        otras_pistas: las demás pistas dobladas del doblaje se sincronizan y muxean también.
+        formato: el del audio doblado si hay que recodificarlo (clave de FORMATOS_AUDIO); sin cortes, se pregunta.
+        estirar: si la velocidad del doblaje varía (VHS), se estira el castellano en vez de cortarlo.
+        limpiar: el castellano se limpia del ruido de la cinta (VHS) antes de montarlo."""
+        total = len(trabajos)
+        hechos = con_avisos = errores = saltados = muxeados = 0
+        entorno = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
+
+        for n, j in enumerate(trabajos, 1):
+            if self.stop_event.is_set():
+                break
+            if j.quitado:
+                continue
+            self.progress_queue.put(("inicio", (j, n, total)))
+            # un fallo inesperado en un episodio no para la tanda: su fila queda en error con el motivo y se sigue
+            # (el 23-10-2026 un fallo así, sin avisar, dejó sin hacer todos los de «solo subtítulos» tras el primero)
+            try:
+                if j.solo_subs():
+                    como, muxeado = self._solo_subs(j, carpeta, idioma, sobrescribir, mux, entorno)
+                    if como == "cancelado":
+                        break
+                    hechos += como in ("hecho", "avisos")
+                    con_avisos += como == "avisos"
+                    errores += como == "error"
+                    saltados += como == "existe"
+                    muxeados += muxeado
+                    continue
+                try:
+                    salida = sd.ruta_salida(j.doblaje, idioma, carpeta or None)
+                except Exception as e:
+                    self.progress_queue.put(("fin", (j, "Error", [f"ERROR: no se pudo leer el doblaje: {e}"], None)))
+                    errores += 1
+                    continue
+                base = os.path.splitext(salida)[0]
+                sub_out = base + ".srt" if j.sub else None
+                informe = base + "_informe.txt"
+                forz_out = sd.ruta_forzados(salida) if forzados else None
+                try:                # subtítulos de texto que trae el doblaje: se ajustan en _sub1.srt, _sub2.ass...
+                    subs_dob = [sd.ruta_sub_doblaje(salida, s) for s in sd.pistas_sub_doblaje(j.doblaje) if s["ext"]]
+                except Exception:
+                    subs_dob = []
+                try:                # las otras pistas de audio que pueden salir (_pista2_[cat].eac3...)
+                    pistas_extra = [sd.ruta_pista_extra(salida, s) for s in sd.pistas_audio(j.doblaje)]
+                except Exception:
+                    pistas_extra = []
+                subs_dob += pistas_extra        # se tratan igual: se respetan las de antes, se borran las de ahora
+                # el .mkv final nunca se sobrescribe: puede ser uno que hayas muxeado tú
+                mkv = sd.ruta_mux(j.original, carpeta or None, mux[1], j.plan_mux) if mux else None
+                hacer_mux = bool(mkv and not os.path.exists(mkv))
+                solo_mux = False
+                if any(x and os.path.exists(x) for x in (salida, sub_out)):
+                    if not sobrescribir:
+                        if not (hacer_mux and os.path.exists(salida)):
+                            lineas = leer_lineas(informe)
+                            if mkv and not hacer_mux:
+                                lineas.append(f"Ya existe el vídeo muxeado, no se toca: {mkv}")
+                            self.progress_queue.put(("fin", (j, "Ya existe", lineas, salida)))
+                            saltados += 1
+                            continue
+                        if sd.leer_mapa(salida) and sub_out and not os.path.exists(sub_out):
+                            # al muxear no se deja copia del subtítulo ajustado: sin él el vídeo iría sin subtítulo, y
+                            # rehacerlo con el mapa no averigua para qué versión estaba hecho (eso lo hacen las voces)
+                            self.progress_queue.put(("linea", (j, "El subtítulo ajustado ya no está (al muxear no se "
+                                                                  "deja copia): se vuelve a sincronizar para meterlo")))
+                            borrar((salida, informe))
+                        elif sd.leer_mapa(salida):
+                            solo_mux = True     # el audio ya está: solo falta meterlo en el vídeo
+                        else:
+                            # sin su informe no se sabe la velocidad ni los cortes: muxearlo así podía dejarlo desfasado
+                            # (Pequeñas mentiras: borrado el informe, el original no se habría adaptado a 25 fps)
+                            self.progress_queue.put(("linea", (j, "Falta el informe del audio sincronizado (guarda la "
+                                                                  "velocidad y los cortes): se vuelve a sincronizar")))
+                            borrar((salida,))
+                    else:
+                        borrar((salida, sub_out, informe, forz_out) + tuple(subs_dob))
+                self.en_curso_salidas = [] if solo_mux else [x for x in (salida, sub_out, informe) if x]
+                # los forzados y subtítulos de antes (quizá corregidos a mano) se respetan; los que se creen ahora, no
+                forz_nuevo = bool(forz_out and not os.path.exists(forz_out))
+                if forz_nuevo:
+                    self.en_curso_salidas.append(forz_out)
+                subs_nuevos = [x for x in subs_dob if not os.path.exists(x)]
+                self.en_curso_salidas += subs_nuevos
+                if hacer_mux:
+                    self.en_curso_salidas.append(mkv)
+
+                cmd = [python_analisis(), SCRIPT, j.doblaje, j.original, "-o", salida]
+                if solo_mux:
+                    cmd += ["--solo-muxear"]
+                else:
+                    if j.sub:
+                        cmd += ["--subs", j.sub]
+                    if not rellenar:
+                        cmd += ["--sin-relleno-original"]
+                    cmd += ["--formato", formato if formato in FORMATOS_AUDIO else "flac", "--sin-cortes", "preguntar"]
+                    if estirar:
+                        cmd += ["--estirar-variable"]
+                    if limpiar:
+                        cmd += ["--limpiar"]
+                    if j.correcciones:
+                        cmd += ["--correcciones", j.correcciones]
+                if forzados:                # el idioma del OCR es el de la pista muxeada
+                    cmd += ["--forzados", "--mux-idioma", forzados]
+                if deco != "cpu" and deco in sd.DECODIFICADORES:
+                    cmd += ["--decodificar", deco]
+                if not otras_pistas:
+                    cmd += ["--solo-pista-principal"]
+                if hacer_mux:
+                    cmd += ["--muxear", mkv, "--mux-idioma", mux[0], "--mux-titulo", mux[1]]
+                    if j.plan_mux:          # sin él, el script copia el título del castellano si lo tiene
+                        cmd += ["--titulo-video", j.plan_mux]
+                lineas, codigo = self._ejecutar(cmd, j, entorno)
+
+                if self.stop_event.is_set():
+                    borrar(self.en_curso_salidas)
+                    self.en_curso_salidas = []
+                    lineas.append("Cancelado por el usuario; se han borrado los archivos a medias.")
+                    self.progress_queue.put(("fin", (j, "Cancelado", lineas, None)))
+                    break
+                self.en_curso_salidas = []
+
+                if solo_mux:
+                    # el informe ya lleva la línea del muxeado si ha ido bien (la añade el script)
+                    res = leer_informe(lineas)
+                    previo = leer_lineas(informe)
+                    if not any(RE_MUX.match(x) for x in previo):     # sin informe (audio hecho fuera)
+                        previo += [x for x in lineas if RE_MUX.match(x)]
+                    if res['mux_error']:
+                        previo.append(f"No se pudo muxear: {res['mux_error']}")
+                        self.progress_queue.put(("fin", (j, "Sin muxear", previo, salida)))
+                        errores += 1
+                    else:
+                        self.progress_queue.put(("fin", (j, "Muxeado", previo, salida)))
+                        muxeados += 1
+                    continue
+
+                res = leer_informe(lineas)
+                if codigo != 0 or res['error'] or not os.path.exists(salida):
+                    if not res['error']:
+                        lineas.append(f"ERROR: el análisis terminó con código {codigo}")
+                    borrar((salida, sub_out, informe) + ((forz_out,) if forz_nuevo else ()) + tuple(subs_nuevos))
+                    if hacer_mux:
+                        borrar((mkv,))
+                    self.progress_queue.put(("fin", (j, "Error", lineas, None)))
+                    errores += 1
+                    continue
+                if mkv and not hacer_mux:
+                    lineas.append(f"Ya existe el vídeo muxeado, no se toca: {mkv}")
+                if res['avisos']:
+                    estado = "Hecho" + texto_avisos(res)
+                    con_avisos += 1
+                else:
+                    estado = "Hecho"
+                if res['mux_error']:
+                    estado += " · sin muxear"
+                elif hacer_mux:
+                    muxeados += 1
+                hechos += 1
+                self.progress_queue.put(("fin", (j, estado, lineas, salida)))
+            except Exception as e:
+                import traceback
+                donde = traceback.extract_tb(e.__traceback__)[-1]
+                self.en_curso_salidas = []
+                self.progress_queue.put(("fin", (j, "Error", [f"ERROR interno de la GUI: {type(e).__name__}: {e} "
+                                                              f"[{donde.name}, línea {donde.lineno}]"], None)))
+                errores += 1
+
+        partes = [f"{hechos}/{total} episodio(s) sincronizados"]
+        if muxeados:
+            partes.append(f"{muxeados} muxeado(s) en su RAW")
+        if con_avisos:
+            partes.append(f"{con_avisos} con avisos (en naranja: conviene escuchar esos puntos)")
+        if saltados:
+            partes.append(f"{saltados} ya existían (marca «Sobrescribir» para rehacerlos)")
+        if errores:
+            partes.append(f"{errores} con error")
+        if self.stop_event.is_set():
+            partes.append("detenido por el usuario")
+        self.progress_queue.put(("done", "Proceso terminado: " + ", ".join(partes) + "."))
+
+
+def primera_ejecucion():
+    """Este Python no tiene numpy/scipy: se ofrece descargarlos (y ffmpeg si falta) y se relanza."""
+    root = tk.Tk()
+    tareas = [("Instalando numpy y scipy...", instalar_modulos)]
+    if not ffmpeg_disponible():
+        tareas.append(("Descargando ffmpeg...", instalar_ffmpeg))
+
+    def fin(ok):
+        if ok and os.path.exists(VENV_PYW):
+            subprocess.Popen([VENV_PYW, os.path.abspath(__file__)] + sys.argv[1:],
+                             env=dict(os.environ, SINCRO_GUI_RELANZADA="1"))
+        elif ok is None:
+            messagebox.showinfo("Sincronizar Doblaje",
+                                "Sin numpy y scipy el programa no puede analizar el audio.\n"
+                                "La próxima vez que lo abras se volverá a ofrecer la descarga.")
+
+    Instalador(root, mensaje_componentes(True, len(tareas) > 1), tareas, LIGHT_PALETTE, fin)
+    root.mainloop()
+
+
+def main():
+    if sd is None:
+        primera_ejecucion()
+        return
+    dnd = False
+    root = None
+    if TkinterDnD is not None:
+        try:
+            root = TkinterDnD.Tk()
+            dnd = True
+        except Exception:
+            root = None
+    if root is None:
+        root = tk.Tk()
+    app = App(root, dnd=dnd)
+    root.protocol("WM_DELETE_WINDOW", lambda: on_closing(root, app))
+    if len(sys.argv) > 1:       # archivos soltados sobre el acceso directo
+        root.after(300, lambda: app._add_paths(sys.argv[1:]))
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
