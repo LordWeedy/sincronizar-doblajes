@@ -1,6 +1,6 @@
-# Sincronizar Doblaje · actualizaciones
+# Sync Master · actualizaciones
 
-Canal de actualizaciones del programa Sincronizar Doblaje.
+Canal de actualizaciones de Sync Master (sincroniza doblajes con la RAW; antes se llamaba Sincronizar Doblaje).
 
 **Versiones:** van numeradas (1.0, 1.1, 1.2...). Cada una tiene su página en
 [Releases](https://github.com/LordWeedy/sincronizar-doblajes/releases), con sus novedades y su paquete .zip.
