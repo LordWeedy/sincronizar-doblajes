@@ -1,0 +1,541 @@
+"""Limpieza del audio de una digitalización VHS: continua, cortes de la captura, chasquidos, zumbido y siseo.
+
+Lo usa sincronizar_doblaje.py con el castellano antes de montarlo (--limpiar, casilla de la GUI). Suelto:
+    python limpiar_vhs.py entrada salida.flac [--ss S] [--t T] [--reduccion DB] [--z-chasquido Z] [--chasquidos q.flac]
+
+Todo se mide en el propio audio (nada va fijado para una cinta):
+1. Continua: se resta la media y un paso alto de 10 Hz quita lo que deriva.
+2. Cortes de la captura (las dos pistas a cero un rato): ruido real de la cinta con fundidos de 3 ms; en el borde del
+   archivo, silencio.
+3. Chasquidos: detector AR de dos lados e interpolación LSAR, recortada a la amplitud de alrededor, hasta 4 pasadas.
+   Solo picos de >= 12 sigmas que sobresalen >= 15 dB por encima de 6 kHz y no se repiten al ritmo del tono de voz
+   (una voz chillona tiene picos así en cada golpe de glotis: tocarlos cambia el timbre).
+4. Zumbido y tonos fijos (la familia de 25 Hz del tambor, la red, silbidos): STFT de 16384 muestras; en sus bandas, y
+   solo donde dominan (en las pausas), se bajan hasta el siseo de alrededor. Nada de muescas: resuenan tras la voz, y
+   la fase del zumbido no aguanta ni 5 s para restar una onda fija.
+5. Siseo: Wiener con SNR a priori dirigida por decisión (Ephraim-Malah), suelo de -12 dB.
+La misma ganancia va a todos los canales (calculada con la mezcla). Al final se comprueba: ruido en las pausas, tonos,
+cambio por bandas con voz, lo quitado con voz frente a sin ella y tramos de ruido que no bajan.
+Memoria: unas 3 veces el audio en float32 (20 min estéreo a 44,1 kHz, ~1,3 GB; 45 min, ~3 GB).
+Ninja Sasuke 2 (VHS, octubre de 2026): ruido de -47 a -58 dBFS, zumbido de +20 a +3 dB, unos 100 chasquidos por minuto.
+"""
+import argparse
+import json
+import subprocess
+
+import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
+from scipy import signal, ndimage, linalg, fft as sfft
+
+VERSION = '1.4'
+NL = 32768              # espectro para buscar los tonos fijos: 1,35 Hz por banda
+P_AR = 40               # orden del modelo AR de los chasquidos
+MAX_BYTES = 1.3e9       # audio (float32) más grande no se limpia: con ~3 veces eso no cabría en 7,4 GB de RAM
+BANDAS = [(20, 60), (60, 150), (150, 400), (400, 1000), (1000, 3000), (3000, 6000), (6000, 10000), (10000, 15000)]
+
+
+def leer(f, ss=None, t=None):
+    s = json.loads(subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'a:0', '-show_entries',
+                                   'stream=sample_rate,channels', '-of', 'json', f],
+                                  capture_output=True, text=True, check=True).stdout)['streams'][0]
+    fs, ch = int(s['sample_rate']), min(2, int(s['channels']))
+    cmd = ['ffmpeg', '-v', 'error'] + (['-ss', str(ss)] if ss else []) + (['-t', str(t)] if t else [])
+    raw = subprocess.run(cmd + ['-i', f, '-map', '0:a:0', '-ac', str(ch), '-f', 'f32le', '-'],
+                         capture_output=True, check=True).stdout
+    return np.frombuffer(raw, np.float32).reshape(-1, ch), fs
+
+
+def escribir(y, fs, ruta):
+    subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'f32le', '-ar', str(fs), '-ac', str(y.shape[1]), '-i', '-',
+                    '-c:a', 'flac', '-sample_fmt', 's32', '-bits_per_raw_sample', '24', ruta],
+                   input=np.ascontiguousarray(y, np.float32).tobytes(), check=True)
+
+
+def mezcla(x):
+    return x.mean(1, dtype=np.float32) if x.shape[1] > 1 else np.array(x[:, 0], np.float32)
+
+
+def niveles(m, fs):
+    """Nivel (sin continua) por tramos de 100 ms."""
+    fr = fs // 10
+    nf = len(m) // fr
+    return 10 * np.log10(m[:nf * fr].reshape(nf, fr).var(1, dtype=np.float64) + 1e-20), fr
+
+
+def tramos_ruido(m, fs):
+    """Tramos de >= 0,4 s a menos de 3 dB del suelo: ahí solo suena el ruido."""
+    db, fr = niveles(m, fs)
+    vivo = db > -90
+    if not vivo.any():
+        return []
+    suelo = np.percentile(db[vivo], 2)
+    lab, _ = ndimage.label(vivo & (db <= suelo + 3))
+    return [(s[0].start * fr, s[0].stop * fr) for s in ndimage.find_objects(lab) if s[0].stop - s[0].start >= 4]
+
+
+def espectro(m, tramos, nper, fs):
+    win = signal.windows.hann(nper)
+    acc, k = 0, 0
+    for a, b in tramos:
+        for i in range(a, b - nper + 1, nper // 2):
+            acc = acc + np.abs(sfft.rfft(m[i:i + nper] * win)) ** 2
+            k += 1
+    if not k:
+        return None, None
+    return np.fft.rfftfreq(nper, 1 / fs), 10 * np.log10(acc / k + 1e-30)
+
+
+def realce(P):
+    """dB de cada banda sobre la mediana de su entorno (±20 bandas)."""
+    return P - ndimage.median_filter(P, size=41, mode='nearest')
+
+
+def tope_util(fq, P):
+    """Frecuencia hasta la que hay señal (por encima, el AAC/MP3 lo ha cortado y solo queda polvo numérico)."""
+    base = ndimage.median_filter(P, size=401, mode='nearest')
+    ref = np.median(P[(fq >= 1000) & (fq <= 8000)])
+    ok = np.flatnonzero(base >= ref - 25)
+    return fq[ok[-1]] if len(ok) else fq[-1]
+
+
+def buscar_zumbido(fq, P):
+    """Fundamental del zumbido (20-65 Hz) que explica las líneas del ruido y armónicos que sobresalen."""
+    ex = realce(P)
+    pk, _ = signal.find_peaks(ex, height=6, distance=5)
+    pk = pk[(fq[pk] >= 15) & (fq[pk] <= 1000)]
+    if len(pk) < 2:
+        return None, []
+    lf, lp = fq[pk], ex[pk]
+    rejilla = np.arange(20, 65, 0.005)
+    n = np.maximum(np.round(lf[None, :] / rejilla[:, None]), 1)
+    punt = ((np.abs(lf[None, :] - n * rejilla[:, None]) < 0.7) * lp[None, :]).sum(1)
+    if punt.max() < 20:                     # sin una familia clara de líneas: no hay zumbido que quitar
+        return None, []
+    f0 = rejilla[punt >= 0.97 * punt.max()].max()
+    df = fq[1] - fq[0]
+
+    def pico(f):
+        i = int(round(f / df))
+        i = i - 1 + int(np.argmax(P[i - 1:i + 2]))
+        a, b, c = P[i - 1], P[i], P[i + 1]
+        d = 0.5 * (a - c) / (a - 2 * b + c) if a - 2 * b + c < 0 else 0.0
+        return (i + d) * df, ex[i]
+
+    est = [pico(n * f0)[0] / n for n in range(1, int(1000 / f0) + 1) if pico(n * f0)[1] >= 6]
+    if est:
+        f0 = float(np.median(est))
+    arm = []
+    for n in range(1, int(tope_util(fq, P) * 0.98 / f0)):
+        f, e = pico(n * f0)
+        if e >= 4 and abs(f - n * f0) < 1.0 + n * f0 * 2e-4:
+            arm.append((n, f, e))
+    return f0, arm
+
+
+def lineas_estables(fq, P, Pa, Pb):
+    """Tonos fijos fuera de la familia principal (otro zumbido, silbidos): realce >= 6 dB en todo el ruido y
+    >= 4 dB en cada mitad (un tono de música que suena en una pausa concreta no pasa)."""
+    ex, ea, eb = realce(P), realce(Pa), realce(Pb)
+    pk, _ = signal.find_peaks(ex, height=6, distance=3)
+    pk = pk[(fq[pk] >= 15) & (fq[pk] < tope_util(fq, P) * 0.98)]
+    return [(0, fq[i], ex[i]) for i in pk if ea[i] >= 4 and eb[i] >= 4]
+
+
+def perfil(m, tramos, n, h):
+    """Potencia media del ruido por banda STFT (mediana / ln 2: robusta a restos de contenido)."""
+    vent = np.sqrt(signal.windows.hann(n, sym=False))
+    pot = [np.abs(sfft.rfft(sliding_window_view(m[a:b], n)[::h] * vent, axis=1)) ** 2
+           for a, b in tramos if b - a >= n]
+    return np.median(np.vstack(pot), 0) / np.log(2)
+
+
+def wiener_dd(xf, n, h, lam, gmin, alfa, activo=None):
+    """Wiener con SNR a priori dirigida por decisión (Ephraim-Malah). Misma ganancia en todos los canales,
+    calculada con la mezcla; las bandas fuera de `activo` no se tocan. Por bloques de tramas (sin copiar el audio)."""
+    largo, ch = xf.shape
+    r = n // h
+    vent = np.sqrt(signal.windows.hann(n, sym=False)).astype(np.float32)
+    T = (largo + n) // h + 1                # tramas sobre el audio con n ceros a cada lado
+    out = np.zeros((largo + 2 * n, ch), np.float32)
+    prev = np.zeros(n // 2 + 1)
+    bloque = max(r, (1 << 22) // n // r * r)
+    for t0 in range(0, T, bloque):
+        t1 = min(T, t0 + bloque)
+        a = t0 * h - n                      # muestra del audio donde empieza la primera trama del bloque
+        seg = np.zeros(((t1 - 1 - t0) * h + n, ch), np.float32)
+        lo, hi = max(a, 0), min(a + len(seg), largo)
+        if hi > lo:
+            seg[lo - a:hi - a] = xf[lo:hi]
+        X = [sfft.rfft(sliding_window_view(seg[:, c], n)[::h] * vent, axis=1) for c in range(ch)]
+        M = sum(X) / ch
+        gam = (M.real ** 2 + M.imag ** 2) / lam
+        G = np.empty_like(gam)
+        for k in range(len(gam)):
+            xi = alfa * prev + (1 - alfa) * np.maximum(gam[k] - 1, 0)
+            g = np.maximum(xi / (1 + xi), gmin)
+            prev = g * g * gam[k]
+            G[k] = g
+        if activo is not None:
+            G[:, ~activo] = 1
+        for c in range(ch):
+            y = sfft.irfft(X[c] * G, n, axis=1) * vent
+            for j in range(r):              # las tramas j, j+r, ... no se solapan entre sí
+                s = y[j::r].reshape(-1)
+                o = (t0 + j) * h
+                out[o:o + len(s), c] += s
+    res = out[n:n + largo]
+    res /= r / 2                            # suma de Hann con solape 1 - 1/r = r/2
+    return res
+
+
+def quitar_zumbido(xf, m, tramos, fs, arm):
+    """Bandas de los tonos fijos, hasta el nivel del siseo de su entorno, solo donde domina el tono."""
+    n, h = 16384, 4096
+    lam = perfil(m, tramos, n, h)
+    ldb = 10 * np.log10(lam + 1e-30)
+    ex = ldb - ndimage.median_filter(ldb, size=41, mode='nearest')
+    df = fs / n
+    activo = np.zeros(len(lam), bool)
+    for _, f, _ in arm:
+        i = int(round(f / df))
+        for j in range(max(i - 2, 0), min(i + 3, len(lam))):
+            activo[j] |= ex[j] >= 1.5
+    gmin = np.clip(10 ** (-ex / 20), 0.03, 1)
+    return wiener_dd(xf, n, h, lam, gmin, 0.9, activo), int(activo.sum())
+
+
+def coef_ar(*trozos, p=P_AR):
+    """Coeficientes AR (x[n] ~ sum c_k x[n-k]) por autocorrelación, juntando los trozos dados."""
+    r = np.zeros(p + 1)
+    for s in trozos:
+        if len(s) > p:
+            F = np.fft.rfft(s * np.hanning(len(s)), 2 * len(s))
+            r += np.fft.irfft(np.abs(F) ** 2)[:p + 1]
+    if r[0] <= 0:
+        return np.zeros(p)
+    r[0] *= 1.001
+    return linalg.solve_toeplitz(r[:p], r[1:])
+
+
+def puntuar_chasquidos(m):
+    """Detector de dos lados (error de predicción filtrado con el AR al revés) en sigmas robustas por bloque:
+    un chasquido se concentra en las muestras que estropea; la voz, no."""
+    p, B = P_AR, 2048
+    z = np.zeros(len(m), np.float32)
+    for i in range(p, len(m) - B - 2 * p, B):
+        a = np.r_[1, -coef_ar(m[i - B if i >= B else 0: i + 2 * B])]
+        e = signal.lfilter(a, 1, m[i - p:i + B + p])
+        d = np.correlate(e, a, 'valid')[p:p + B]
+        z[i:i + B] = np.abs(d) / (1.4826 * np.median(np.abs(d)) + 1e-15)
+    return z
+
+
+def realce_agudo(m, i, fs):
+    """dB del pico de > 6 kHz en ±0,25 ms sobre el nivel de ±20 ms (sin el ±1 ms central)."""
+    W = int(fs * 0.02)
+    if i < W + 2000 or i > len(m) - W - 2000:
+        return 0.0
+    h = signal.sosfiltfilt(signal.butter(6, 6000, 'highpass', fs=fs, output='sos'), m[i - W - 2000:i + W + 2000])
+    c = W + 2000
+    w1, w2 = int(fs * 0.00025), int(fs * 0.001)
+    ent = np.r_[h[c - W:c - w2], h[c + w2:c + W]]
+    return 20 * np.log10(np.abs(h[c - w1:c + w1 + 1]).max() / (np.sqrt(np.mean(ent ** 2)) + 1e-15))
+
+
+def al_ritmo_de_la_voz(m, z, i, fs):
+    """¿El pico se repite un periodo de tono (2,5-12 ms) antes y después? Entonces es la voz, no un chasquido."""
+    W = int(fs * 0.023)
+    if i < W + 600 or i > len(m) - W - 600:
+        return False
+    seg = m[i - W:i + W].astype(np.float64)
+    seg -= seg.mean()
+    ac = np.correlate(seg, seg, 'full')[len(seg) - 1:]
+    ac /= ac[0] + 1e-15
+    lags = np.arange(int(fs * 0.0025), int(fs * 0.012))
+    T = lags[np.argmax(ac[lags])]
+    if ac[T] < 0.5:
+        return False
+    return z[i - T - 8:i - T + 9].max() > 0.4 * z[i] and z[i + T - 8:i + T + 9].max() > 0.4 * z[i]
+
+
+def regiones_chasquido(z, fs, z_min, m=None, realce_min=15.0, max_ms=4.0):
+    """Muestras a reparar: alrededor de cada pico >= z_min, las contiguas > 4 sigmas; lo que dure más de
+    max_ms es contenido (una consonante, un golpe) y no se toca. Con `m`, solo picos que sobresalen
+    >= realce_min dB en los agudos y no van al ritmo de la voz."""
+    pk, _ = signal.find_peaks(z, height=z_min, distance=int(fs * 0.0005))
+    descartes = {'largos': 0, 'voz': 0, 'sin agudos': 0}
+    if m is not None:
+        ok = []
+        for i in pk:
+            if realce_agudo(m, i, fs) < realce_min:
+                descartes['sin agudos'] += 1
+            elif al_ritmo_de_la_voz(m, z, i, fs):
+                descartes['voz'] += 1
+            else:
+                ok.append(i)
+        pk = ok
+    marca = z > 4
+    w = int(fs * 0.0015)
+    reg = []
+    for i in pk:
+        a, b = i, i + 1
+        while a > i - w and (marca[a - 1] or marca[a - 2] or marca[a - 3]):
+            a -= 1
+        while b < i + w and (marca[b] or marca[b + 1] or marca[b + 2]):
+            b += 1
+        a, b = a - 2, b + 2
+        if reg and a <= reg[-1][1] + P_AR // 4:
+            a = reg[-1][0]
+            reg.pop()
+        reg.append((a, b))
+    lim = int(fs * max_ms / 1000)
+    descartes['largos'] = sum(1 for a, b in reg if b - a > lim)
+    return [(a, b) for a, b in reg if b - a <= lim], descartes
+
+
+def interpolar_ar(x, a0, a1, ctx=1024, p=P_AR):
+    """LSAR: las muestras [a0, a1) que hacen mínimo el error de predicción con el AR del entorno."""
+    lo, hi = max(0, a0 - ctx), min(len(x), a1 + ctx)
+    if a0 - lo < p or hi - a1 < p:
+        return
+    seg = np.asarray(x[lo:hi], np.float64)
+    u0, u1 = a0 - lo, a1 - lo
+    a = np.r_[1, -coef_ar(seg[:u0], seg[u1:], p=p)]
+    filas = np.arange(u0, min(u1 + p, len(seg)))
+    c0 = u0 - p
+    A = np.zeros((len(filas), filas[-1] - c0 + 1))
+    for k in range(p + 1):
+        A[np.arange(len(filas)), filas - k - c0] = a[k]
+    desc = np.zeros(A.shape[1], bool)
+    desc[u0 - c0:u1 - c0] = True
+    conoc = seg[c0:filas[-1] + 1][~desc]
+    sol = np.linalg.lstsq(A[:, desc], -A[:, ~desc] @ conoc, rcond=None)[0]
+    w = max(p, (a1 - a0) * 2)               # nada más alto que la onda de alrededor
+    tope = np.abs(np.r_[seg[max(0, u0 - w):u0], seg[u1:u1 + w]]).max()
+    x[a0:a1] = np.clip(sol, -tope, tope)
+
+
+def huecos(x, fs, dc):
+    """Cortes de la captura: todas las pistas a cero (continua incluida) durante >= 1 ms. En los bordes del archivo,
+    con continua, el corte sigue hasta que el audio se acerca a ella: el AAC arranca en 0 y tarda en llegar, y esa
+    subida, sin la continua, era un golpe (Ninja Sasuke 2: 41 ms a cero, 16 más cerca de 0 y 8 de subida)."""
+    plano = (np.abs(x) < 2e-4).all(1)
+    lab, _ = ndimage.label(plano)
+    hs = [(s[0].start, s[0].stop) for s in ndimage.find_objects(lab) if s[0].stop - s[0].start >= fs // 1000]
+    if hs and np.abs(dc).max() >= 0.005:
+        w, tope = fs // 500, fs // 10           # de 2 en 2 ms, como mucho 100 ms
+        lejos = lambda i: np.any(np.abs(x[i:i + w].mean(0) - dc) > np.abs(dc) / 4)
+        if hs[0][0] == 0:
+            a1 = hs[0][1]
+            while a1 < min(tope, len(x) - w) and lejos(a1):
+                a1 += w
+            hs[0] = (0, a1)
+        if hs[-1][1] >= len(x):
+            a0 = hs[-1][0]
+            while a0 > max(len(x) - tope, w) and lejos(a0 - w):
+                a0 -= w
+            hs[-1] = (a0, len(x))
+    return hs
+
+
+def tapar_hueco(x, a0, a1, ruido, fs):
+    """Rellena el hueco con ruido real de la cinta y funde 3 ms a cada lado (el audio perdido no vuelve).
+    En el borde del archivo no hay nada antes (o después) que dé el golpe: silencio y fundido de 10 ms."""
+    f = int(fs * 0.003)
+    if a0 == 0 or a1 >= len(x):
+        x[a0:a1] = 0
+        f = int(fs * 0.01)
+        if a0 == 0 and a1 + f <= len(x):
+            x[a1:a1 + f] *= np.linspace(0, 1, f, dtype=np.float32)[:, None]
+        elif a1 >= len(x) and a0 >= f:
+            x[a0 - f:a0] *= np.linspace(1, 0, f, dtype=np.float32)[:, None]
+        return
+    a, b = max(0, a0 - f), min(len(x), a1 + f)
+    n = b - a
+    if len(ruido) < n:
+        ruido = np.tile(ruido, (n // len(ruido) + 1, 1))
+    env = np.ones(n, np.float32)
+    env[:a0 - a] = np.linspace(0, 1, a0 - a)
+    env[a1 - a:] = np.linspace(1, 0, b - a1)
+    x[a:b] = x[a:b] * (1 - env[:, None]) + ruido[:n] * env[:, None]
+
+
+def paso_alto(xf, fs, bloque=1 << 20):
+    """10 Hz, por bloques y en su sitio (la deriva de la continua); el desfase que mete no se oye."""
+    sos = signal.butter(2, 10, 'highpass', fs=fs, output='sos')
+    for c in range(xf.shape[1]):
+        zi = signal.sosfilt_zi(sos) * float(xf[0, c])
+        for i in range(0, len(xf), bloque):
+            y, zi = signal.sosfilt(sos, xf[i:i + bloque, c], zi=zi)
+            xf[i:i + bloque, c] = y
+
+
+def bandas_db(fq, P):
+    return [10 * np.log10((10 ** (P[(fq >= lo) & (fq < hi)] / 10)).sum()) for lo, hi in BANDAS]
+
+
+def limpiar(x, fs, reduccion=12.0, z_chasquido=12.0, p=print, chasquidos=None):
+    """Devuelve (audio limpio en float32, avisos). x: (muestras, canales); si nadie más lo guarda (se pasa
+    recién leído), se suelta en cuanto ya no hace falta. chasquidos: ruta donde guardar solo lo que quita la
+    reparación de chasquidos (para escucharlo). Sin con qué medir el ruido, devuelve x tal cual con un aviso."""
+    dur = len(x) / fs
+    if x.shape[1] > 2 or len(x) * x.shape[1] * 4 > MAX_BYTES:
+        aviso = (f"no se limpia el ruido de la cinta: {'más de 2 canales' if x.shape[1] > 2 else 'demasiado largo'} "
+                 "(es para episodios de VHS, mono o estéreo)")
+        p(f"Limpieza del ruido de la cinta: {aviso}")
+        return x, [aviso]
+    dc = x.mean(0, dtype=np.float64).astype(np.float32)
+    m = mezcla(x)
+    tr = tramos_ruido(m, fs)
+    seg_ruido = sum(b - a for a, b in tr) / fs
+    if seg_ruido < 3:
+        aviso = "no se limpia el ruido de la cinta: hay menos de 3 s de ruido solo para medirlo"
+        p(f"Limpieza del ruido de la cinta: {aviso}")
+        return x, [aviso]
+    p(f"Limpieza del ruido de la cinta: continua {', '.join(f'{d:+.4f}' for d in dc)}; "
+      f"{len(tr)} tramos de ruido solo ({seg_ruido:.1f} s) para medirlo")
+    hs = huecos(x, fs, dc)
+    xf = np.subtract(x, dc, dtype=np.float32)
+    del x
+    avisos = []
+
+    # cortes de la captura: ruido real de la cinta en su lugar, con fundidos
+    if hs:
+        a, b = max(tr, key=lambda r: r[1] - r[0])
+        for h0, h1 in hs:
+            tapar_hueco(xf, h0, h1, xf[a:b].copy(), fs)
+        p(f"  cortes de la captura: {len(hs)} ({sum(h1 - h0 for h0, h1 in hs) / fs * 1000:.0f} ms): "
+          + ", ".join(f"{h0 / fs:.2f} s ({(h1 - h0) / fs * 1000:.0f} ms)" for h0, h1 in hs[:10])
+          + (", ..." if len(hs) > 10 else ""))
+
+    # chasquidos sueltos
+    if z_chasquido:
+        pico0 = float(np.abs(xf).max())
+        cambios = []                        # (inicio, lo quitado) de cada reparación
+        mx = mezcla(xf)
+        z = puntuar_chasquidos(mx)
+        todas, zr0, desc0, pasada, reg = [], [], None, 0, []
+        for pasada in range(4):             # al quitar uno, puede asomar el de al lado (más pasadas ya no aportan)
+            reg, desc = regiones_chasquido(z, fs, z_chasquido, mx)
+            desc0 = desc0 or desc
+            if not reg:
+                break
+            zr0 += [float(z[r0:r1].max()) for r0, r1 in reg] if pasada == 0 else []
+            for r0, r1 in reg:
+                orig = xf[r0:r1].copy()
+                for c in range(xf.shape[1]):
+                    interpolar_ar(xf[:, c], r0, r1)
+                cambios.append((r0, orig - xf[r0:r1]))
+            todas += reg
+            mx = mezcla(xf)
+            z = puntuar_chasquidos(mx)
+        quedan = len(regiones_chasquido(z, fs, z_chasquido, mx)[0])
+        p(f"  chasquidos: {len(todas)} reparados en {pasada + 1 if reg else pasada} pasadas ({len(todas) / (dur / 60):.0f}"
+          f"/min, {sum(r1 - r0 for r0, r1 in todas) / (dur * fs) * 100:.3f} % de las muestras); no se tocan "
+          f"{desc0['voz']} al ritmo de la voz, {desc0['sin agudos']} sin agudos marcados, {desc0['largos']} largos")
+        if todas:
+            zr1 = [float(z[max(0, r0 - 44):r1 + 44].max()) for r0, r1 in todas]
+            p(f"    fuerza en los sitios reparados (sigmas): mediana {np.median(zr0):.0f} -> {np.median(zr1):.1f}, "
+              f"máx {max(zr0):.0f} -> {max(zr1):.1f}; quedan {quedan} que cumplan los criterios; pico de la señal "
+              f"{20 * np.log10(pico0):.2f} -> {20 * np.log10(np.abs(xf).max()):.2f} dBFS")
+        if chasquidos:
+            q = np.zeros(xf.shape, np.float32)
+            for r0, d in cambios:
+                q[r0:r0 + len(d)] += d
+            escribir(q, fs, chasquidos)
+            del q
+        del z, mx, cambios
+    paso_alto(xf, fs)
+    m_rep = mezcla(xf)                      # referencia para «lo quitado» por zumbido y siseo
+
+    # zumbido y tonos fijos
+    fq, P0 = espectro(m, tr, NL, fs)
+    f0, arm = buscar_zumbido(fq, P0)
+    mitad = int(np.searchsorted(np.cumsum([b - a for a, b in tr]), seg_ruido * fs / 2)) + 1
+    _, Pa = espectro(m, tr[:mitad], NL, fs)
+    _, Pb = espectro(m, tr[mitad:], NL, fs)
+    otras = [r for r in lineas_estables(fq, P0, Pa, Pb) if all(abs(r[1] - f) > 2 for _, f, _ in arm)] \
+        if Pa is not None and Pb is not None else []
+    if f0:
+        p(f"  zumbido: fundamental {f0:.3f} Hz, {len(arm)} armónicos: " + ", ".join(f"{f:.0f}" for _, f, _ in arm))
+    if otras:
+        p(f"  otros tonos fijos ({len(otras)}): " + ", ".join(f"{f:.0f}" for _, f, _ in otras))
+    arm = sorted(arm + otras, key=lambda r: r[1])
+    if arm:
+        xf, _ = quitar_zumbido(xf, m_rep, tr, fs, arm)
+    else:
+        p("  sin zumbido ni tonos fijos")
+
+    # siseo
+    lam = perfil(mezcla(xf), tr, 2048, 512)
+    y = wiener_dd(xf, 2048, 512, lam, 10 ** (-reduccion / 20), 0.98)
+    del xf
+
+    # --- comprobación
+    my = mezcla(y)
+    db0, fr = niveles(m, fs)
+    db1, _ = niveles(my, fs)
+    enr = np.zeros(len(db0), bool)
+    for a, b in tr:
+        enr[a // fr:b // fr] = True
+    fuerte = db0 >= np.percentile(db0, 70)
+    pw = lambda d, k: 10 * np.log10(np.mean(10 ** (d[k] / 10)))
+    p(f"  ruido de fondo (tramos sin contenido): {pw(db0, enr):.1f} -> {pw(db1, enr):.1f} dBFS")
+    malos = [(a, 10 * np.log10(m[a:b].var(dtype=np.float64)), 10 * np.log10(my[a:b].var(dtype=np.float64)))
+             for a, b in tr]
+    malos = [r for r in malos if r[2] > r[1] - 3]
+    if malos:
+        aviso = (f"limpieza: {len(malos)} tramos de ruido bajan menos de 3 dB: "
+                 + ", ".join(f"{a / fs:.1f} s ({u:+.1f} -> {v:+.1f})" for a, u, v in malos[:6]))
+        p(f"  AVISO: {aviso}")
+        avisos.append(aviso)
+    _, P1 = espectro(my, tr, NL, fs)
+    if arm:
+        ex0, ex1 = realce(P0), realce(P1)
+        idx = [int(round(f / (fq[1] - fq[0]))) for _, f, _ in arm]
+        ip = int(np.argmax([ex0[i] for i in idx]))
+        p(f"  tonos fijos sobre su entorno: media {np.mean([ex0[i] for i in idx]):+.1f} -> "
+          f"{np.mean([ex1[i] for i in idx]):+.1f} dB; el más fuerte ({arm[ip][1]:.1f} Hz) "
+          f"{ex0[idx[ip]]:+.1f} -> {ex1[idx[ip]]:+.1f} dB")
+    b0, b1 = bandas_db(fq, P0), bandas_db(fq, P1)
+    p("  ruido por bandas (dB): " + " | ".join(f"{lo}-{hi}: {u - v:+.1f}" for (lo, hi), v, u in zip(BANDAS, b0, b1)))
+    # voz/música: el 30 % de tramos de más nivel, por bandas, y cuánto se quitó ahí frente al ruido solo
+    tf = [(i * fr, (i + 1) * fr) for i in np.flatnonzero(fuerte)]
+    fq2, V0 = espectro(m - m.mean(), tf, 4096, fs)
+    _, V1 = espectro(my, tf, 4096, fs)
+    v0, v1 = bandas_db(fq2, V0), bandas_db(fq2, V1)
+    p("  con voz/música, cambio por bandas (dB): "
+      + " | ".join(f"{lo}-{hi}: {u - v:+.1f}" for (lo, hi), v, u in zip(BANDAS, v0, v1)))
+    dq, _ = niveles(m_rep - my, fs)
+    dif = pw(dq, fuerte) - pw(dq, enr)
+    p(f"  lo quitado por zumbido y siseo: {pw(dq, enr):.1f} dBFS en ruido solo, {pw(dq, fuerte):.1f} dBFS con "
+      f"voz/música ({dif:+.1f} dB)")
+    if dif > 3:
+        aviso = "limpieza: con voz/música se quita bastante más que en el ruido solo: parte de lo quitado es contenido"
+        p(f"  AVISO: {aviso}")
+        avisos.append(aviso)
+    pico = float(np.abs(y).max())
+    if pico >= 0.999:                       # el AAC pasaba de 0 dBFS: se baja todo un poco en vez de recortar
+        y *= 0.999 / pico
+        p(f"  pico {20 * np.log10(pico):+.2f} dBFS: todo baja {20 * np.log10(pico / 0.999):.2f} dB para no recortar")
+    return y, avisos
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Quita el ruido de la cinta del audio de un VHS digitalizado.")
+    ap.add_argument('entrada')
+    ap.add_argument('salida', help="audio limpio (FLAC de 24 bits)")
+    ap.add_argument('--ss', type=float, help="empezar en este segundo (para probar con un trozo)")
+    ap.add_argument('--t', type=float, help="solo estos segundos")
+    ap.add_argument('--reduccion', type=float, default=12, help='dB máximos de reducción del siseo (12)')
+    ap.add_argument('--z-chasquido', type=float, default=12,
+                    help='fuerza mínima (sigmas) de un chasquido para repararlo (12); 0 = no tocar chasquidos')
+    ap.add_argument('--chasquidos', help='guarda aparte solo lo que quita la reparación de chasquidos')
+    a = ap.parse_args()
+    x, fs = leer(a.entrada, a.ss, a.t)
+    y, _ = limpiar(x, fs, a.reduccion, a.z_chasquido, chasquidos=a.chasquidos)
+    escribir(y, fs, a.salida)
+
+
+if __name__ == '__main__':
+    main()
