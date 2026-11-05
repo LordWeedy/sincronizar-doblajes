@@ -1,0 +1,900 @@
+"""Batería de pruebas del sincronizador, con la respuesta conocida: cada caso se fabrica a partir de vídeos cortos (de
+G:\\cosas varias\\Intros y cosas random), se sincroniza con sincronizar_doblaje.py tal cual y se compara su informe con
+lo que tiene que salir. Se pasa después de cada cambio del programa: si algo que funcionaba se rompe, sale FALLO.
+Pedido del usuario (21-10-2026): «la robustez para no romper lo que ya funcionaba».
+
+Uso:  python probar_sincronizador.py [--carpeta CARPETA] [--solo caso1,caso2] [--conservar]
+Tarda unos minutos (vídeos de 1-4 min en SD). Los archivos fabricados van a una carpeta temporal que se borra al final
+(con --conservar se deja, para mirar un fallo). Termina con código 1 si algún caso falla."""
+import argparse, ast, builtins, os, re, shutil, subprocess, sys, tempfile, time
+
+VERSION = '1.4.7'
+AQUI = os.path.dirname(os.path.abspath(__file__))
+MOTOR = os.path.join(AQUI, "sincronizar_doblaje.py")
+CARPETA = r"G:\cosas varias\Intros y cosas random"
+BASE = "TVE 1 (Continuidad).mp4"            # 3:41, 640x480, 25 fps
+CORTO = "Cocodrilos al rescate.mp4"         # 1:00
+COLOR = "Motorratones de Marte.mp4"         # 1:01, 1080p HEVC con datos de color mal puestos («trc:reserved»)
+OTRO_DIALOGO = "Vaya Semanita - El Katxi - MARTÍN DE IDIAZABAL (480p, h264, youtube).mp4"     # 5:06, otras voces
+FONDO = [CORTO, "El locomundo de Tex Avery.mp4", COLOR, "Intro motorratones.mp4"]           # 4:08 seguidos
+PAL = 1001 / 960
+
+
+def ffmpeg(*args):
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-v", "error", "-y", *args], capture_output=True, text=True,
+                       errors="replace")
+    if r.returncode:
+        raise RuntimeError(f"ffmpeg: {r.stderr.strip()[-300:]}")
+
+
+def tasa(path):
+    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=sample_rate",
+                        "-of", "csv=p=0", path], capture_output=True, text=True)
+    return int(r.stdout.strip() or 48000)
+
+
+def segundos(mmss):
+    m, s = mmss.split(":")
+    return int(m) * 60 + float(s)
+
+
+def leer(texto):
+    """Lo que interesa del informe (o de la salida, si no hay informe): error, inicio (ms, negativo si se recorta),
+    cortes [(s, ms con signo)], velocidad, verificación, avisos."""
+    r = dict(texto=texto, error=None, inicio=None, cortes=[], velocidad="", verif=None, avisos=[])
+    en_avisos = False
+    for linea in texto.splitlines():
+        if linea.startswith("ERROR"):
+            r["error"] = linea
+        elif (m := re.match(r"^Inicio: (recortados|añadidos) (\d+) ms", linea)):
+            r["inicio"] = int(m[2]) * (-1 if m[1] == "recortados" else 1)
+        elif (m := re.match(r"^Corte\s+(\S+)\s+(inserta|recorta)\s+(\d+) ms", linea)):
+            r["cortes"].append((segundos(m[1]), int(m[3]) * (-1 if m[2] == "recorta" else 1)))
+        elif linea.startswith("Velocidad"):
+            r["velocidad"] += linea + "\n"
+        elif (m := re.match(r"^Verificación(?! \(con el castellano\)).*(?:desviación típica|mediana) ([\d.]+) ms, "
+                            r"p90 ([\d.]+) ms", linea)):
+            r["verif"] = (float(m[1]), float(m[2]))
+        elif linea.startswith("Avisos:"):
+            en_avisos = True
+        elif en_avisos and linea.startswith("  - "):
+            r["avisos"].append(linea[4:])
+        else:
+            en_avisos = False
+    r["revisar"] = [a for a in r["avisos"] if a.startswith("[revisar] ")]
+    return r
+
+
+# --- comprobaciones (cada una devuelve una lista de fallos, vacía si todo va bien)
+def sin_error(r):
+    return [f"error: {r['error']}"] if r["error"] else []
+
+
+def inicio(ms, tol):
+    return lambda r: [] if r["inicio"] is not None and abs(r["inicio"] - ms) <= tol else \
+        [f"inicio {r['inicio']} ms, se esperaba {ms:+d} ±{tol}"]
+
+
+def cortes(n):
+    return lambda r: [] if len(r["cortes"]) == n else [f"{len(r['cortes'])} cortes {r['cortes']}, se esperaban {n}"]
+
+
+def un_corte(ms, tol, desde, hasta):
+    def f(r):
+        if len(r["cortes"]) != 1:
+            return [f"{len(r['cortes'])} cortes {r['cortes']}, se esperaba uno de {ms:+d} ms"]
+        t, d = r["cortes"][0]
+        return ([] if abs(d - ms) <= tol else [f"el corte es de {d:+d} ms, se esperaba {ms:+d} ±{tol}"]) + \
+               ([] if desde <= t <= hasta else [f"el corte va en {t:.2f} s, se esperaba entre {desde} y {hasta}"])
+    return f
+
+
+def contiene(texto, donde="texto"):
+    return lambda r: [] if texto in r[donde] else [f"falta «{texto}»"]
+
+
+def no_contiene(texto):
+    return lambda r: [f"sale «{texto}»"] if texto in r["texto"] else []
+
+
+def nada_que_revisar(r):
+    return [f"avisa «{a}»" for a in r["revisar"]]
+
+
+def verificacion(max_ms):
+    return lambda r: [] if r["verif"] and r["verif"][0] <= max_ms else [f"verificación {r['verif']}, máx. {max_ms} ms"]
+
+
+def error_con(texto):
+    return lambda r: [] if r["error"] and texto in r["error"] else [f"se esperaba el error «{texto}», salió {r['error']}"]
+
+
+def verif_castellano(max_ms):
+    """La verificación con la propia pista doblada (con guía, 1.4.4): su p90, como mucho max_ms."""
+    def f(r):
+        m = re.search(r"Verificación \(con el castellano\): mediana ([\d.]+) ms, p90 ([\d.]+) ms", r["texto"])
+        return [] if m and float(m[2]) <= max_ms else \
+            [f"verificación con el castellano: {m[0] if m else 'no sale'}; se esperaba p90 <= {max_ms} ms"]
+    return f
+
+
+def correccion_sugerida(desde, hasta, ms, tol_ms):
+    """Un aviso de trozo descolocado con su corrección a mano: que cubra desde-hasta (s, con 3 s de margen) y mueva ms."""
+    def f(r):
+        for m in re.finditer(r"la corrección a mano sería «(\d+):(\d\d)-(\d+):(\d\d) ([+-]\d+)»", r["texto"]):
+            a, b = int(m[1]) * 60 + int(m[2]), int(m[3]) * 60 + int(m[4])
+            if a <= desde + 3 and b >= hasta - 3 and a >= desde - 3 and b <= hasta + 3 and abs(int(m[5]) - ms) <= tol_ms:
+                return []
+        return [f"no sale la corrección de {desde}-{hasta} s ({ms:+d} ms)"]
+    return f
+
+
+def cortes_en(esperados, tol_ms, tol_s):
+    """Los cortes [(s del doblaje, ms con signo)], en ese orden."""
+    def f(r):
+        if len(r["cortes"]) != len(esperados):
+            return [f"{len(r['cortes'])} cortes {r['cortes']}, se esperaban {esperados}"]
+        return [f"corte en {t:.2f} s de {d:+d} ms, se esperaba en {te} s de {de:+d} ms"
+                for (t, d), (te, de) in zip(r["cortes"], esperados) if abs(d - de) > tol_ms or abs(t - te) > tol_s]
+    return f
+
+
+def corte_cerca(te, de, tol_ms, tol_s):
+    """Que haya un corte de de ms (con signo) a te ±tol_s s del doblaje (para casos con cortes de tolerancias distintas:
+    un recorte va al silencio más cercano, un relleno justo al empalme)."""
+    return lambda r: [] if any(abs(d - de) <= tol_ms and abs(t - te) <= tol_s for t, d in r["cortes"]) else \
+        [f"no hay un corte de {de:+d} ms en {te} ±{tol_s} s; cortes: {r['cortes']}"]
+
+
+# --- los casos: (nombre, qué comprueba, cómo se fabrica el doblaje -> (doblaje, original), comprobaciones)
+def casos(c, tmp):
+    base, corto, color = (os.path.join(c, x) for x in (BASE, CORTO, COLOR))
+    sr = tasa(base)
+    t = lambda nombre: os.path.join(tmp, nombre)
+
+    def limpio():
+        ffmpeg("-i", base, "-map", "0:a:0", "-ac", "2", "-c:a", "flac", t("limpio.mka"))
+        return t("limpio.mka"), base
+
+    def desfase():
+        ffmpeg("-i", base, "-map", "0:a:0", "-ac", "2", "-af", "adelay=1500|1500", "-c:a", "flac", t("desfase.mka"))
+        return t("desfase.mka"), base
+
+    def sobra():
+        ffmpeg("-i", base, "-filter_complex", "[0:a]atrim=0:60,asetpts=PTS-STARTPTS[a1];[0:a]atrim=58,"
+               "asetpts=PTS-STARTPTS[a2];[a1][a2]concat=n=2:v=0:a=1[a]", "-map", "[a]", "-ac", "2", "-c:a", "flac",
+               t("sobra.mka"))
+        return t("sobra.mka"), base
+
+    def falta():
+        ffmpeg("-i", base, "-filter_complex", "[0:a]atrim=0:90,asetpts=PTS-STARTPTS[a1];[0:a]atrim=91,"
+               "asetpts=PTS-STARTPTS[a2];[a1][a2]concat=n=2:v=0:a=1[a]", "-map", "[a]", "-ac", "2", "-c:a", "flac",
+               t("falta.mka"))
+        return t("falta.mka"), base
+
+    def pal():
+        ffmpeg("-i", base, "-map", "0:a:0", "-ac", "2", "-af", f"asetrate={sr}*1001/960,aresample={sr}", "-c:a", "flac",
+               t("pal.mka"))
+        return t("pal.mka"), base
+
+    def pal_tono():
+        ffmpeg("-i", base, "-map", "0:a:0", "-ac", "2", "-af", f"atempo={PAL:.10f}", "-c:a", "flac", t("pal_tono.mka"))
+        return t("pal_tono.mka"), base
+
+    def corto_pal():
+        ffmpeg("-i", corto, "-map", "0:a:0", "-ac", "2", "-af",
+               f"asetrate={tasa(corto)}*1001/960,aresample={tasa(corto)}", "-c:a", "flac", t("corto_pal.mka"))
+        return t("corto_pal.mka"), corto
+
+    def imagen_desplazada():
+        ffmpeg("-itsoffset", "0.5", "-i", base, "-i", base, "-map", "0:v:0", "-map", "1:a:0", "-c", "copy",
+               t("imagen_desplazada.mkv"))
+        return t("imagen_desplazada.mkv"), base
+
+    def con_imagen():
+        ffmpeg("-i", base, "-f", "lavfi", "-i", "anoisesrc=d=230:c=pink:r=48000", "-filter_complex",
+               "[0:v]trim=0:63,setpts=PTS-STARTPTS[v1];[0:v]trim=60,setpts=PTS-STARTPTS[v2];[v1][v2]concat=n=2:v=1:a=0[v]",
+               "-map", "[v]", "-map", "1:a:0", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-c:a", "aac",
+               "-shortest", t("con_imagen.mp4"))
+        return t("con_imagen.mp4"), base
+
+    def color_raro():
+        ffmpeg("-i", color, "-f", "lavfi", "-i", "anoisesrc=d=70:c=pink:r=48000", "-map", "0:v:0", "-map", "1:a:0",
+               "-c:v", "copy", "-c:a", "aac", "-shortest", t("color.mkv"))
+        return t("color.mkv"), color
+
+    def destellos():
+        # 15 s de destellos al principio (imagen normal e invertida cada 0,16 s, como la cabecera de Becker), en la
+        # RAW y en el doblaje; al doblaje le faltan sus primeros 1,5 s (hay que añadírselos) y su audio no se parece
+        # (se mide con la imagen)
+        ffmpeg("-i", base, "-vf", r"negate=enable='lt(mod(t\,0.32)\,0.16)*lt(t\,15)'", "-c:v", "libx264",
+               "-preset", "ultrafast", "-crf", "23", "-c:a", "copy", t("destellos_raw.mp4"))
+        ffmpeg("-ss", "1.5", "-i", t("destellos_raw.mp4"), "-f", "lavfi", "-i", "anoisesrc=d=230:c=pink:r=48000",
+               "-map", "0:v:0", "-map", "1:a:0", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-c:a", "aac",
+               "-shortest", t("destellos.mp4"))
+        return t("destellos.mp4"), t("destellos_raw.mp4")
+
+    def lateral_rota():
+        # La pelu del señor Pan 3x02 (27-10-2026): la guía, en AAC y con el tono corregido, tenía la lateral (L-R)
+        # estropeada y la mezcla intacta; el programa miraba solo la lateral, daba el sonido por «otro» y medía con la
+        # imagen. Aquí, en la RAW y en el doblaje, la lateral es ruido (distinto en cada uno) y la mezcla, el sonido;
+        # el del doblaje, además, estirado y vuelto a encoger (la onda no coincide: hace falta la envolvente)
+        lado = lambda semilla: (f"anoisesrc=d=230:c=pink:r={sr}:a=0.2:s={semilla}[n];[m][n]amerge=inputs=2,"
+                                "pan=stereo|c0=0.6*c0+c1|c1=0.6*c0-c1[a]")
+        ffmpeg("-i", base, "-filter_complex", "[0:a]pan=mono|c0=0.5*c0+0.5*c1[m];" + lado(1), "-map", "0:v:0",
+               "-map", "[a]", "-c:v", "copy", "-c:a", "flac", "-shortest", t("lateral_rota_raw.mkv"))
+        ffmpeg("-i", base, "-filter_complex", f"[0:a]atempo={PAL:.10f},atempo={1 / PAL:.10f},"
+               "pan=mono|c0=0.5*c0+0.5*c1[m];" + lado(2), "-map", "0:v:0", "-map", "[a]", "-c:v", "copy",
+               "-c:a", "flac", "-shortest", t("lateral_rota.mkv"))
+        return t("lateral_rota.mkv"), t("lateral_rota_raw.mkv")
+
+    def guia_sin_imagen():
+        # un doblaje con imagen, su castellano (aquí ruido) y la guía inglesa, que es el audio de la RAW: con la guía
+        # encajando en todo el episodio no se leen los vídeos (27-10-2026; antes, más de la mitad del tiempo)
+        ffmpeg("-i", base, "-map", "0:v:0", "-map", "0:a:0", "-c", "copy", "-metadata:s:a:0", "language=eng",
+               t("guia_raw.mkv"))
+        ffmpeg("-i", base, "-f", "lavfi", "-i", f"anoisesrc=d=230:c=pink:r={sr}:a=0.1", "-map", "0:v:0", "-map", "1:a:0",
+               "-map", "0:a:0", "-c:v", "copy", "-c:a:0", "flac", "-c:a:1", "copy", "-metadata:s:a:0", "language=spa",
+               "-metadata:s:a:1", "language=eng", "-shortest", t("guia.mkv"))
+        return t("guia.mkv"), t("guia_raw.mkv")
+
+    def guia_sin_idioma():
+        # La pelu del señor Pan 3x14: la guía (el audio de la RAW, con el tono corregido) sin idioma y un castellano;
+        # con la envolvente, una pista sin idioma no se daba nunca por versión original (y se medía con la imagen)
+        ffmpeg("-i", base, "-map", "0:v:0", "-map", "0:a:0", "-c", "copy", "-metadata:s:a:0", "language=eng",
+               t("guia_sin_idioma_raw.mkv"))
+        ffmpeg("-i", base, "-f", "lavfi", "-i", f"anoisesrc=d=230:c=pink:r={sr}:a=0.1", "-filter_complex",
+               f"[0:a]atempo={PAL:.10f},atempo={1 / PAL:.10f}[g]", "-map", "0:v:0", "-map", "1:a:0", "-map", "[g]",
+               "-c:v", "copy", "-c:a", "flac", "-metadata:s:a:0", "language=spa", "-metadata:s:a:1", "language=und",
+               "-shortest", t("guia_sin_idioma.mkv"))
+        return t("guia_sin_idioma.mkv"), t("guia_sin_idioma_raw.mkv")
+
+    def etiquetas_cambiadas():
+        # la versión original (con el tono corregido) etiquetada «spa» y el doblaje (aquí ruido) «eng»: con la onda no se
+        # veía que la «castellana» tiene los diálogos del original, y se habría muxeado inglés como castellano
+        ffmpeg("-i", base, "-f", "lavfi", "-i", f"anoisesrc=d=230:c=pink:r={sr}:a=0.1", "-filter_complex",
+               f"[0:a]atempo={PAL:.10f},atempo={1 / PAL:.10f}[g]", "-map", "0:v:0", "-map", "[g]", "-map", "1:a:0",
+               "-c:v", "copy", "-c:a", "flac", "-metadata:s:a:0", "language=spa", "-metadata:s:a:1", "language=eng",
+               "-shortest", t("etiquetas_cambiadas.mkv"))
+        ffmpeg("-i", base, "-map", "0:v:0", "-map", "0:a:0", "-c", "copy", "-metadata:s:a:0", "language=eng",
+               t("etiquetas_cambiadas_raw.mkv"))
+        return t("etiquetas_cambiadas.mkv"), t("etiquetas_cambiadas_raw.mkv")
+
+    def ruido():
+        ffmpeg("-f", "lavfi", "-i", "anoisesrc=d=221:c=pink:r=48000", "-ac", "2", "-c:a", "flac", t("ruido.mka"))
+        return t("ruido.mka"), base
+
+    def desfasada_de_la_guia():
+        # Diagnóstico asesinato S06 (02-11-2026): dentro del doblaje el castellano no iba a la par de la guía (de 0 a 180
+        # ms, distinto en cada trozo) y, con la verificación hecha con la guía, salía «0,0 ms». Aquí el castellano (los
+        # graves del audio de la RAW, con otra «voz» encima) va 150 ms tarde entre 1:00 y 2:30, con silencios en los dos
+        # empalmes; la guía, a la par
+        ffmpeg("-i", base, "-map", "0:v:0", "-map", "0:a:0", "-c", "copy", "-metadata:s:a:0", "language=eng",
+               t("desf_raw.mkv"))
+        ffmpeg("-i", base, "-f", "lavfi", "-i", f"anoisesrc=d=230:c=white:r={sr}:a=0.3:s=7", "-filter_complex",
+               "[0:a]aformat=channel_layouts=stereo,lowpass=f=300,lowpass=f=300,asplit=3[a][b][c];"
+               "[a]atrim=0:60,asetpts=PTS-STARTPTS[a1];[b]atrim=59.85:149.85,asetpts=PTS-STARTPTS[b1];"
+               "[c]atrim=150,asetpts=PTS-STARTPTS[c1];[a1][b1][c1]concat=n=3:v=0:a=1[me];"
+               "[1:a]bandpass=f=1200:width_type=h:w=2000,aformat=channel_layouts=stereo[v];"
+               "[me][v]amix=inputs=2:normalize=0:duration=first,"
+               "volume=0:enable='between(t,59.6,60.4)+between(t,149.6,150.4)'[cas]",
+               "-map", "0:v:0", "-map", "[cas]", "-map", "0:a:0", "-c:v", "copy", "-c:a:0", "flac", "-c:a:1", "copy",
+               "-metadata:s:a:0", "language=spa", "-metadata:s:a:1", "language=eng", "-shortest", t("desf.mkv"))
+        return t("desf.mkv"), t("desf_raw.mkv")
+
+    def trozo_corto_descolocado():
+        # 8 s (1:40-1:48) puestos 1,5 s fuera de su sitio: demasiado corto para ser un desfase de la medida (pide unos
+        # 10 s), así que se monta con el de al lado; la verificación solo contaba lo que encaja y salía bien. Ahora lo
+        # busca más lejos y avisa, con la corrección a mano que lo arreglaría (1.4.5)
+        ffmpeg("-i", base, "-filter_complex", "[0:a]asplit=3[a][b][c];[a]atrim=0:100,asetpts=PTS-STARTPTS[a1];"
+               "[b]atrim=101.5:109.5,asetpts=PTS-STARTPTS[b1];[c]atrim=108,asetpts=PTS-STARTPTS[c1];"
+               "[a1][b1][c1]concat=n=3:v=0:a=1[a]", "-map", "[a]", "-ac", "2", "-c:a", "flac", t("descolocado.mka"))
+        return t("descolocado.mka"), base
+
+    def sonido_desfasado_por_trozos():
+        # medido con la imagen (aquí, a la fuerza): el sonido del doblaje va 120 ms tarde de su imagen entre 1:00 y 2:30.
+        # Seguir al sonido solo ve partes de 0,2 s o más; el contraste lo corrige (1.4.5)
+        ffmpeg("-i", base, "-f", "lavfi", "-i", f"anoisesrc=d=230:c=white:r={sr}:a=0.3:s=7", "-filter_complex",
+               "[0:a]aformat=channel_layouts=stereo,lowpass=f=300,lowpass=f=300,asplit=3[a][b][c];"
+               "[a]atrim=0:60,asetpts=PTS-STARTPTS[a1];[b]atrim=59.88:149.88,asetpts=PTS-STARTPTS[b1];"
+               "[c]atrim=150,asetpts=PTS-STARTPTS[c1];[a1][b1][c1]concat=n=3:v=0:a=1[me];"
+               "[1:a]bandpass=f=1200:width_type=h:w=2000,aformat=channel_layouts=stereo[v];"
+               "[me][v]amix=inputs=2:normalize=0:duration=first,"
+               "volume=0:enable='between(t,59.6,60.4)+between(t,149.6,150.4)'[cas]",
+               "-map", "0:v:0", "-map", "[cas]", "-c:v", "copy", "-c:a", "flac", "-metadata:s:a:0", "language=spa",
+               "-shortest", t("sonido_trozos.mkv"))
+        return t("sonido_trozos.mkv"), base, ["--medir", "video"]
+
+    def desfasada_tono():
+        # lo mismo en un DVD PAL con el tono corregido (como La pelu del señor Pan): castellano y guía acelerados sin
+        # cambiar el tono; la onda no coincide con el original y se contrasta con la envolvente de los graves
+        desfasada_de_la_guia()
+        ffmpeg("-i", t("desf.mkv"), "-filter_complex", f"[0:a:0]atempo={PAL:.10f}[c];[0:a:1]atempo={PAL:.10f}[g]",
+               "-map", "[c]", "-map", "[g]", "-c:a", "flac", "-metadata:s:a:0", "language=spa",
+               "-metadata:s:a:1", "language=eng", t("desf_tono.mka"))
+        return t("desf_tono.mka"), t("desf_raw.mkv")
+
+    def empalme_en_mono():
+        # One Piece 1x01 de Netflix (04-11-2026, prueba de un compañero del usuario): la escena de después de la
+        # cortinilla iba en mono; con la lateral, que ahí calla, el empalme del relleno caía 1 s tarde, ese segundo de
+        # ambiente sonaba dos veces y la música de la cortinilla entraba a medias. Aquí, un original con lateral de
+        # verdad (otro vídeo en ella) y 6 s en mono justo después de un hueco de 10 s que le falta al doblaje
+        # (1:30-1:40); el doblaje, con un ruido lateral muy bajo que no es el del original (como el de un códec). Con la
+        # 1.4.5 el corte iba en 1:35,40 y la verificación decía «0,0 ms»
+        ffmpeg("-i", base, "-stream_loop", "-1", "-i", corto, "-filter_complex",
+               f"[0:a]pan=mono|c0=0.5*c0+0.5*c1[m];[1:a]aresample={sr},pan=mono|c0=0.5*c0+0.5*c1,volume=0.7,"
+               "volume=0:enable='between(t,100,106)'[s];[m][s]amerge=inputs=2,pan=stereo|c0=c0+c1|c1=c0-c1[a]",
+               "-map", "0:v:0", "-map", "[a]", "-c:v", "copy", "-c:a", "flac", "-shortest", t("mono_raw.mkv"))
+        ffmpeg("-i", t("mono_raw.mkv"), "-f", "lavfi", "-i", f"anoisesrc=d=230:c=white:r={sr}:a=0.0001:s=3",
+               "-filter_complex", "[0:a]asplit=2[a][b];[a]atrim=0:90,asetpts=PTS-STARTPTS[a1];[b]atrim=100,"
+               "asetpts=PTS-STARTPTS[b1];[a1][b1]concat=n=2:v=0:a=1[d];[d][1:a]amerge=inputs=2,"
+               "pan=stereo|c0=c0+c2|c1=c1-c2[a]", "-map", "[a]", "-c:a", "flac", "-shortest", t("mono.mka"))
+        return t("mono.mka"), t("mono_raw.mkv")
+
+    def estereo_otro_dialogo():
+        # Lo de casi todos los doblajes de verdad (05-11-2026, tras la 1.4.6): estéreo con la misma música y efectos en
+        # los dos y el diálogo en el centro, cada uno en su idioma. La lateral (L-R) lleva solo el fondo y encaja; la
+        # mezcla (L+R) lleva el diálogo, distinto, y encaja poco. Los demás casos se fabrican con audios casi mono y se
+        # miden con la mezcla, así que este es el que comprueba que medir también con la mezcla (1.4.6) no mueve nada
+        # donde la lateral suena. Fondo: cuatro vídeos seguidos (sin bucles, que darían coincidencias cada vuelta), en
+        # la lateral y algo en el centro. Al doblaje le sobran 2 s en el 1:00 y le faltan 8 s del 2:30 del original.
+        # (asetpts=N/SR/TB: tiempos seguidos; sin él el doblaje salía con un salto de 40 ms en sus primeros paquetes, que
+        # el motor lee como un reproductor, como un hueco, y el informe daba «recortados 40 ms»)
+        fondo = [os.path.join(c, x) for x in FONDO]
+        mezcla = "".join(f"[{i + 1}:a]aresample={sr},pan=mono|c0=0.5*c0+0.5*c1[f{i}];" for i in range(len(fondo))) + \
+            "".join(f"[f{i}]" for i in range(len(fondo))) + f"concat=n={len(fondo)}:v=0:a=1[fondo];" + \
+            f"[0:a]aresample={sr},pan=mono|c0=0.5*c0+0.5*c1[dlg];" + \
+            "[dlg][fondo]amerge=inputs=2,pan=stereo|c0=0.6*c0+0.6*c1|c1=0.6*c0-0.2*c1,asetpts=N/SR/TB,atrim=0:221"
+        entradas = [x for f in fondo for x in ("-i", f)]
+        ffmpeg("-i", base, *entradas, "-filter_complex", mezcla + "[a]", "-map", "0:v:0", "-map", "[a]", "-c:v",
+               "copy", "-c:a", "flac", "-shortest", t("dial_raw.mkv"))
+        ffmpeg("-i", os.path.join(c, OTRO_DIALOGO), *entradas, "-filter_complex",
+               mezcla + ",asplit=3[a][b][c];[a]atrim=0:60,asetpts=PTS-STARTPTS[a1];[b]atrim=58:150,asetpts=PTS-STARTPTS"
+               "[b1];[c]atrim=158,asetpts=PTS-STARTPTS[c1];[a1][b1][c1]concat=n=3:v=0:a=1,asetpts=N/SR/TB[a]", "-map", "[a]",
+               "-c:a", "flac", t("dial.mka"))
+        return t("dial.mka"), t("dial_raw.mkv")
+
+    def salida_estereo():
+        # un castellano 5.1 en AC3 sin cortes: tal cual iría intacto, pero se ha pedido 2.0 a 224 kb/s (1.4.3)
+        ffmpeg("-i", base, "-map", "0:a:0", "-ac", "6", "-c:a", "ac3", "-b:a", "448k", t("estereo.mka"))
+        return t("estereo.mka"), base, ["--canales", "2.0", "--formato", "ac3", "--kbps", "224"]
+
+    def salida_es(canales, codec, kbps):
+        def f(r):
+            ruta = t("salida_estereo_SYNC.mka")
+            p = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
+                                "stream=codec_name,channels,bit_rate", "-of", "csv=p=0", ruta], capture_output=True,
+                               text=True).stdout.strip()
+            return [] if p == f"{codec},{canales},{kbps * 1000}" else [f"la salida es «{p}», se esperaba "
+                                                                       f"{codec}, {canales} canales, {kbps} kb/s"]
+        return f
+
+    return [
+        ("limpio", "el mismo audio: ni cortes ni nada que revisar", limpio,
+         [sin_error, inicio(0, 5), cortes(0), verificacion(5), nada_que_revisar]),
+        ("desfase", "1,5 s tarde en todo el episodio", desfase,
+         [sin_error, inicio(-1500, 10), cortes(0), nada_que_revisar]),
+        ("sobra_2s", "2 s repetidos en el 1:00: un recorte ahí", sobra,
+         [sin_error, inicio(0, 10), un_corte(-2000, 40, 57, 63), nada_que_revisar]),
+        # (el corte, justo en el empalme: hasta la 1.4.5 iba en 1:31,33 y se admitía de 1:28 a 1:32; 1 s sonaba dos
+        # veces, y lo vio la comprobación de los empalmes)
+        ("falta_1s", "le falta 1 s en el 1:30: un relleno ahí, con el corte en el empalme", falta,
+         [sin_error, inicio(0, 10), un_corte(1000, 40, 89.85, 90.15), nada_que_revisar]),
+        ("pal", "PAL, el tono subido", pal,
+         [sin_error, contiene("4,3 %", "velocidad"), inicio(0, 15), cortes(0), nada_que_revisar]),
+        ("pal_tono", "PAL con el tono corregido (se mide con la envolvente)", pal_tono,
+         [sin_error, contiene("4,3 %", "velocidad"), contiene("tono corregido", "velocidad"), inicio(0, 25), cortes(0)]),
+        ("corto_pal", "un vídeo de 1 min a velocidad PAL", corto_pal,
+         [sin_error, contiene("4,3 %", "velocidad"), cortes(0)]),
+        ("imagen_desplazada", "la imagen del doblaje 0,5 s desplazada de su sonido: se sigue al sonido", imagen_desplazada,
+         [sin_error, contiene("imagen va +500 ms"), inicio(0, 5), cortes(0), nada_que_revisar]),
+        ("con_imagen", "sin audio que encaje: con la imagen, 3 s repetidos en el 1:03", con_imagen,
+         [sin_error, contiene("Señal de análisis: vídeo"), un_corte(-3000, 80, 58, 68)]),
+        ("color_raro", "un vídeo con los datos de color mal puestos se lee", color_raro,
+         [sin_error, no_contiene("no se ha podido leer el vídeo"), contiene("Señal de análisis: vídeo")]),
+        ("destellos", "15 s de destellos al principio: no cuentan, sin cortes ahí", destellos,
+         [sin_error, contiene("Destellos"), inicio(1500, 60), cortes(0)]),
+        ("lateral_rota", "la lateral de los dos audios estropeada y el mismo sonido: se mide con la mezcla, no con la "
+                         "imagen", lateral_rota,
+         [sin_error, contiene("Señal de análisis: mezcla L+R"), no_contiene("Señal de análisis: vídeo"), inicio(0, 25),
+          cortes(0)]),
+        ("guia_sin_imagen", "con una guía que encaja en todo el episodio no se leen los vídeos", guia_sin_imagen,
+         [sin_error, contiene("guía: pista 2"), contiene("Comprobación con la imagen: no hace falta"),
+          no_contiene("Leyendo los cambios de plano"), inicio(0, 5), cortes(0), no_contiene("NO va a la par")]),
+        ("guia_sin_idioma", "la guía sin idioma (y con el tono corregido) se reconoce por cómo suena", guia_sin_idioma,
+         [sin_error, contiene("guía: pista 2"), no_contiene("Señal de análisis: vídeo"), inicio(0, 25), cortes(0),
+          no_contiene("NO va a la par")]),
+        ("etiquetas_cambiadas", "la versión original etiquetada como castellano: se ve por el audio", etiquetas_cambiadas,
+         [sin_error, contiene("Las etiquetas de idioma no cuadran"), contiene("Se sincroniza la pista 2"),
+          contiene("guía: pista 1"), inicio(0, 25), no_contiene("NO va a la par")]),
+        ("desfasada_de_la_guia", "el castellano 150 ms tarde de su guía en un trozo: se contrasta con el original y se "
+                                 "corrige, con los cortes en sus silencios", desfasada_de_la_guia,
+         [sin_error, contiene("NO va a la par de la guía"), cortes_en([(60.0, -150), (150.0, 150)], 10, 1.0),
+          verif_castellano(5), nada_que_revisar]),
+        ("trozo_corto_descolocado", "8 s descolocados 1,5 s: la verificación lo ve y avisa con la corrección a mano",
+         trozo_corto_descolocado,
+         [sin_error, contiene("puede estar descolocado"), correccion_sugerida(100, 108, 1500, 40),
+          contiene("ventanas encajan en su sitio")]),
+        ("sonido_desfasado_por_trozos", "medido con la imagen, el sonido 120 ms tarde de ella en un trozo: el contraste "
+                                        "lo corrige", sonido_desfasado_por_trozos,
+         [sin_error, contiene("Señal de análisis: vídeo"), contiene("NO va a la par de su imagen"),
+          cortes_en([(60.0, -120), (150.0, 120)], 15, 1.0), verif_castellano(5)]),
+        ("desfasada_tono", "lo mismo con el tono corregido (PAL): se contrasta con la envolvente de los graves",
+         desfasada_tono,
+         [sin_error, contiene("NO va a la par de la guía"),
+          cortes_en([(57.5, -144), (143.9, 144)], 10, 1.0), verif_castellano(5)]),
+        ("empalme_en_mono", "un hueco de 10 s junto a una escena en mono (la lateral calla): el empalme del relleno se "
+                            "busca también con la mezcla y va en su sitio", empalme_en_mono,
+         [sin_error, contiene("Señal de análisis: lateral"), cortes_en([(90.0, 10000)], 40, 0.15), verificacion(5),
+          nada_que_revisar]),
+        ("estereo_otro_dialogo", "estéreo con la misma música y efectos y otro diálogo (un doblaje de verdad): se mide "
+                                 "con la lateral, 2 s de más en el 1:00 y 8 s de menos en el 2:32, en su sitio",
+         estereo_otro_dialogo,
+         [sin_error, contiene("Señal de análisis: lateral"), inicio(0, 10), cortes(2), corte_cerca(60.0, -2000, 40, 3.0),
+          corte_cerca(152.0, 8000, 40, 0.15), verificacion(5), nada_que_revisar]),
+        ("ruido", "un audio sin relación: error, sin inventarse nada", ruido,
+         [error_con("apenas hay coincidencias")]),
+        ("salida_estereo", "un 5.1 sin cortes, pedido en 2.0 a 224 kb/s: se recodifica así, no va intacto",
+         salida_estereo,
+         [sin_error, cortes(0), contiene("5.1 → 2.0"), contiene("pasado a 2.0 como se ha pedido; no había cortes"),
+          no_contiene("intacto, sin recodificar"), salida_es(2, "ac3", 224)]),
+    ]
+
+
+def pruebas_sueltas():
+    """Comprobaciones de funciones sueltas del motor, sin fabricar nada: [(nombre, fallos)]."""
+    sys.path.insert(0, AQUI)
+    import numpy as np
+    import sincronizar_doblaje as sd
+    out = []
+    muestra = ("frame:0    pts:0       pts_time:0\ntimecode=00:00:00:00\nlavfi.scd.mafd=0.000\nlavfi.scd.score=0.000\n"
+               "frame:1    pts:42      pts_time:0.042\nlavfi.scd.mafd=0.632\nlavfi.scd.score=0.632\n")
+    n = len(sd.RE_FOTOGRAMA.findall(muestra))
+    out.append(("patron_fotogramas", "las líneas de ffmpeg con código de tiempo se leen",
+                [] if n == 2 else [f"lee {n} fotogramas de 2"]))
+    c = sd.ncc_curve(np.ones(100, np.float32), np.ones(50, np.float32))
+    out.append(("ncc_corto", "buscar un trozo más largo que la señal no revienta",
+                [] if c is None else ["no devuelve None"]))
+    av = ["corte 1:00.00: sin silencio claro, conviene escucharlo",
+          "1:00-2:00: 12 cambios de plano seguidos del doblaje no encajan con el original; puede estar descolocado"]
+    clase = [sd.para_revisar(a) for a in av]
+    out.append(("clases_de_aviso", "los avisos se separan en «revisar» y «escuchar»",
+                [] if clase == [False, True] else [f"clasificados {clase}"]))
+    # el nombre del audio sincronizado: el nuevo, y los de antes se siguen reconociendo (no se repite lo ya hecho)
+    fallos = []
+    with tempfile.TemporaryDirectory(prefix="nombres_") as d:
+        dob = os.path.join(d, "Serie 1x01.avi")
+        nuevo = sd.ruta_salida(dob, "es-ES")
+        if os.path.basename(nuevo) != "Serie 1x01_[es-ES]_SYNC.mka":
+            fallos.append(f"nombre nuevo: {os.path.basename(nuevo)}")
+        for viejo, idioma in (("Serie 1x01_[spa]_SYNC_ENG.mka", "es-ES"), ("Serie 1x01_[spa]_SYNC_ENG.flac", "es-ES"),
+                              ("Serie 1x01_[spa]_SYNC_ENG.mka", "es-419")):
+            open(os.path.join(d, viejo), "w").close()
+            r = os.path.basename(sd.ruta_salida(dob, idioma))
+            if r != viejo:
+                fallos.append(f"con {viejo} ya hecho ({idioma}) da {r}")
+            os.remove(os.path.join(d, viejo))
+        otra = os.path.join(d, "salida")
+        os.makedirs(otra)
+        open(os.path.join(otra, "Serie 1x01_[spa]_SYNC_ENG.mka"), "w").close()
+        if os.path.dirname(sd.ruta_salida(dob, "es-ES", otra)) != otra or \
+                not sd.ruta_salida(dob, "es-ES", otra).endswith("_SYNC_ENG.mka"):
+            fallos.append("con carpeta de salida no encuentra el de antes")
+    out.append(("nombre_salida", "«…_[es-ES]_SYNC.mka», y los «…_[spa]_SYNC_ENG» de antes se reconocen", fallos))
+    # la pista de la RAW con la que se mide (y se rellena): por idioma y, si no decide, por el título (el DVDRemux de
+    # Becker: ucraniano «MVO» primero, inglés «Original» después, doblaje .avi sin idioma)
+    pista = lambda n, idioma="", titulo="": {"_n": n, "index": n, "codec_name": "ac3", "channels": 2,
+                                            "tags": {k: v for k, v in (("language", idioma), ("title", titulo)) if v}}
+    casos_pista = [  # (pistas de la RAW, pistas del doblaje, la que tiene que salir)
+        ([pista(1, "ukr", "MVO | Comedy Central"), pista(2, "eng", "Original")], [pista(1)], 2),
+        ([pista(1, "rus", "Закадровый"), pista(2, "eng")], [pista(1)], 2),
+        ([pista(1, "eng", "Commentary"), pista(2, "eng", "English")], [pista(1)], 2),
+        ([pista(1, "dan"), pista(2, "eng")], [pista(1, "spa"), pista(2, "eng")], 2),      # por idioma
+        ([pista(1, "spa", "Castellano"), pista(2, "eng", "V.O.")], [pista(1)], 2),
+        ([pista(1, "ukr"), pista(2, "eng")], [pista(1)], 1),                               # nada lo dice: la primera
+        ([pista(1, "eng", "Original")], [pista(1)], 1),
+    ]
+    fallos, antes = [], sd.pistas_audio
+    try:
+        for ori, dob, bien in casos_pista:
+            sd.pistas_audio = lambda ruta, ori=ori, dob=dob: ori if ruta == "raw" else dob
+            sale = sd.elegir_original("raw", "doblaje", "spa", p=lambda *a: None)["_n"]
+            if sale != bien:
+                fallos.append(f"con {[sd.describir_pista(s) for s in ori]} elige la {sale}, no la {bien}")
+    finally:
+        sd.pistas_audio = antes
+    out.append(("pista_original", "de la RAW se mide con la versión original, no con voces superpuestas", fallos))
+    # etiquetas de idioma que no lo son (La pelu del señor Pan 3x14: «???» en ffprobe, «und» en mkvmerge): sin idioma, y
+    # que no acaben en el nombre de un archivo («?» no vale en Windows: salía «Broken pipe»)
+    fallos = [f"«{e}» -> «{sd.idioma_valido(e)}»" for e, bien in (("???", ""), ("und", ""), ("", ""), ("spa", "spa"),
+                                                                  ("es-ES", "es-ES"), ("eng", "eng"))
+              if sd.idioma_valido(e) != bien]
+    ruta = sd.ruta_pista_extra("x_SYNC.mka", {"_n": 2, "tags": {"language": "???"}})
+    if any(ch in os.path.basename(ruta) for ch in '?*<>|:"'):
+        fallos.append(f"nombre de la pista extra: {ruta}")
+    out.append(("idioma_sin_valor", "«???» y «und» son «sin idioma» y no van al nombre de archivo", fallos))
+    # cuándo la envolvente mide bien sin la imagen: el mismo sonido con otra codificación (parecido 0,85-0,94, desfase
+    # estable) sí; otra mezcla (el desfase salta 0,18 s de ida y vuelta) no
+    t = np.arange(600.0)
+    estable = np.column_stack([t, 0.465 + np.random.default_rng(2).normal(0, 0.001, 600), np.full(600, 0.88)])
+    salta = estable.copy()
+    salta[::7, 1] += 0.18
+    fallos = ([] if sd.envolvente_precisa(estable) else ["el mismo sonido con parecido 0,88 no se da por preciso"]) + \
+             (["otra mezcla, con saltos de 0,18 s, se da por precisa"] if sd.envolvente_precisa(salta) else [])
+    out.append(("envolvente_precisa", "la envolvente vale sin imagen si el desfase es estable, no si salta", fallos))
+    # subtítulo de otra versión con diálogo seguido (huecos de 0,5 s) y dos desfases candidatos a 30 s que cubren voz
+    # por bloques alternos (Black Mask, 01-11-2026: se alternaban y las líneas salían desordenadas y solapadas)
+    iv = np.array([(10 + 2.5 * i, 12 + 2.5 * i) for i in range(48)])
+    v = np.zeros(400 * sd.FR_VOZ, np.float32)
+    for i, (x0, x1) in enumerate(iv):
+        L = 0.0 if (i // 6) % 2 == 0 else -30.0        # el desfase con el que cada bloque de 6 cubre voz
+        v[int((x0 + L + 40) * sd.FR_VOZ):int((x1 + L + 40) * sd.FR_VOZ)] = 1
+    ref = dict(v=v, t0=-40.0, escala=1.0)
+    a, L = sd._tramos_con_deriva(iv, ref, 1.0, 0.0, np.array([50.0, 60, 100, 110]), np.array([0.0, 0, -30, -30]))
+    ini, fin = a * iv[:, 0] + L, a * iv[:, 1] + L
+    mal = int((ini[1:] < fin[:-1] - sd.SUB_TOL_ORDEN - 1e-9).sum())
+    out.append(("subtitulo_en_orden", "un subtítulo de otra versión no sale nunca antes que el anterior",
+                [f"{mal} subtítulos salen antes que el anterior"] if mal else []))
+    # velocidad con la envolvente (La pelu del señor Pan 3x21): a la misma velocidad una ventana suelta de 0,80 (música
+    # lenta, que la envolvente casa aunque vaya un 4 % más rápida) no puede vetar la PAL, confirmada con 0,94-0,98
+    misma, pal = (-1.0, 1, 0.80, 5, 0.80), (0.97, 2, 0.95, 5, 0.98)
+    fallos = [] if sd.encaja_velocidad(pal, sd.base_envolvente(misma), True) else ["la PAL no encaja"]
+    if sd.encaja_velocidad(misma, sd.ENV_RUIDO, True):
+        fallos.append("una ventana suelta a la misma velocidad se da por buena")
+    out.append(("velocidad_suelta", "una ventana suelta a la misma velocidad no veta la PAL confirmada", fallos))
+    # el seguimiento empieza con el desfase del principio, no con el mejor (La pelu del señor Pan 3x18: +1,01 s al
+    # principio y +28,4 s, más claro, al final; empezando en +28,4 el primer minuto salía con desfases casuales)
+    rng = np.random.default_rng(1)
+    AR, n = sd.AR, 700 * sd.AR
+    x = rng.standard_normal(n + 60 * AR).astype(np.float32)
+    a = x[30 * AR:30 * AR + n]
+    b = np.concatenate([x[29 * AR:29 * AR + 300 * AR] + rng.standard_normal(300 * AR).astype(np.float32),
+                        x[5 * AR + 300 * AR:5 * AR + n]])                      # +1 s (con ruido) y luego +25 s
+    p, m = sd.desfase_inicial(a, b, primero=True)[0], sd.desfase_inicial(a, b)[0]
+    out.append(("desfase_del_principio", "con dos desfases en el episodio, el seguimiento empieza por el del principio",
+                [] if abs(p - 1) < 0.01 and abs(m - 25) < 0.01 else [f"primero {p:+.3f} s, mejor {m:+.3f} s"]))
+    # la limpieza del ruido de la cinta, por trozos (1.4.2: una película de 86 min no se limpiaba, «demasiado largo»):
+    # los trozos casan con la limpieza de una vez, en disco sale lo mismo que en la RAM, el ruido de las pausas baja
+    # y un 5.1 no se toca (con su aviso). Un tono con vibrato y pausas, siseo, zumbido de 50 Hz, continua y chasquidos.
+    # El tono entra y sale en 30 ms, como un sonido de verdad: cortado en seco a -13 dB, el siseo (tramas de 46 ms) deja
+    # algo de ese corte en la pausa de al lado y el ruido de las pausas enteras solo bajaba 7 dB (igual en la 1.4.1)
+    import limpiar_vhs as lv
+    from scipy.ndimage import uniform_filter1d
+    fs, fallos, calla = 44100, [], lambda *a: None
+    rng = np.random.default_rng(3)
+    t = np.arange(100 * fs) / fs
+    suena = np.sin(2 * np.pi * 0.25 * t) > -0.3                     # 1,6 s de pausa cada 4 s
+    tono = 0.3 * np.sin(2 * np.pi * 180 * t + 2 * np.sin(2 * np.pi * 3 * t)) * uniform_filter1d(suena * 1.0,
+                                                                                                int(0.03 * fs))
+    x = (tono[:, None] + rng.standard_normal((len(t), 2)) * 0.004
+         + 0.003 * np.sin(2 * np.pi * 50 * t)[:, None] - 0.03).astype(np.float32)
+    x[rng.choice(np.arange(fs, len(t) - fs), 100, replace=False)] += 0.4
+    entero = np.array(lv.limpiar(x, fs, p=calla, bloque_s=1000)[0])
+    trozos = np.array(lv.limpiar(x, fs, p=calla, bloque_s=30)[0])
+    with tempfile.TemporaryDirectory(prefix="limpieza_", ignore_cleanup_errors=True) as d:
+        ruta = os.path.join(d, "x.f32")
+        x.tofile(ruta)
+        xm = np.memmap(ruta, np.float32, "r", shape=x.shape)
+        lienzo = lambda forma: np.memmap(tempfile.mktemp(suffix=".f32", dir=d), np.float32, "w+", shape=forma)
+        y = lv.limpiar(xm, fs, p=calla, lienzo=lienzo, bloque_s=30)[0]
+        en_disco = np.array(y)
+        del xm, y
+    if np.abs(trozos - entero).max() > 1e-4:
+        fallos.append(f"por trozos difiere de una vez hasta {np.abs(trozos - entero).max():.1e}")
+    if np.abs(en_disco - trozos).max() > 1e-6:
+        fallos.append(f"en disco difiere de en la RAM hasta {np.abs(en_disco - trozos).max():.1e}")
+    pausa = (uniform_filter1d(suena * 1.0, int(0.4 * fs)) == 0) & (t > 1)      # sin los 0,2 s junto al tono
+    baja = 10 * np.log10(np.var(x[pausa]) / np.var(entero[pausa]))
+    if baja < 10:
+        fallos.append(f"el ruido de las pausas solo baja {baja:.1f} dB")
+    y, av = lv.limpiar(np.zeros((10 * fs, 6), np.float32), fs, p=calla)
+    if y.shape[1] != 6 or not any("más de 2 canales" in a for a in av):
+        fallos.append(f"un 5.1 no da su aviso: {av}")
+    out.append(("limpieza_por_trozos", "la limpieza del ruido de la cinta por trozos casa con la de una vez", fallos))
+    # canales y kb/s del audio de salida (1.4.3, lo pidió un compañero del usuario): un mono pasa a 2.0 igual en los dos
+    # lados; un 5.1, con cada canal donde toca (los delanteros enteros, el central y los de los lados a -3 dB, sin el
+    # subgrave) y sin saturar; «igual» no toca los canales; los kb/s pedidos van a los admitidos; y sin cortes se
+    # recodifica solo si lo pedido no es lo que ya tiene
+    import json
+    fallos, fs = [], 48000
+    t = np.arange(3 * fs) / fs
+
+    def leer_salida(ruta):
+        r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_name,channels,bit_rate", "-of",
+                            "json", ruta], capture_output=True, text=True)
+        st = json.loads(r.stdout)["streams"][0]
+        raw = subprocess.run(["ffmpeg", "-v", "error", "-i", ruta, "-f", "f32le", "-"], capture_output=True).stdout
+        return st, np.frombuffer(raw, np.float32).reshape(-1, int(st["channels"]))
+
+    def amplitud(x, f):
+        return 2 * abs(np.fft.rfft(x[fs // 2:fs // 2 + 2 * fs])[int(f * 2)]) / (2 * fs)   # bin de 0,5 Hz, 2 s
+    with tempfile.TemporaryDirectory(prefix="canales_") as d:
+        mono = (0.5 * np.sin(2 * np.pi * 440 * t))[:, None].astype(np.float32)
+        r = sd.codificar(mono, fs, "mono", "flac", None, os.path.join(d, "mono.mka"), "2.0")
+        st, y = leer_salida(os.path.join(d, "mono.mka"))
+        if st["channels"] != 2 or r != "1.0 → 2.0":
+            fallos.append(f"mono: {st['channels']} canales, «{r}»")
+        elif np.abs(y[:, 0] - y[:, 1]).max() > 2e-4 or abs(amplitud(y[:, 0], 440) - 0.5) > 0.01:
+            fallos.append(f"mono: los dos lados no llevan el mono entero ({amplitud(y[:, 0], 440):.3f} de 0,5)")
+        frecs = (300, 500, 700, 50, 900, 1100)          # FL FR FC LFE SL SR
+        x51 = np.stack([0.3 * np.sin(2 * np.pi * f * t) for f in frecs], 1).astype(np.float32)
+        r = sd.codificar(x51, fs, "5.1(side)", "flac", None, os.path.join(d, "x51.mka"), "2.0")
+        st, y = leer_salida(os.path.join(d, "x51.mka"))
+        espera = {0: {300: 0.3, 700: 0.212, 900: 0.212, 500: 0, 1100: 0, 50: 0},
+                  1: {500: 0.3, 700: 0.212, 1100: 0.212, 300: 0, 900: 0, 50: 0}}
+        if st["channels"] != 2 or r != "5.1 → 2.0":
+            fallos.append(f"5.1: {st['channels']} canales, «{r}»")
+        else:
+            for lado, tabla in espera.items():
+                for f, a in tabla.items():
+                    if abs(amplitud(y[:, lado], f) - a) > 0.01:
+                        fallos.append(f"5.1: {'izquierdo' if lado == 0 else 'derecho'} con {amplitud(y[:, lado], f):.3f} "
+                                      f"de {f} Hz, se esperaba {a}")
+        fuerte = np.stack([0.9 * np.sin(2 * np.pi * 440 * t)] * 6, 1).astype(np.float32)
+        r = sd.codificar(fuerte, fs, "5.1", "flac", None, os.path.join(d, "fuerte.mka"), "2.0")
+        st, y = leer_salida(os.path.join(d, "fuerte.mka"))
+        if "bajado" not in r or np.abs(y).max() > 1.0:
+            fallos.append(f"5.1 fuerte: pico {np.abs(y).max():.3f}, «{r}»")
+        r = sd.codificar(x51, fs, "5.1(side)", "ac3", 448000, os.path.join(d, "igual.mka"), "igual")
+        st, _ = leer_salida(os.path.join(d, "igual.mka"))
+        if st["channels"] != 6 or r:
+            fallos.append(f"«igual» deja {st['channels']} canales, «{r}»")
+    for f_, k, ch, tasa_, quiere in (("ac3", 200, 2, 48000, 192000), ("ac3", 900, 6, 48000, 640000),
+                                     ("opus", 510, 1, 48000, 256000), ("aac", 512, 1, 44100, 256000),
+                                     ("flac", 192, 2, 48000, None)):
+        if sd.kbps_elegido(f_, k, ch, tasa_) != quiere:
+            fallos.append(f"{k} kb/s en {f_} con {ch} canales da {sd.kbps_elegido(f_, k, ch, tasa_)}, no {quiere}")
+    st = {"codec_name": "ac3", "channels": 6, "bit_rate": "448000", "sample_rate": "48000"}
+    for canales, kbps, formato, quiere in (("2.0", None, "ac3", "pasado a 2.0"), ("igual", None, "ac3", None),
+                                           ("igual", 448, "ac3", None), ("igual", 192, "ac3", "AC3 192 kb/s"),
+                                           ("igual", 192, "flac", None)):
+        m = sd.motivo_recodificar(canales, kbps, formato, st, "")
+        if (m is None) != (quiere is None) or (quiere and quiere not in m):
+            fallos.append(f"sin cortes, {canales} y {kbps} kb/s en {formato}: «{m}»")
+    out.append(("canales_y_kbps", "1.0 y 5.1 pasan bien a 2.0, sin saturar; los kb/s pedidos van a los admitidos",
+                fallos))
+    # con guía, la pista doblada se contrasta con el original (1.4.4, Diagnóstico asesinato S06): un trozo 120 ms tarde
+    # se corrige con dos cortes en sus silencios; a la par no se toca; sin relación no se inventa nada; un pico ancho (una
+    # envolvente) no es ambiguo y varios iguales (música con ritmo) sí
+    fallos = []
+    AR = sd.AR
+    rng = np.random.default_rng(1)
+    n = 300 * AR
+    from scipy.signal import butter as _butter, sosfilt as _sosfilt
+    me = _sosfilt(_butter(4, 200, "low", fs=AR, output="sos"), rng.standard_normal(n)) * 3
+    me *= np.repeat(rng.uniform(0.2, 1.0, n // AR + 1), AR)[:n]
+    golpes = np.zeros(n)
+    golpes[rng.integers(0, n, 400)] = 1
+    me += np.convolve(golpes, np.exp(-np.arange(400) / 60) * rng.standard_normal(400), "same")
+    voz = lambda s: _sosfilt(_butter(4, [300, 3400], "band", fs=AR, output="sos"),
+                             np.random.default_rng(s).standard_normal(n)) * 0.8
+    y = (me + voz(2)).astype(np.float32)
+    x = (me + voz(3)).astype(np.float32)
+    d = int(0.120 * AR)
+    x[100 * AR:200 * AR] = x[100 * AR - d:200 * AR - d].copy()
+    for t_ in (100, 200):
+        x[int((t_ - 0.4) * AR):int((t_ + 0.4) * AR)] = 0
+    db_x = sd.niveles_db(x.reshape(-1, 1), AR)
+    L, cs, inf = sd.contrastar_doblada(x, y, [0.0], [], 300.0, lambda: db_x)
+    if inf["estado"] != "corregido" or len(L) != 3 or abs(L[1] + 0.120) > 0.003 or abs(L[0]) > 0.003 \
+            or abs(L[2]) > 0.003:
+        fallos.append(f"trozo 120 ms tarde: {inf['estado']}, L {[round(v * 1000) for v in L]} ms")
+    elif any(abs(c["c"] - t_) > 0.5 for c, t_ in zip(cs, (100, 200))):
+        fallos.append(f"los cortes van en {[round(c['c'], 2) for c in cs]} s, no en los silencios de 100 y 200")
+    else:
+        v = sd.verificar_contraste(x, y, L, cs, 300.0)
+        if not v["n"] or v["p90"] > 3:
+            fallos.append(f"verificación con el castellano: {v.get('p90')} ms ({v['n']} ventanas)")
+    if sd.contrastar_doblada(y.copy(), y, [0.0], [], 300.0, lambda: db_x)[2]["estado"] != "igual":
+        fallos.append("a la par: no sale «igual»")
+    otro = (np.random.default_rng(9).standard_normal(n) * 0.3).astype(np.float32)
+    if sd.contrastar_doblada(otro, y, [0.0], [], 300.0, lambda: db_x)[2]["estado"] != "sin_medida":
+        fallos.append("un audio sin relación no sale «sin_medida»")
+    k = np.arange(-600, 601)
+    if sd.ambigua(np.exp(-(k / 15.0) ** 2)):
+        fallos.append("un pico ancho se da por ambiguo")
+    if not sd.ambigua(0.5 + 0.5 * np.cos(2 * np.pi * k / 30) * np.exp(-(k / 300.0) ** 2)):
+        fallos.append("picos iguales cada 30 ms no se dan por ambiguos")
+    # 1.4.5: un tramo corto (10 s, sin ventana entera) que va 100 ms tarde se mide con una a su medida; estricto (medido
+    # con la imagen), un tramo sin medida se queda donde está; y la corrección que proponen los avisos se puede leer
+    xc = x.copy()
+    xc[100 * AR:200 * AR] = y[100 * AR:200 * AR]                # (ya sin el trozo tarde de antes)
+    for t_ in (100, 200):
+        xc[int((t_ - 0.4) * AR):int((t_ + 0.4) * AR)] = 0
+    d2 = int(0.100 * AR)
+    xc[150 * AR:160 * AR] = y[150 * AR - d2:160 * AR - d2]       # 1:50-1:60 del doblaje, 100 ms tarde
+    cortes_c = [dict(c=150.0, q0=149.9, q1=150.1, suelo=-90.0), dict(c=160.0, q0=159.9, q1=160.1, suelo=-90.0)]
+    db_c = sd.niveles_db(xc.reshape(-1, 1), AR)
+    Lc, _, infc = sd.contrastar_doblada(xc, y, [0.0, 0.0, 0.0], cortes_c, 300.0, lambda: db_c)
+    if infc["estado"] != "corregido" or abs(Lc[1] + 0.100) > 0.005:
+        fallos.append(f"tramo corto 100 ms tarde: {infc['estado']}, L {[round(v * 1000) for v in Lc]} ms")
+    # estricto: el primer tramo va 120 ms tarde y el segundo no tiene nada que compartir (casi solo «voz»): sin estricto
+    # va como el de al lado; estricto (medido con la imagen), se queda donde lo pone la imagen
+    x0 = (me + voz(3)).astype(np.float32)                       # (el doblaje sin ningún trozo desplazado)
+    pocas = x0.copy()
+    pocas[:150 * AR] = np.concatenate([np.zeros(d, np.float32), x0[:150 * AR - d]])    # 0-150 s, 120 ms tarde
+    # (otros graves: con los mismos más flojos, la correlación, que no mira el volumen, sí lo mediría)
+    otros = _sosfilt(_butter(4, 200, "low", fs=AR, output="sos"), np.random.default_rng(5).standard_normal(n)) * 3
+    pocas[150 * AR:] = (otros[150 * AR:] + voz(3)[150 * AR:]).astype(np.float32)
+    pocas[int(149.6 * AR):int(150.4 * AR)] = 0
+    db_p = sd.niveles_db(pocas.reshape(-1, 1), AR)
+    corte_p = [dict(c=150.0, q0=149.6, q1=150.4, suelo=-120.0)]
+    L_no = sd.contrastar_doblada(pocas, y, [0.0, 0.0], corte_p, 300.0, lambda: db_p)[0]
+    L_es = sd.contrastar_doblada(pocas, y, [0.0, 0.0], corte_p, 300.0, lambda: db_p, estricto=True)[0]
+    if len(L_no) != 1 or abs(L_no[0] + 0.120) > 0.005:
+        fallos.append(f"sin estricto, el tramo sin medida no va como el de al lado: L {[round(v * 1000) for v in L_no]}")
+    if len(L_es) != 2 or abs(L_es[0] + 0.120) > 0.005 or abs(L_es[1]) > 1e-9:
+        fallos.append(f"estricto, el tramo sin medida no se queda donde estaba: L {[round(v * 1000) for v in L_es]}")
+    sug = sd.avisos_descolocados([(99.3, 108.6, 1.5, 4, 4)])[0]
+    m = re.search(r"«(.+)»", sug)
+    try:
+        leida = sd.leer_correcciones(m[1]) if m else None
+    except ValueError:
+        leida = None
+    if not leida or abs(leida[0][2] - 1.5) > 1e-6 or leida[0][0] > 99.3 or leida[0][1] < 108.6:
+        fallos.append(f"la corrección sugerida no se lee bien: «{m[1] if m else sug}» -> {leida}")
+    # el repaso del recorrido: 3 ventanas seguidas de acuerdo (aunque dos sean flojas) y apartadas 30 ms o más hacen
+    # trozo aparte; 2, no; y el aviso de un corte dudoso solo si el salto se notaría (40 ms o más)
+    pk = np.array([-138.0] * 4 + [-14.0, -15.0, -13.0] + [-138.0] * 4)
+    fz = np.array([0.6] * 4 + [0.22, 0.25, 0.35] + [0.6] * 4)
+    tr = sd.apartar_seguidas([dict(w0=0, w1=10, d=-0.138, apoyo=[0, 1, 2, 3, 7, 8, 9, 10])], pk, fz)
+    if [round(t["d"] * 1000) for t in tr] != [-138, -14, -138]:
+        fallos.append(f"repaso: 3 ventanas a -14 dentro de -138 dan {[round(t['d'] * 1000) for t in tr]}")
+    pk2, fz2 = pk.copy(), fz.copy()
+    fz2[4] = 0.1
+    if len(sd.apartar_seguidas([dict(w0=0, w1=10, d=-0.138, apoyo=list(range(11)))], pk2, fz2)) != 1:
+        fallos.append("repaso: con solo 2 ventanas a -14 se parte el trozo")
+    duda = dict(dudas=[(130.0, 186.0, 137.8)])
+    if not sd.avisos_dudas(duda) or "entre 2:10" not in sd.avisos_dudas(duda)[0]:
+        fallos.append(f"aviso de corte dudoso: {sd.avisos_dudas(duda)}")
+    out.append(("contraste_con_el_original", "con guía, la pista doblada se contrasta con el original y se corrige "
+                                             "por trozos solo si hace falta (y los tramos cortos; estricto con la "
+                                             "imagen; la corrección sugerida se puede usar)", fallos))
+    # la comprobación de los empalmes de los rellenos (1.4.6): un relleno de 20-30 s; si el corte va 1 s tarde, lo de
+    # justo antes del relleno es lo de después del hueco. También con la lateral callada, solo con la mezcla
+    rng = np.random.default_rng(5)
+    en = rng.standard_normal(60 * sd.AR).astype(np.float32)
+    mal = en.copy()
+    mal[19 * sd.AR:20 * sd.AR] = en[29 * sd.AR:30 * sd.AR]
+    tarde = en.copy()
+    tarde[30 * sd.AR:31 * sd.AR] = en[20 * sd.AR:21 * sd.AR]
+    trozos = lambda x: (lambda i0, n: x[i0:i0 + n])
+    fallos = []
+    if sd.empalmes_dudosos(en, en, [(20.0, 30.0)]):
+        fallos.append("avisa de un empalme que está bien")
+    for nombre, x, lado, lat, mezcla in (("tarde", mal, "antes", mal, None), ("pronto", tarde, "después", tarde, None),
+                                         ("tarde, con la lateral callada", mal, "antes", np.zeros_like(en),
+                                          (trozos(mal), trozos(en)))):
+        e = sd.empalmes_dudosos(lat, en if mezcla is None else rng.standard_normal(len(en)).astype(np.float32),
+                                [(20.0, 30.0)], mezcla)
+        if len(e) != 1 or e[0][2] != lado:
+            fallos.append(f"empalme {nombre}: {e}")
+        elif not any("el empalme del relleno" in a and sd.para_revisar(a) for a in sd.avisos_empalmes(e)):
+            fallos.append(f"empalme {nombre}: el aviso no es para revisar: {sd.avisos_empalmes(e)}")
+    out.append(("empalme_del_relleno", "un relleno con el empalme 1 s tarde o pronto se avisa, también donde la "
+                                       "lateral calla", fallos))
+    # un nombre sin definir solo revienta al pasar por esa línea (así se paró la tanda de «solo subtítulos» de la GUI
+    # tras el primer episodio, 23-10-2026): se buscan en todos los archivos del programa sin ejecutarlos
+    fallos = [f"{os.path.basename(f)}, línea {ln} ({func}): «{nombre}» no existe"
+              for f in ("sincronizar_doblaje.py", "Sincronizar_Doblaje_Gui.py", "limpiar_vhs.py",
+                        "probar_sincronizador.py", "actualizador.py", "actualizador_ventana.py")
+              if os.path.exists(os.path.join(AQUI, f))
+              for ln, func, nombre in nombres_sin_definir(os.path.join(AQUI, f))]
+    out.append(("nombres_definidos", "ninguna función usa una variable que no existe", fallos))
+    return out
+
+
+FUNCIONES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+
+def _mismo_ambito(nodo):
+    """Los nodos que cuelgan de un ámbito sin entrar en las funciones y clases de dentro (que son otro ámbito)."""
+    for h in ast.iter_child_nodes(nodo):
+        yield h
+        if not isinstance(h, FUNCIONES + (ast.ClassDef,)):
+            yield from _mismo_ambito(h)
+
+
+def _ligados(nodo):
+    """Los nombres que crea un ámbito: argumentos, asignaciones, imports, def, except … as, global, for, :=."""
+    out = set()
+    if isinstance(nodo, FUNCIONES):
+        a = nodo.args
+        out |= {x.arg for x in a.posonlyargs + a.args + a.kwonlyargs + [a.vararg, a.kwarg] if x}
+    for n in _mismo_ambito(nodo):
+        if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+            out.add(n.id)
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out.add(n.name)
+        elif isinstance(n, (ast.Import, ast.ImportFrom)):
+            out |= {(x.asname or x.name).split(".")[0] for x in n.names}
+        elif isinstance(n, ast.ExceptHandler) and n.name:
+            out.add(n.name)
+        elif isinstance(n, (ast.Global, ast.Nonlocal)):
+            out |= set(n.names)
+        elif isinstance(n, ast.comprehension):
+            out |= {t.id for t in ast.walk(n.target) if isinstance(t, ast.Name)}
+        elif isinstance(n, ast.NamedExpr):
+            out.add(n.target.id)
+    return out
+
+
+def nombres_sin_definir(ruta):
+    """[(línea, función, nombre)] que una función lee y no existe ni en ella, ni en las que la contienen, ni en el
+    módulo, ni en Python. (Lo de una clase no se ve desde sus métodos, como en Python.)"""
+    arbol = ast.parse(open(ruta, encoding="utf-8").read())
+    fallos = set()
+
+    def revisar(nodo, visibles):
+        vis = visibles | _ligados(nodo)
+        for n in _mismo_ambito(nodo):
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id not in vis:
+                fallos.add((n.lineno, getattr(nodo, "name", "lambda"), n.id))
+        funciones(nodo, vis)
+
+    def funciones(nodo, vis):
+        for n in _mismo_ambito(nodo):
+            if isinstance(n, FUNCIONES):
+                revisar(n, vis)
+            elif isinstance(n, ast.ClassDef):
+                funciones(n, vis)
+
+    funciones(arbol, _ligados(arbol) | set(dir(builtins)) | {"__file__"})
+    return sorted(fallos)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--carpeta", default=CARPETA)
+    ap.add_argument("--solo", default="", help="casos separados por comas")
+    ap.add_argument("--conservar", action="store_true", help="no borrar los archivos fabricados")
+    args = ap.parse_args()
+    solo = {x.strip() for x in args.solo.split(",") if x.strip()}
+    tmp = tempfile.mkdtemp(prefix="pruebas_sincro_")
+    resultados, t_total = [], time.time()
+    try:
+        for nombre, que, fallos in pruebas_sueltas():
+            if not solo or nombre in solo:
+                resultados.append((nombre, que, fallos, 0.0))
+        for nombre, que, fabricar, comprobaciones in casos(args.carpeta, tmp):
+            if solo and nombre not in solo:
+                continue
+            t0 = time.time()
+            try:
+                fabricado = fabricar()          # (doblaje, original) u, opcional, opciones del motor
+                dob, ori = fabricado[:2]
+                extra = list(fabricado[2]) if len(fabricado) > 2 else []
+                salida = os.path.join(tmp, nombre + "_SYNC.mka")
+                r = subprocess.run([sys.executable, MOTOR, dob, ori, "-o", salida] + extra, capture_output=True,
+                                   text=True, encoding="utf-8", errors="replace", cwd=tmp)
+                informe = os.path.splitext(salida)[0] + "_informe.txt"
+                texto = open(informe, encoding="utf-8").read() if os.path.exists(informe) else ""
+                # el informe si lo hay (la salida repite lo mismo); de la salida, el error (con error no hay informe)
+                res = leer(texto or r.stdout)
+                res["error"] = res["error"] or next((x for x in r.stdout.splitlines() if x.startswith("ERROR")), None)
+                if r.returncode and not res["error"]:
+                    res["error"] = f"terminó con código {r.returncode}: {r.stderr.strip()[-300:]}"
+                fallos = [x for comprobar in comprobaciones for x in comprobar(res)]
+            except Exception as e:
+                fallos = [f"no se pudo probar: {e}"]
+            resultados.append((nombre, que, fallos, time.time() - t0))
+            print(f"{'OK   ' if not fallos else 'FALLO'} {nombre:18s} {time.time() - t0:5.0f} s  {que}"
+                  + "".join(f"\n        - {x}" for x in fallos), flush=True)
+    finally:
+        if args.conservar:
+            print(f"Archivos de las pruebas: {tmp}")
+        else:
+            shutil.rmtree(tmp, ignore_errors=True)
+    malos = [x for x in resultados if x[2]]
+    for nombre, que, fallos, _ in resultados:
+        if not _ and not fallos:
+            print(f"OK    {nombre:18s}    -   {que}")
+        elif not _:
+            print(f"FALLO {nombre:18s}    -   {que}" + "".join(f"\n        - {x}" for x in fallos))
+    print(f"\n{len(resultados) - len(malos)} de {len(resultados)} pruebas bien"
+          + (f"; FALLAN: {', '.join(x[0] for x in malos)}" if malos else "") + f" ({time.time() - t_total:.0f} s)")
+    sys.exit(1 if malos else 0)
+
+
+if __name__ == "__main__":
+    main()
