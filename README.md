@@ -22,3 +22,9 @@ Contenido:
   paquete .zip). Una versión publicada no se cambia nunca.
 - `historial/`: los manifiestos anunciados antes.
 - `Sincronizar_Doblaje.zip`: el paquete completo de la versión actual.
+
+## Código fuente y contribuciones
+
+El código fuente de Sync Master está en [`src/`](src/). Para proponer cambios con un pull request, mira
+[CONTRIBUTING.md](CONTRIBUTING.md): cómo probarlo y qué no hay que tocar. Las versiones las publica y firma solo el
+autor. El código se publica con la licencia [GPL-3.0](LICENSE).

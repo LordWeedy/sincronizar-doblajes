@@ -1,0 +1,13 @@
+# Archivos que forman una versión publicada de Sync Master: «origen» (relativo a la carpeta del programa)
+# y, si va a otro sitio de la instalación, «-> ruta». Lo que no esté aquí no se publica nunca (ajustes, .venv,
+# ffmpeg, informes, respaldos, claves, las demás herramientas de la carpeta...).
+Sincronizar_Doblaje_Gui.py
+sincronizar_doblaje.py
+limpiar_vhs.py
+forzados_vo.py
+actualizador.py
+actualizador_ventana.py
+probar_sincronizador.py
+Iniciar Sincronizar Doblaje.bat
+Sync_Master.ico
+LEEME.txt

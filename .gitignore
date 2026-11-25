@@ -1,0 +1,19 @@
+# Lo que crea el programa al abrirlo o usarlo desde src/ (nunca se sube)
+src/Sincronizar_Doblaje_ajustes.json
+src/.actualizador/
+src/.venv/
+src/ffmpeg/
+src/Sincronizar_Doblaje_compartir.zip
+__pycache__/
+*.pyc
+*.log
+*.tmp
+# Entornos y accesos directos locales
+.venv/
+*.lnk
+# De herramientas/ solo se suben las herramientas de publicar y su batería; lo demás (versiones preparadas, notas,
+# paquete para compartir, guías y herramientas de uso propio) se queda en el equipo del autor
+herramientas/*
+!herramientas/publicar_version.py
+!herramientas/probar_actualizador.py
+!herramientas/archivos_publicados.txt
