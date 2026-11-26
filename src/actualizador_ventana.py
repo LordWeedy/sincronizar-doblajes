@@ -16,7 +16,7 @@ import time
 import tkinter as tk
 from tkinter import ttk
 
-VERSION = '1.4.19'
+VERSION = '1.4.20'
 
 PALETA = {'bg': '#2b2b2b', 'fg': '#f5f5f5', 'muted': '#a8a8a8', 'ok': '#5cc74a', 'error': '#ef5350',
           'aviso': '#f0a030', 'entry_bg': '#3c3f41', 'entry_fg': '#f5f5f5', 'select_bg': '#4a90d9'}

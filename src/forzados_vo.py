@@ -11,7 +11,7 @@ Solo vale lo que se oye: cada trozo se transcribe suelto (sin lo de al lado, que
 de Whisper, y fuera lo que Whisper se inventa en el silencio o el ruido («You», «Thanks for watching!»...)."""
 import os, re, shutil, subprocess, tempfile
 
-VERSION = '1.4.19'
+VERSION = '1.4.20'
 CACHE = os.path.join(os.path.expanduser("~"), ".cache", "sincronizar_doblaje")
 WHISPER = "medium"          # small: unas 3 veces más rápido y algo peor; nunca large (demasiado para estos equipos)
 MAX_LINEA = 42              # caracteres por línea del subtítulo, dos líneas como mucho
@@ -26,6 +26,42 @@ INVENTOS = re.compile(r"(?i)^\W*(?:you|thank you|thanks for watching|thank you f
 # (en castellano, lo que se inventa en la música: «Subtítulos realizados por la comunidad de Amara.org», «subtítulos en
 # español de la Iglesia de Jesucristo de los Santos de los Últimos Días»; 1x01 37:02-37:07 del doblaje)
 INVENTOS_ES = re.compile(r"(?i)subt[ií]tul|amara\.org|iglesia de jesucristo|suscr[ií]b|gracias por ver")
+# (1.4.20) lo que se inventa en la música con frases de vídeos de internet, que lo de arriba no pilla (mal escrito o
+# dicho de otra forma; Crash Canyon 1x01, en la canción de la cabecera: «Y nos vemos en el próximo vídeo, ¡hasta la
+# próxima!», «¡Scribete y lláete y haz un spazm!»): fuera solo si además el detector de voz de Whisper (Silero) no oye
+# voz ahí (sin_coletillas). Con él solo no vale: no oye voz en las canciones, las voces de robot ni lo dicho bajo los efectos
+# (unas 170 palabras de verdad en 8 trozos de 3 min de los finales), y lo que no da Whisper se toma por pausa
+COLETILLAS = re.compile(r"(?i)pr[oó]xim[oa] v[ií]deo|hasta la pr[oó]xima|nos vemos en (?:el|la|los) pr[oó]xim|"
+                        r"\b(?:sus)?s?cr[ií]b[ae]te\b|dale (?:a |un )?like|\blike y |activa la campan|"
+                        r"comparte (?:el|este) v[ií]deo|deja (?:tu|un) comentario|gracias por (?:ver|vernos|mirar)|"
+                        r"thanks? (?:you )?for watching|see you (?:in|on) the next (?:video|one|episode)|"
+                        r"(?:like|please) (?:and )?subscribe|hit the bell|don'?t forget to (?:like|subscribe)|"
+                        r"leave a comment")
+
+
+def _voz_silero(x16):
+    """[(desde, hasta)] (s) de lo que el detector de voz de Whisper (Silero) da por voz en x16 (mono a 16 kHz), con su
+    margen de siempre; sin él, todo (como si hubiera voz: no se quita nada)."""
+    try:
+        from faster_whisper.vad import VadOptions, get_speech_timestamps
+        return [(v["start"] / 16000, v["end"] / 16000)
+                for v in get_speech_timestamps(x16, VadOptions(min_silence_duration_ms=200))]
+    except Exception:
+        return [(0.0, len(x16) / 16000)]
+
+
+def sin_coletillas(segs, x16, voz=_voz_silero):
+    """Los segmentos de Whisper sin los de COLETILLAS en los que no hay voz (voz(x16): [(desde, hasta)] en s): tienen que
+    decirlo las dos cosas. El detector solo se pasa si alguno tiene una coletilla."""
+    habla, out = None, []
+    for s in segs:
+        if COLETILLAS.search(s.text or ""):
+            if habla is None:
+                habla = voz(x16)
+            if not any(a < s.end and b > s.start for a, b in habla):
+                continue
+        out.append(s)
+    return out
 
 
 def piezas():
@@ -150,8 +186,8 @@ REPASO_VUELTAS = 1          # repasos (dentro de un repaso, otro...): uno basta 
 def _escuchar(x16, idioma, modelo):
     segs, _ = modelo_whisper(modelo).transcribe(x16, language=idioma, word_timestamps=True, vad_filter=False,
                                                 condition_on_previous_text=False, beam_size=5)
-    return [(w.word.strip(), float(w.start), float(w.end)) for s in segs if _vale(s) for w in (s.words or [])
-            if w.word.strip()]
+    return [(w.word.strip(), float(w.start), float(w.end)) for s in sin_coletillas([s for s in segs if _vale(s)], x16)
+            for w in (s.words or []) if w.word.strip()]
 
 
 def palabras(x16, idioma=None, modelo="small", vueltas=REPASO_VUELTAS):

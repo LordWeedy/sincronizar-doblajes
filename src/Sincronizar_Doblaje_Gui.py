@@ -44,7 +44,7 @@ import zlib
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-VERSION = '1.4.19'
+VERSION = '1.4.20'
 AQUI = os.path.dirname(os.path.abspath(__file__))
 # el icono de las ondas (pedido del usuario, 29-10-2026), en la esquina de la ventana y en la barra de tareas
 ICONO = os.path.join(AQUI, "Sync_Master.ico")
@@ -94,8 +94,8 @@ FORMATOS_AUDIO = {"flac": "FLAC", "aac": "AAC", "ac3": "AC3", "opus": "Opus"}   
 CANALES_AUDIO = {"igual": "Como el castellano", "2.0": "Estéreo 2.0"}               # --canales del motor
 KBPS_AUTO = "Automático"                                                           # --kbps sin poner
 EXTENSIONES_SUB = ('.srt',)
-EN_CURSO = ("En cola", "Analizando…", "Montando…", "Forzados…", "Codificando…", "Otras pistas…", "Subtítulos…",
-            "Muxeando…")
+EN_CURSO = ("En cola", "Analizando…", "Montando…", "Forzados…", "Codificando…", "Comprobando uniones…",
+            "Otras pistas…", "Subtítulos…", "Muxeando…")
 
 
 def open_subprocess(command, **kwargs):
@@ -2465,6 +2465,8 @@ class App:
                         etapa = "Codificando…"
                     elif linea.startswith("Guardado") and j.sub:
                         etapa = "Subtítulos…"
+                    elif linea.startswith("Uniones con Whisper: escuchando"):
+                        etapa = "Comprobando uniones…"     # (unos minutos: si no, seguía «Codificando…»)
                     elif linea.startswith("Muxeando en"):
                         etapa = "Muxeando…"
                     if etapa:

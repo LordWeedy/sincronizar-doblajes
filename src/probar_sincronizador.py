@@ -12,7 +12,7 @@ a una carpeta temporal que se borra al final (con --conservar se deja, para mira
 algún caso falla."""
 import argparse, ast, builtins, os, re, shutil, subprocess, sys, tempfile, time
 
-VERSION = '1.4.19'
+VERSION = '1.4.20'
 AQUI = os.path.dirname(os.path.abspath(__file__))
 MOTOR = os.path.join(AQUI, "sincronizar_doblaje.py")
 CARPETA = os.environ.get("SYNC_MASTER_PRUEBAS") or None     # (la de los vídeos de prueba; o --carpeta)
@@ -1025,6 +1025,25 @@ def pruebas_sueltas(carpeta=CARPETA):
             fallos.append(f"{que}: {texto or 'nada'}")
     out.append(("autocomprobar_uniones", "las uniones con el original: inglés cortado, sin voz que cabía y salto del "
                 "fondo, cada uno con sus dos medidas (y nada si una no lo confirma)", fallos))
+    # (1.4.20) los inventos de Whisper con frases de vídeos de internet: fuera solo si además no hay voz ahí (Silero)
+    import forzados_vo
+    from types import SimpleNamespace
+    seg = lambda texto, a, b: SimpleNamespace(text=texto, start=a, end=b, words=[])
+    segs = [seg(" Y nos vemos en el próximo vídeo, ¡hasta la próxima!", 20.4, 24.8), seg(" ¡Scribete y haz un spazm!", 110.0, 112.0),
+            seg(" Thanks for watching!", 170.0, 171.0), seg(" See you next time.", 160.0, 161.0),
+            seg(" Escríbete una nota.", 30.0, 31.0), seg(" ¿Qué?", 40.0, 40.5)]
+    quedan = lambda voz: [s.text.strip() for s in forzados_vo.sin_coletillas(segs, None, lambda x: voz)]
+    fallos = []
+    if quedan([]) != ["See you next time.", "Escríbete una nota.", "¿Qué?"]:
+        fallos.append(f"sin voz quedan {quedan([])}")
+    if len(quedan([(0.0, 200.0)])) != len(segs):
+        fallos.append(f"con voz en todo quedan {quedan([(0.0, 200.0)])}")
+    llamadas = []
+    forzados_vo.sin_coletillas([segs[3], segs[5]], None, lambda x: llamadas.append(1) or [])
+    if llamadas:
+        fallos.append("pasa el detector de voz sin ninguna coletilla")
+    out.append(("inventos_whisper", "las frases de vídeos de internet que se inventa Whisper en la música, fuera solo si "
+                "además el detector no oye voz ahí", fallos))
     # la pista de la RAW con la que se mide (y se rellena): por idioma y, si no decide, por el título (el DVDRemux de
     # Becker: ucraniano «MVO» primero, inglés «Original» después, doblaje .avi sin idioma)
     pista = lambda n, idioma="", titulo="": {"_n": n, "index": n, "codec_name": "ac3", "channels": 2,

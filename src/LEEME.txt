@@ -354,6 +354,10 @@ fondo que el original no tiene. Cada cosa tienen que confirmarla dos medidas dis
 Whisper y la voz del sonido, o dos largos de ventana). Solo eso va a la lista de lo que hay que
 escuchar; los rellenos con sus uniones bien, no ("uniones comprobadas, bien"). El informe lo resume:
   Uniones con el original comprobadas: 14 (de 7 rellenos); 3 para escuchar (arriba); ...
+Lo que Whisper se inventa en la música o el silencio («Subtítulos realizados por...», «Thanks for
+watching», «nos vemos en el próximo vídeo») no cuenta como voz. Desde la 1.4.20, una frase de esas
+(de las de los vídeos de internet) solo se quita si además el detector de voz de Whisper no oye voz
+ahí: él solo no vale, porque no oye las canciones ni las voces de robot.
 Tarda unos minutos más por episodio y necesita faster-whisper (si no está, se avisa y se hace como
 siempre). La casilla se recuerda.
 

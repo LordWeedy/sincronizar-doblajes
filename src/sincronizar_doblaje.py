@@ -51,7 +51,7 @@ from scipy import fft as sp_fft
 import limpiar_vhs
 import forzados_vo
 
-VERSION = '1.4.19'
+VERSION = '1.4.20'
 AR = 8000            # frecuencia de análisis
 MIN_JUMP = 0.060     # saltos menores se ignoran (~1,5 frames PAL)
 # Las tareas independientes (los dos vídeos, las velocidades candidatas, las dos señales del seguimiento, los tramos

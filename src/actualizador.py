@@ -39,7 +39,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = '1.4.19'
+VERSION = '1.4.20'
 PROGRAMA = "sincronizar-doblaje"
 FORMATO = 1
 # Las versiones van numeradas (1.0, 1.1...) y se anuncian en CANAL. Las de antes eran por fecha (AAAA.MM.DD) y esas
