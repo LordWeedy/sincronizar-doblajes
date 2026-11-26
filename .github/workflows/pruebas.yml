@@ -11,6 +11,9 @@ name: Pruebas
 
 on:
   push:
+    # (solo ramas: una etiqueta de versión, vX.Y, no la vuelve a pasar; sin esto la etiqueta la lanzaba otra vez,
+    # porque el filtro de rutas no se mira en las etiquetas)
+    branches: ["**"]
     paths: ["src/**", "herramientas/**", ".github/workflows/pruebas.yml"]
   pull_request:
     paths: ["src/**", "herramientas/**", ".github/workflows/pruebas.yml"]

@@ -555,7 +555,10 @@ def _rutas_anuncio(destino, sitio, canal):
 
 
 def _sitio(args):
-    sitio = os.path.abspath(args.sitio)
+    # (resuelta como la del programa, en main(): con una abspath y la otra realpath, en Windows una podía quedar con el
+    # nombre corto —C:\Users\RUNNER~1, la carpeta temporal de GitHub Actions— y la otra con el largo, y todo src/ salía
+    # como «cambios que no son de esta publicación»)
+    sitio = os.path.realpath(args.sitio)
     if not os.path.isdir(os.path.join(sitio, ".git")):
         raise Error(f"{sitio} no es la copia del repositorio de GitHub.")
     return sitio
@@ -582,7 +585,8 @@ def cmd_github(args):
     otros = [x for x in _pendientes(sitio) if x not in fuentes and not any(x == r or x.startswith(r) for r in propias)]
     if otros:
         raise Error(f"En {sitio} hay cambios que no son de esta publicación; súbelos (o deshazlos) antes:\n  "
-                    + "\n  ".join(otros))
+                    + "\n  ".join(otros) + f"\n(el programa: {args.programa}; sus archivos en el repositorio: "
+                    + (", ".join(fuentes[:3]) + "..." if fuentes else "ninguno") + ")")
     subida = bool(_git(sitio, "ls-files", "--", _rel(sitio, os.path.join(destino, "versiones", v,
                                                                           "manifiesto.json"))).strip())
     if lista and not subida:
