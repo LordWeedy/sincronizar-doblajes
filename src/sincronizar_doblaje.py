@@ -51,7 +51,7 @@ from scipy import fft as sp_fft
 import limpiar_vhs
 import forzados_vo
 
-VERSION = '1.4.18'
+VERSION = '1.4.19'
 AR = 8000            # frecuencia de análisis
 MIN_JUMP = 0.060     # saltos menores se ignoran (~1,5 frames PAL)
 # Las tareas independientes (los dos vídeos, las velocidades candidatas, las dos señales del seguimiento, los tramos
@@ -1501,7 +1501,7 @@ COSTURA_MISMO = 0.4
 
 def montar(es, fs, k, L, cortes, en_len, pre, original=None, lienzo=None, sin_doblaje=(), curva=None, puentes=(),
            p=None, voz_original=None, voz_doblaje=None, sin_voz=None, piezas=None, voz_dob=None, voz_ori=None,
-           traducir=None, repetidas=None):
+           traducir=None, repetidas=None, registro=None):
     """original: función que recibe tramos [(a, b)] en muestras de la pista original y devuelve esos
     trozos al formato del doblaje. Con ella, lo que le falta al doblaje (huecos de MIN_ORIGINAL s o
     más, y el principio y el final) se rellena con el audio original en vez de con silencio o ruido
@@ -1527,6 +1527,8 @@ def montar(es, fs, k, L, cortes, en_len, pre, original=None, lienzo=None, sin_do
     se veía más corta de lo que es (1x01, 11:05: se alargaba 0,53 s y quedaba «...if I'm really alone»).
     repetidas: lista a la que se añaden los avisos de las frases del original que se oyen dos veces (las dice también el
     castellano al lado) y no se les puede quitar la voz (repetida).
+    registro: lista a la que se añade, por cada borde de un relleno junto al castellano (con Whisper), lo que necesita
+    autocomprobar_uniones (medida_union).
     p: dónde se dice lo que se hace (una función de un argumento).
     Devuelve (audio, colocación de cada tramo, rellenos [(t doblaje, desde, hasta, dB)])."""
     ch = es.shape[1]
@@ -2065,6 +2067,7 @@ def montar(es, fs, k, L, cortes, en_len, pre, original=None, lienzo=None, sin_do
             frases_x = frases_de_palabras(pal_x) if pal_x is not None and EMPALME_POR_FRASES else None
             voz_x = mascara(x, voz_original) if frases_x is not None else None
             solape = {}                     # (borde: muestras del inglés que van por debajo del castellano)
+            planes = {}                     # (borde: lo que se ha hecho en él, para autocomprobar_uniones)
             for borde, hacia in ((a, 1), (b, -1)) if hablan is not None else ():
                 if not (pre < borde < total):
                     continue
@@ -2072,6 +2075,7 @@ def montar(es, fs, k, L, cortes, en_len, pre, original=None, lienzo=None, sin_do
                 if frases_x is not None:
                     plan = empalme_con_frases(borde, hacia, t, frases_x, pal_x, voz_x, x)
                     m_, ov_, z_, que_ = plan if plan is not None else (0, 0, None, None)
+                    planes[borde] = que_ or ""
                     if m_:
                         alarga[borde] = m_
                         if ov_:
@@ -2289,6 +2293,20 @@ def montar(es, fs, k, L, cortes, en_len, pre, original=None, lienzo=None, sin_do
             if nb:
                 f[len(f) - (p1 - b):] *= np.linspace(1, 0, p1 - b, dtype=np.float32)[:, None]
             sumar(f, p0)
+            if registro is not None and frases_x is not None:
+                # (ya montado este relleno: lo de cada borde con el castellano, para autocomprobar_uniones)
+                q_res = [(q0_ + pre / fs, q1_ + pre / fs) for q0_, q1_, *_ in quitados]
+                for borde, hacia in ((a, 1), (b, -1)):
+                    tr = trozo_en(viejos[borde], hacia < 0) if pre < borde < total else None
+                    if tr is None:
+                        continue
+                    d_b = tr[1] + (borde - tr[3])                # (la muestra del doblaje en el borde)
+                    cabe_ = ((tr[3] + tr[2] - borde) if hacia < 0 else (borde - tr[3])) / fs
+                    registro.append(medida_union(
+                        borde, hacia, t_dob, fs, out, x, pre + o0, frases_x, voz_x, q_res,
+                        (ov_a if hacia > 0 else ov_b) / fs, d_b / fs if 0 <= d_b <= len(es) else None,
+                        lambda q0, q1: pausas_voz(es, fs, q0, q1), planes.get(viejos[borde], ""), cabe_,
+                        hablan, lambda q0, q1: voz_castellano(int(round(q0 * fs)), int(round(q1 * fs)))))
             rellenos.append((t_dob, a, b, 20 * np.log10(g)))
     return out, colocacion, rellenos
 
@@ -3393,6 +3411,9 @@ def _medir_video(es_path, en_path, st_es, st_en, p, deco, vel, estirar, miniatur
         segs, L, bloques, restos = bloques_lejanos(segs, L, ev, ref, k, R, p)
         if bloques:
             k, L = reajustar(segs)
+        segs, L, intermedios = intermedios_con_imagen(segs, L, k, ev, ref, R, p)
+        if intermedios:
+            k, L = reajustar(segs)
         antes = [list(sg) for sg in segs]
         segs, L, confirmados, avisos = revisar_con_imagen(segs, L, k, ev, ref, (md, (mo[0] / float(vel), mo[1])), p,
                                                           niveles_video(pts, ev, ref, k), rasgos=R)
@@ -3409,9 +3430,12 @@ def _medir_video(es_path, en_path, st_es, st_en, p, deco, vel, estirar, miniatur
                    f"{mmss(t0 * (1 + k) + Lg)}); conviene comprobarlo" for t0, t1, Lg, *_ in bloques]
         avisos += [f"{mmss(t0)}-{mmss(t1)} del doblaje: colocado solo con la imagen en {mmss(t0 * (1 + k) + Lg)} del "
                    "original (sin cambios de plano que lo confirmen); conviene comprobarlo" for t0, t1, Lg, *_ in piezas]
+        avisos += [f"{mmss(t0)}-{mmss(t1)} del doblaje: entre dos saltos seguidos, colocado con la imagen a {Lg:+.2f} s "
+                   f"(entre el {La:+.2f} y el {Lb:+.2f} de al lado; con pocos cambios de plano); conviene comprobarlo"
+                   for t0, t1, Lg, _, La, Lb in intermedios]
     md = mo = None                  # (sueltan los archivos para poder borrarlos)
     # (lo colocado con la imagen está confirmado por ella: no es otro montaje)
-    colocados = [(t0, t1, Lg) for t0, t1, Lg, *_ in bloques + piezas] if md_ok else []
+    colocados = [(t0, t1, Lg) for t0, t1, Lg, *_ in bloques + piezas + intermedios] if md_ok else []
     segs, L, zonas = sin_encaje(segs, L, ev, ref, k, confirmados, p, colocados)
     return segs, k, L, (tm, sm, te, se), vel, pts, zonas + zonas_orden, None, None, avisos
 
@@ -3741,6 +3765,92 @@ def revisar_con_imagen(segs, L, k, ev, ref, imagen, p, candidatos=(), calibracio
     p(f"Comprobación con la imagen: {n_fiables} de {len(T)} ventanas de {VENTANA_IMAGEN:.0f} s se pueden comparar; "
       f"{n_ok} van con el desfase de su tramo")
     return devolver(segs, L, confirmados, avisos)
+
+
+# Dos huecos seguidos con pocos cambios de plano entre ellos (1.4.19; Becker 1x02 fabricado: al doblaje le faltan 5 s y,
+# 17 s después, otros 2,5 en planos largos de una comedia): lo de en medio va a un desfase intermedio que no sale como
+# nivel (las ventanas de 20 s del seguimiento lo cruzan, y solo tiene 3 cambios de plano), así que el salto se hacía de
+# una vez (+7,3 s en un solo sitio) y esos 17 s iban 5 s adelantados en una parte y 2,5 s tarde en la otra, sin aviso; la
+# comprobación con la imagen solo prueba los desfases que ya hay. Junto a cada salto grande se prueba también, con la
+# imagen, lo de en medio
+INTERMEDIO_SALTO = 1.2       # s: saltos de esto o más (dos grupos de la imagen) entre dos tramos seguidos se miran
+INTERMEDIO_ZONA = 40.0       # s a cada lado del salto
+
+
+def intermedios_con_imagen(segs, L, k, ev, ref, R, p=print):
+    """Entre dos tramos seguidos con un salto de INTERMEDIO_SALTO o más, un trozo a un desfase intermedio que no tenían
+    los candidatos: cada segundo, VENTANA_IMAGEN s de la imagen (parecidos_imagen) con el desfase de cada tramo y con lo
+    de en medio (a más de 0,3 s de los dos), hasta INTERMEDIO_ZONA s a cada lado del salto. Vale con MIN_OTRO_IMAGEN
+    ventanas casi seguidas (hasta 3 sin decirlo) en las que lo de en medio encaja MEJORA_IMAGEN mejor que los dos, con el
+    mismo desfase (±0,25 s), si además lo confirma la imagen de todo el trozo (confirmado_por_imagen, y mejor que con el
+    desfase de los dos tramos) y sus cambios de plano no lo contradicen (no encajan más con el de un tramo). El desfase,
+    el de sus cambios de plano si encajan 2 o más, si no el de la imagen. R: rasgos_de.
+    Devuelve (tramos, desfases, [(desde, hasta, desfase, ventanas, el de antes, el de después)] de los nuevos)."""
+    td, Id, Md, to, Io, Mo = R["td"], R["Id"], R["Md"], R["to"], R["Io"], R["Mo"]
+    unicos = ev[np.concatenate([[True], np.diff(ev) > 0.06])] if len(ev) else ev
+    segs, L, nuevos, i = [list(s[:2]) + [Li] for s, Li in zip(segs, L)], list(L), [], 0
+    medio_v = VENTANA_IMAGEN / 2
+    while i < len(segs) - 1:
+        La, Lb = L[i], L[i + 1]
+        if abs(Lb - La) < INTERMEDIO_SALTO:
+            i += 1
+            continue
+        z0 = max(segs[i][0], segs[i][1] - INTERMEDIO_ZONA)
+        z1 = min(segs[i + 1][1], segs[i + 1][0] + INTERMEDIO_ZONA)
+        j0, j1 = np.searchsorted(td, [z0, z1])
+        m0, m1 = min(La, Lb), max(La, Lb)
+        T, S, O = parecidos_imagen(td[j0:j1], Id[j0:j1], Md[j0:j1], to, Io, Mo, k,
+                                   [[La, La], [m0 + 0.6, m1 - 0.6], [Lb, Lb]]) if j1 - j0 >= 20 else ([], None, None)
+        if len(T) < MIN_OTRO_IMAGEN:
+            i += 1
+            continue
+        Sn = np.where(np.isfinite(S), S, -1.0)
+        piso = max(0.3, PISO_IMAGEN * float(np.median(Sn.max(1))))
+        dice = (Sn[:, 1] - np.maximum(Sn[:, 0], Sn[:, 2]) >= MEJORA_IMAGEN) & (Sn[:, 1] >= piso)
+        mejor, n = None, 0
+        while n < len(T):
+            if not dice[n]:
+                n += 1
+                continue
+            ws, m, sin = [n], n, 0
+            while m + 1 < len(T) and sin < 3:
+                m += 1
+                if dice[m] and abs(O[m, 1] - float(np.median(O[ws, 1]))) <= 0.25:
+                    ws, sin = ws + [m], 0
+                else:
+                    sin += 1
+            if mejor is None or len(ws) > len(mejor):
+                mejor = ws
+            n = ws[-1] + 1
+        if mejor is None or len(mejor) < MIN_OTRO_IMAGEN:
+            i += 1
+            continue
+        Lm = float(np.median(O[mejor, 1]))
+        t0, t1 = float(T[mejor[0]]), float(T[mejor[-1]])         # (los centros de la primera y la última ventana)
+        conf = confirmado_por_imagen(R, t0, t1, Lm, k)
+        otros = [x for x in (parecido_desfase(R, t0, t1, La, k), parecido_desfase(R, t0, t1, Lb, k)) if np.isfinite(x)]
+        e = unicos[(unicos >= t0 - medio_v) & (unicos <= t1 + medio_v)]
+        # (el desfase exacto antes de mirar si los cambios de plano lo contradicen: la imagen va de dos en dos
+        # fotogramas, y a +6,94 no encajaba ninguno de los que encajan a +7,00)
+        cerca = [min(ref[np.abs(ref - (t * (1 + k) + Lm)) < 0.12] - t * (1 + k), key=lambda d: abs(d - Lm))
+                 for t in e if (np.abs(ref - (t * (1 + k) + Lm)) < 0.12).any()]
+        if len(cerca) >= 2:
+            Lm = float(np.median(cerca))
+        con = lambda Lg: int(encajan_cortes(e, Lg, ref, k).sum()) if len(e) else 0
+        if conf is None or conf[0] < max(otros, default=-1.0) + BLOQUE_SOBRE_AZAR or con(Lm) < max(con(La), con(Lb)) \
+                or t0 - medio_v <= segs[i][0] + 0.5 or t1 + medio_v >= segs[i + 1][1] - 0.5:
+            i += 1
+            continue
+        segs[i][1] = min(segs[i][1], t0 - medio_v)
+        segs[i + 1][0] = max(segs[i + 1][0], t1 + medio_v)
+        segs.insert(i + 1, [t0, t1, Lm])
+        L.insert(i + 1, Lm)
+        nuevos.append((t0, t1, Lm, len(mejor), La, Lb))
+        p(f"Con la imagen, entre dos saltos: {mmss(t0)}-{mmss(t1)} del doblaje va a {Lm:+.2f} s, entre el {La:+.2f} y el "
+          f"{Lb:+.2f} de los tramos de al lado ({len(mejor)} ventanas lo dicen; {con(Lm)} de sus {len(e)} cambios de "
+          "plano encajan)")
+        i += 2
+    return segs, L, nuevos
 
 
 def encajan_en_tramo(ev, ref, k, sg):
@@ -4331,6 +4441,14 @@ def piezas_por_imagen(segs, L, ev, ref, k, R, p=print, restos=()):
                       if x is None else x for x, v, vs in et]
             claros = [x for x in et if x != "oscuro"]
             previo = claros[0] if claros else 0
+            if not claros and contradice == "extremo":
+                # (todo oscuro al principio o al final: con el trozo de al lado, que está medido; con el del tramo, que
+                # ahí no lo está, no. Becker 1x02 fabricado: el segundo en negro antes de 17 s colocados con la imagen a
+                # +0,04 se quedaba con el +2,00 del tramo de después, y el rodeo de la voz se llevaba luego los 17 s a
+                # ese +2,00: el castellano iba 2 s tarde)
+                junto = [n for n, q in ((1, izq), (1 + (izq is not None), der)) if q is not None and
+                         (abs(segs[q][1] - r0) < 0.06 if q == izq else abs(segs[q][0] - r1) < 0.06)]
+                previo = junto[0] if junto else 0
             for q, x in enumerate(et):          # (los oscuros, con el de antes; al principio, con el de después)
                 if x == "oscuro":
                     et[q] = previo
@@ -9407,8 +9525,151 @@ def texto_a_medias(malo):
     return que + (f", partiendo «{partida[0]}»" if partida else "")
 
 
+# Autocomprobación de las uniones con el original (1.4.19). Hasta la 1.4.18 cada relleno iba a la lista de lo que hay
+# que escuchar («conviene escuchar las uniones»): en una película, un centenar (Invasion, 1997: 95). Ahora, con Whisper,
+# cada borde de un relleno junto al castellano se comprueba en el resultado y solo se pide escuchar lo que tenga algo,
+# confirmado por dos medidas distintas (de 7 avisos de una sola medida, 6 eran falsos): el inglés cortado a media frase
+# (la frase de Whisper sigue al otro lado y la voz del original, por su banda o su centro, no para en el borde), la
+# frase inglesa sin voz que cabía (el castellano calla ahí según Whisper medium y según las pausas de su banda de voz)
+# y un salto del nivel del fondo que el original no tiene ahí (con ventanas de dos largos). (Dos voces a la vez no
+# hace falta mirarlo: dentro del relleno el castellano se quita, y solo van juntas en lo que va por debajo a propósito,
+# SOLAPE_MAX como mucho)
+UNION_VOZ_FUERA = 0.2        # s con voz del original (su banda o su centro) en lo que no se oye de la frase cortada...
+UNION_VOZ_DENTRO = 1.0       # ...y voz en lo que se oye, a esto o menos del borde: la frase sigue de verdad al otro lado
+UNION_FONDO = 6.0            # dB de salto del fondo en la unión que el original no tiene
+UNION_FONDO_VENTANAS = (0.75, 1.5)      # s a cada lado (sin la voz) con que se mide el fondo
+UNION_FONDO_SUENA = -50.0    # dB: con menos a un lado no suena nada ahí (el negro de un cambio de escena): no se mide
+
+
+def medida_union(borde, hacia, t_dob, fs, out, x, x0, frases_x, voz_x, sin_voz, ov, d, pausas, plan=None, cabe=0.0,
+                 habla_x=None, voz_cast=None):
+    """Lo que se mide de un borde de relleno junto al castellano, ya montado, para autocomprobar_uniones. borde: muestra
+    del resultado; hacia: +1 el principio del relleno, -1 el final; x: el original de alrededor, que empieza en la
+    muestra x0 del resultado; frases_x (frases_de_palabras) y voz_x (mascara, 100 por segundo) en su tiempo; sin_voz:
+    [(desde, hasta)] (s del resultado) de lo de este relleno que va sin voz; ov: s que van por debajo del castellano en
+    este borde; d: s del doblaje en el borde (o None); pausas(desde, hasta): pausas_voz del doblaje; plan: lo que dijo el
+    empalme (empalme_con_frases); cabe: s del trozo de castellano de al lado desde el borde. Para el fondo, la voz que
+    no cuenta es la de las dos medidas: habla_x, dónde habla el original según Whisper (100 por segundo, en su tiempo),
+    además de voz_x; voz_cast(desde, hasta): lo mismo del doblaje (voz_castellano, 100 por segundo), además de sus
+    pausas."""
+    t, tx, x_s = borde / fs, (borde - x0) / fs, x0 / fs
+    H = fs // 100
+    u = dict(t=t, hacia=hacia, t_dob=t_dob, d=d, ov=ov, sin_voz=list(sin_voz), plan=plan or "", frase=None,
+             voz_sigue=False, fondo={}, cabia=[])
+    f = next((f for f in frases_x if f[0] < tx - 0.1 and f[1] > tx + 0.1), None)
+    if f is not None:
+        u["frase"] = (x_s + f[0], x_s + f[1], f[2])
+        if voz_x is not None:
+            # (la frase sigue de verdad al otro lado: voz del original en lo que no se oye de ella, y en lo que se oye
+            # cerca del borde; en la pausa de una coma también se corta: «What, | the outhouse?», Xena 6x10)
+            vx_ = lambda a_, b_: int(np.asarray(voz_x[max(int(a_ * 100), 0):max(int(b_ * 100), 0)], bool).sum()) / 100
+            fuera = (tx, f[1]) if hacia < 0 else (f[0], tx)
+            dentro = (max(f[0], tx - UNION_VOZ_DENTRO), tx) if hacia < 0 else (tx, min(f[1], tx + UNION_VOZ_DENTRO))
+            u["voz_sigue"] = vx_(*fuera) >= UNION_VOZ_FUERA and vx_(*dentro) >= 0.1
+    # la frase que va sin voz en este borde: si fuera del relleno, en el castellano, cabía (sus pausas lo dicen)
+    for z0, z1 in sin_voz:
+        if not (abs(z1 - t) < 0.06 if hacia < 0 else abs(z0 - t) < 0.06) or u["frase"] is None or d is None:
+            continue
+        f0, f1, texto = u["frase"]
+        extra = VOZ_MARGEN + EMPALME_HOLGURA
+        largo = (f1 - t if hacia < 0 else t - f0) + extra
+        if largo > cabe:
+            continue                                    # (no cabía en el trozo de castellano de al lado)
+        i0, i1 = (d, d + largo) if hacia < 0 else (d - largo, d)
+        if any(q0 <= i0 + 0.05 and q1 >= i1 - 0.05 for q0, q1 in pausas(i0, i1)):
+            u["cabia"].append((i0, i1, texto))
+    # el fondo a cada lado (sin la voz de ninguno, ni lo que va sin voz o por debajo), en el resultado y en el original
+    if d is None or ov > 0:
+        return u
+    vx = np.asarray(voz_x, bool) if voz_x is not None else np.zeros(0, bool)
+    if habla_x is not None:
+        hx = np.asarray(habla_x, bool)[:len(vx)]
+        vx = vx.copy()
+        vx[:len(hx)] |= hx
+
+    def ext(tramas):
+        i = (tramas - x0) // H
+        return np.where((i >= 0) & (i < len(vx)), vx[np.clip(i, 0, max(len(vx) - 1, 0))] if len(vx) else False, False)
+
+    # (aquí, los niveles cada 10 ms y la voz que ya se sabe; la del castellano según Whisper, solo del montaje que vale,
+    # en autocomprobar_uniones: con cada vuelta de montar_comprobado se escucharía otra vez)
+    Wm = max(UNION_FONDO_VENTANAS)
+    n0, n1 = borde - int(round(Wm * fs)), borde + int(round(Wm * fs))
+    if n0 < x0 or n1 > x0 + len(x) or n0 < 0 or n1 > len(out):
+        return u
+    m = (n1 - n0) // H
+    tramas = n0 + np.arange(m) * H
+    db_ = lambda z: 10 * np.log10(np.mean(np.asarray(z[:m * H], np.float64).reshape(m, H, -1) ** 2, axis=(1, 2)) + 1e-12)
+    en_voz = ext(tramas)
+    relleno = (tramas >= borde) == (hacia > 0)
+    sv = np.array([any(z0 <= n / fs <= z1 for z0, z1 in sin_voz) for n in tramas], bool)
+    c = d + (tramas - borde) / fs                       # (s del doblaje, del lado del castellano)
+    q = pausas(float(c[0]), float(c[-1]) + 0.01)
+    calla = np.array([any(q0 <= ci <= q1 for q0, q1 in q) for ci in c], bool)
+    u["fondo"] = dict(k=int(round(Wm * 100)), res=db_(out[n0:n0 + m * H]), ori=db_(x[n0 - x0:n0 - x0 + m * H]),
+                      voz_ori=en_voz, relleno=relleno, voz_res=np.where(relleno, en_voz | sv, ~calla),
+                      cast=(float(c[0]), float(c[-1]) + 0.01), voz_cast=voz_cast)
+    return u
+
+
+def nivel_fondo(db, voz):
+    """El nivel del fondo (mediana de las tramas sin voz) o None con menos de 20 tramas sin voz."""
+    ok = ~np.asarray(voz, bool)
+    return float(np.median(db[ok])) if ok.sum() >= 20 else None
+
+
+def saltos_del_fondo(fd):
+    """Lo que salta el fondo en la unión en el resultado menos lo que salta en el original (dB), con cada ventana de
+    UNION_FONDO_VENTANAS; None en las que no se puede medir (poca cosa sin voz, o un lado sin sonido)."""
+    voz_res, k = fd["voz_res"].copy(), fd["k"]
+    if fd.get("voz_cast") is not None:         # (la voz castellana según Whisper, además de sus pausas)
+        vc = np.asarray(fd["voz_cast"](*fd["cast"]), bool)[:len(voz_res)]
+        voz_res[:len(vc)] |= vc & ~fd["relleno"][:len(vc)]
+    out = []
+    for W in UNION_FONDO_VENTANAS:
+        n = int(round(W * 100))
+        izq, der = slice(max(k - n, 0), k - 5), slice(k + 5, k + n)
+        r = [nivel_fondo(fd["res"][s], voz_res[s]) for s in (izq, der)]
+        o = [nivel_fondo(fd["ori"][s], fd["voz_ori"][s]) for s in (izq, der)]
+        out.append(None if None in r or None in o or min(r) < UNION_FONDO_SUENA else (r[1] - r[0]) - (o[1] - o[0]))
+    return out
+
+
+def autocomprobar_uniones(registro, confirmar=None, p=print):
+    """Lo de cada borde (medida_union) juzgado: [(s del resultado, qué tiene)] de los que conviene escuchar. Con
+    confirmar (palabras_doblaje con CONFIRMAR_MODELO), lo que va sin voz y cabía según las pausas tiene que confirmarlo
+    también Whisper (que el castellano no diga nada ahí)."""
+    malos = []
+    for u in registro:
+        que = []
+        f = u["frase"]
+        if f is not None and u["voz_sigue"]:
+            t = u["t"]
+            dentro = (t, f[1]) if u["hacia"] > 0 else (f[0], t)
+            fuera = (f[0], t) if u["hacia"] > 0 else (t, f[1])
+            callado = all(any(z0 - 0.05 <= s <= z1 + 0.05 for z0, z1 in u["sin_voz"])
+                          for s in np.arange(dentro[0] + 0.05, dentro[1] - 0.04, 0.1))
+            if not callado and fuera[1] - fuera[0] > FRASE_COLA:
+                que.append(f"el inglés se corta a media frase («{f[2][:60]}»)")
+        for i0, i1, texto in u["cabia"]:
+            if "dice lo mismo" in u["plan"]:
+                continue                    # (va sin voz a propósito: el castellano dice justo eso)
+            if confirmar is not None and any(e > i0 + 0.05 and s < i1 - 0.05
+                                             for _, s, e in confirmar(max(0.0, i0 - 2.0), i1 + 2.0)):
+                continue
+            que.append(f"la frase inglesa «{texto[:60]}» va sin voz y cabía (el castellano calla ahí)")
+        saltos = saltos_del_fondo(u["fondo"]) if u["fondo"] else [None]
+        if None not in saltos and all(abs(s) >= UNION_FONDO for s in saltos) and len({s > 0 for s in saltos}) == 1:
+            s = min(saltos, key=abs)
+            que.append(f"el fondo {'sube' if s > 0 else 'baja'} {abs(s):.0f} dB de golpe y en el original no")
+        if que:
+            malos.append((u["t"], "; ".join(que)))
+    return malos
+
+
 def montar_comprobado(es, fs, k, L, cortes, en_len, pre, original, lienzo_, zonas, curva, puentes, palabras,
-                      voz_original, voz_doblaje, forz_idioma, p, avisos, confirmar=None, voz_ori=None, traducir=None):
+                      voz_original, voz_doblaje, forz_idioma, p, avisos, confirmar=None, voz_ori=None, traducir=None,
+                      revisados=None):
     """El montaje (montar) y, con Whisper (palabras: palabras_doblaje), su comprobación antes de guardarlo: donde empieza
     o acaba cada trozo del doblaje, lo que en el propio doblaje queda a media frase (castellano_a_medias, confirmado con
     CONFIRMAR_MODELO) va con el audio original hasta donde acaba la frase (FRAGMENTO_MAX s como mucho) y se vuelve a
@@ -9417,7 +9678,9 @@ def montar_comprobado(es, fs, k, L, cortes, en_len, pre, original, lienzo_, zona
     lienzo_: lienzo(carpeta) o None; zonas: lo que va con el original (se le añade lo de la comprobación); voz_original,
     voz_doblaje: los de montar; avisos: lista a la que se añade lo que no tiene arreglo. confirmar, voz_ori, traducir:
     los de Whisper, o None (se hacen aquí: palabras_doblaje con CONFIRMAR_MODELO, voz_por_palabras_audio,
-    traductor_doblaje). Devuelve (out, colocación, rellenos, sin_voz, piezas), como montar."""
+    traductor_doblaje). revisados: lista a la que se añaden (desde, hasta) (muestras del resultado) de los rellenos
+    cuyas uniones con el castellano se han comprobado y están bien (autocomprobar_uniones): no hace falta escucharlos.
+    Devuelve (out, colocación, rellenos, sin_voz, piezas), como montar."""
     if palabras:
         confirmar = confirmar or palabras_doblaje(es, fs, forz_idioma, p, CONFIRMAR_MODELO)
         voz_ori = voz_ori or voz_por_palabras_audio(fs)
@@ -9429,13 +9692,14 @@ def montar_comprobado(es, fs, k, L, cortes, en_len, pre, original, lienzo_, zona
     cuenta = []                 # (por vuelta: los que da small, los confirmados)
     arreglados, quedan = 0, []
     for vuelta in range(VUELTAS_MEDIA_FRASE + 1):
-        sin_voz, piezas, dicho, repetidas = [], [], [], []
+        sin_voz, piezas, dicho, repetidas, registro = [], [], [], [], []
         out, coloc, rellenos = montar(es, fs, k, L, cortes, en_len, pre, original, lienzo_,
                                       [(z["d0"], z["d1"], z["a"]) for z in zonas], curva, puentes,
                                       dicho.append if palabras else p, voz_original=voz_original,
                                       voz_doblaje=voz_doblaje, sin_voz=sin_voz, piezas=piezas,
                                       voz_dob=voz_por_palabras(palabras) if palabras else None, voz_ori=voz_ori,
-                                      traducir=traducir, repetidas=repetidas)
+                                      traducir=traducir, repetidas=repetidas,
+                                      registro=registro if palabras and curva is None else None)
         if not palabras or curva is not None:
             break
         malos, dudas = castellano_a_medias(piezas, palabras, pausa_dob, len(out) / fs, confirmar, len(es) / fs)
@@ -9501,6 +9765,30 @@ def montar_comprobado(es, fs, k, L, cortes, en_len, pre, original, lienzo_, zona
             p(f"Unión {mmss(malo[0])}: {texto_a_medias(malo)}; no tiene arreglo con el original (lo que queda de "
               f"la frase pasa de {FRAGMENTO_MAX:.0f} s o no se ve dónde acaba): se queda en castellano")
             avisos.append(f"unión {mmss(malo[0])}: {texto_a_medias(malo)}; se queda en castellano, conviene escucharlo")
+    if registro:
+        # (las uniones con el original del montaje que vale: solo se pide escuchar lo que tenga algo)
+        malos = autocomprobar_uniones(registro, confirmar, p)
+        for t, que in malos:
+            p(f"Unión {mmss(t)}: {que}")
+            avisos.append(f"[revisar] unión {mmss(t)}: {que}" if "fondo" not in que or ";" in que else
+                          f"unión {mmss(t)}: {que}; conviene escucharlo")
+        # (y lo que ya se avisa en una unión —el castellano a media frase sin arreglo, una frase repetida— también
+        # cuenta: ese relleno hay que escucharlo)
+        # (las de «relleno», sin el retraso del principio; las de «unión», con él)
+        otros = [_seg(m[2]) + (pre / fs if m[1] == "relleno" else 0.0) for a_ in avisos
+                 for m in [re.match(r"(?:\[revisar\] )?(unión|relleno) (\d+:\d\d(?:\.\d+)?):", a_)] if m]
+        n_bien = 0
+        for _, a0, a1, _ in rellenos:
+            bordes = [u for u in registro if a0 / fs - 0.01 <= u["t"] <= a1 / fs + 0.01]
+            if bordes and not any(a0 / fs - 0.5 <= t <= a1 / fs + 0.5 for t, _ in malos) and \
+                    not any(a0 / fs - 0.5 <= t <= a1 / fs + 0.5 for t in otros):
+                n_bien += 1
+                if revisados is not None:
+                    revisados.append((a0, a1))
+        n_m = len({round(t, 1) for t, _ in malos})
+        p(f"Uniones con el original comprobadas: {len(registro)} (de {len(rellenos)} rellenos); "
+          + (f"{n_m} para escuchar (arriba); " if n_m else "ninguna para escuchar; ")
+          + f"{n_bien} relleno{'s' if n_bien != 1 else ''} sin nada que escuchar")
     return out, coloc, rellenos, sin_voz, piezas
 
 
@@ -10459,6 +10747,7 @@ def sincronizar(es_path, en_path, out_path, sub_path=None, pista=None, guia=None
     pedido = motivo_recodificar(canales, kbps, formato, st_es, es_path) if tal_cual else None
     convertir = tal_cual and (bool(pedido) or convertir_sin_cortes(sin_cortes, formato, st_es, p))
     sin_voz, piezas = [], []        # (los trozos de los rellenos que van sin voz; dónde va cada trozo del doblaje)
+    revisados = []                  # (los rellenos con sus uniones comprobadas y bien: autocomprobar_uniones)
     if tal_cual and not convertir:
         out, coloc, rellenos = None, [(L[0], L[0] + dur_es)], []     # va tal cual: no hay nada que montar
     else:
@@ -10473,7 +10762,8 @@ def sincronizar(es_path, en_path, out_path, sub_path=None, pista=None, guia=None
             es, fs, k, L, cortes, en_len, pre, original, lienzo(tmp), zonas, curva, puentes, palabras,
             "centro" if lateral_util(en8) else "banda",
             # (la lateral del doblaje sin diálogo solo se sabe si se ha medido con ella)
-            "centro" if not video and lateral and ch == 2 else "banda", forz_idioma, p, avisos_contraste)
+            "centro" if not video and lateral and ch == 2 else "banda", forz_idioma, p, avisos_contraste,
+            revisados=revisados)
 
     p("")
     # (con bloques en otro orden o el principio del doblaje sin usar, lo primero del resultado puede no ser el principio
@@ -10563,10 +10853,12 @@ def sincronizar(es_path, en_path, out_path, sub_path=None, pista=None, guia=None
         avisos.append(f"{mmss(t0)}-{mmss(t1)}: música desplazada {d:+.1f} s en el doblaje, no se corta; conviene escucharlo")
     for t_dob, a0, a1, gdb in rellenos:
         o0, o1 = (a0 - pre) / fs, (a1 - pre) / fs
+        bien = (a0, a1) in revisados
         p(f"Relleno {mmss(t_dob):>9}  {(a1 - a0) / fs * 1000:6.0f} ms  con el audio original "
-          f"({mmss(o0)}-{mmss(o1)} del original, {gdb:+.1f} dB)")
-        avisos.append(f"relleno {mmss(o0)}-{mmss(o1)}: {o1 - o0:.1f} s con el audio original, "
-                      f"conviene escuchar las uniones")
+          f"({mmss(o0)}-{mmss(o1)} del original, {gdb:+.1f} dB)" + ("; uniones comprobadas, bien" if bien else ""))
+        if not bien:        # (lo comprobado y bien no hace falta escucharlo: autocomprobar_uniones)
+            avisos.append(f"relleno {mmss(o0)}-{mmss(o1)}: {o1 - o0:.1f} s con el audio original, "
+                          f"conviene escuchar las uniones")
     p(f"Final: longitud ajustada a la del original ({en_len:.3f} s)")
     p(f"Retraso de la pista original aplicado al principio: {pre_s * 1000:.0f} ms (muxear con delay 0)")
 
@@ -10698,9 +10990,6 @@ def sincronizar(es_path, en_path, out_path, sub_path=None, pista=None, guia=None
         else:
             avisos.append(f"{mmss(a_)}-{mmss(b_)}: {n} cambios de plano seguidos del doblaje no encajan con el original; "
                           "puede estar descolocado, conviene comprobarlo")
-    p("Avisos: " + ("ninguno" if not avisos else ""))
-    for a_ in [a for a in avisos if para_revisar(a)] + [a for a in avisos if not para_revisar(a)]:
-        p(f"  - {'[revisar] ' if para_revisar(a_) else ''}{a_}")
 
     # sin cortes ni rellenos, el doblaje va tal cual (sin recodificar: no pierde nada), solo con su desfase, salvo
     # que se haya pedido pasarlo al formato elegido; si hay que editarlo, en ese formato (FLAC de serie: el usuario
@@ -10732,6 +11021,12 @@ def sincronizar(es_path, en_path, out_path, sub_path=None, pista=None, guia=None
     if forzados_vo:
         avisos += forzados_de_la_vo(out_path, [(a0 / fs, a1 / fs) for _, a0, a1, _ in rellenos], sin_voz,
                                     forzados_vo, forz_previo, forzados, p)
+    # (al final, con lo de todas las comprobaciones: hasta la 1.4.18 iba antes de guardar el audio, y lo de las uniones
+    # con Whisper y los forzados de la VO no salía en esta lista, la que leen la ventana —«N a revisar»— y la lista de
+    # saltos para VLC)
+    p("Avisos: " + ("ninguno" if not avisos else ""))
+    for a_ in [a for a in avisos if para_revisar(a)] + [a for a in avisos if not para_revisar(a)]:
+        p(f"  - {'[revisar] ' if para_revisar(a_) else ''}{a_}")
     p(f"Tiempo: {texto_tiempo(time.time() - t_inicio)}")
     out = es = None                 # una película 5.1 son varios GB por pista: de una en una
     if tmp:

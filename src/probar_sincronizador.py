@@ -12,7 +12,7 @@ a una carpeta temporal que se borra al final (con --conservar se deja, para mira
 algún caso falla."""
 import argparse, ast, builtins, os, re, shutil, subprocess, sys, tempfile, time
 
-VERSION = '1.4.18'
+VERSION = '1.4.19'
 AQUI = os.path.dirname(os.path.abspath(__file__))
 MOTOR = os.path.join(AQUI, "sincronizar_doblaje.py")
 CARPETA = os.environ.get("SYNC_MASTER_PRUEBAS") or None     # (la de los vídeos de prueba; o --carpeta)
@@ -983,6 +983,48 @@ def pruebas_sueltas(carpeta=CARPETA):
             fallos.append("sin nada que escuchar sigue habiendo lista")
     out.append(("lista_vlc", "la lista de saltos para VLC: lo de revisar primero, el corte en el tiempo del resultado "
                  "y junto a su relleno, sin avisos ninguna", fallos))
+    # (1.4.19) la autocomprobación de las uniones con el original (medida_union, autocomprobar_uniones): un relleno de
+    # 8 a 12 s del resultado y su final junto al castellano; cada cosa sale con sus dos medidas, y sola con una no
+    fallos, fs_ = [], 8000
+    rng = np.random.default_rng(7)
+    ruido = lambda n, amp: (amp * rng.standard_normal((n, 2))).astype(np.float32)
+
+    def union(frase=None, voz=(9.0, 11.5), sin_voz=(), pausas=((29.0, 34.0),), fondo_cast=1.0, fondo_ori=1.0,
+              plan="", palabras=(), fondo_rel=1.0):
+        x0 = 2 * fs_                                    # (el original de alrededor, de 2 a 18 s del resultado)
+        x = np.concatenate([ruido(10 * fs_, 0.01 * fondo_rel), ruido(6 * fs_, 0.01 * fondo_ori)])
+        res = np.concatenate([ruido(12 * fs_, 0.01), ruido(8 * fs_, 0.01 * fondo_cast)])
+        res[x0:12 * fs_] = x[:10 * fs_]                 # (el relleno: el original hasta el borde, a los 12 s)
+        voz_x = np.zeros(1600, bool)
+        for v0, v1 in (voz if isinstance(voz[0], tuple) else [voz]):
+            voz_x[int((v0 - 2) * 100):int((v1 - 2) * 100)] = True
+        frases = [(frase[0] - 2, frase[1] - 2, "We should wait here until the storm has passed.")] if frase else []
+        u = sd.medida_union(12 * fs_, -1, 30.0, fs_, res, x, x0, frases, voz_x, list(sin_voz), 0.0, 30.0,
+                            lambda q0, q1: [q for q in pausas if q[1] > q0 and q[0] < q1], plan, 6.0)
+        return sd.autocomprobar_uniones([u], lambda a, b: [w for w in palabras if w[2] > a and w[1] < b])
+    esperado = [
+        ("bien", union(), None),
+        ("inglés cortado", union((10.5, 13.5), (10.5, 13.5)), "se corta a media frase"),
+        ("Whisper alarga la frase, pero no hay voz al otro lado", union((10.5, 13.5), (10.5, 11.9)), None),
+        ("cortado en la pausa de una coma («What, | the outhouse?», Xena 6x10)",
+         union((10.5, 13.5), ((10.5, 11.85), (12.2, 13.5))), "se corta a media frase"),
+        ("del negro de un cambio de escena al castellano: no se mide", union(fondo_cast=10.0, fondo_rel=0.001), None),
+        ("sin voz y cabía", union((10.5, 13.5), (10.5, 13.5), [(10.35, 12.0)]), "va sin voz y cabía"),
+        ("sin voz, el castellano habla (pausas)", union((10.5, 13.5), (10.5, 13.5), [(10.35, 12.0)], ((29.0, 30.5),)),
+         None),
+        ("sin voz, el castellano habla (Whisper)", union((10.5, 13.5), (10.5, 13.5), [(10.35, 12.0)],
+                                                         palabras=[("Sí", 30.4, 30.7)]), None),
+        ("sin voz a propósito", union((10.5, 13.5), (10.5, 13.5), [(10.35, 12.0)],
+                                      plan="el castellano dice lo mismo justo después"), None),
+        ("salto del fondo", union(fondo_cast=10.0), "el fondo sube 20 dB"),
+        ("salto que el original también tiene", union(fondo_cast=10.0, fondo_ori=10.0), None),
+    ]
+    for que, malos, sale in esperado:
+        texto = "; ".join(m[1] for m in malos)
+        if (sale is None and malos) or (sale is not None and sale not in texto):
+            fallos.append(f"{que}: {texto or 'nada'}")
+    out.append(("autocomprobar_uniones", "las uniones con el original: inglés cortado, sin voz que cabía y salto del "
+                "fondo, cada uno con sus dos medidas (y nada si una no lo confirma)", fallos))
     # la pista de la RAW con la que se mide (y se rellena): por idioma y, si no decide, por el título (el DVDRemux de
     # Becker: ucraniano «MVO» primero, inglés «Original» después, doblaje .avi sin idioma)
     pista = lambda n, idioma="", titulo="": {"_n": n, "index": n, "codec_name": "ac3", "channels": 2,
@@ -1747,6 +1789,14 @@ REALES = [
     dict(nombre="real_becker_destellos", trozo="becker_1x02.mkv", que="Becker 1x02: cabecera de destellos y el castellano con "
          "1,4 s de retraso en el contenedor; le falta 1,5 s al principio", dob=[(1.5, 180)], raw=[(0, 180)], cortes=[],
          inicio=(1500, 45), excl=[(0, 1.5)], tol_ms=45),
+    # (1.4.19) solo con la imagen y planos largos: lo de entre dos huecos seguidos va a un desfase intermedio con solo 3
+    # cambios de plano (iba 5 s adelantado y 2,5 s tarde, sin aviso: intermedios_con_imagen), y el segundo en negro del
+    # principio se quedaba con el desfase de después y el rodeo de la voz se llevaba ahí la cabecera (2 s tarde)
+    dict(nombre="real_becker_huecos", trozo="becker_1x02.mkv", que="Becker 1x02 (sin sonido en común: solo con la "
+         "imagen): al doblaje le faltan 2 s tras los destellos de la cabecera y luego 5 s y, 17 s después en planos "
+         "largos, otros 2,5: cada hueco en su sitio", dob=[(0, 20.38), (22.38, 63.94), (68.94, 86.37), (88.87, 180)],
+         raw=[(0, 180)], cortes=[(20.38, 2000, 2.5, 60), (61.94, 5000, 2.5, 60), (79.37, 2500, 2.5, 60)],
+         excl=[(20.38, 22.38), (63.94, 68.94), (86.37, 88.87)], tol_ms=45),
     dict(nombre="real_pan_guia", trozo="pan_3x02.mkv", que="La pelu del señor Pan 3x02: con la guía inglesa (lateral "
          "estropeada, onda distinta); le sobran 2 s", dob=[(0, 92.0), (90.0, 180)], raw=[(0, 180)], guia=True,
          cortes=[(91.0, -2000, 2.0, 60)], excl=[(90.0, 92.0)], tol_ms=10),

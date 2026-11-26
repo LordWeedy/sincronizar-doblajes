@@ -348,6 +348,12 @@ compara). Si Whisper junta dos frases, se vuelve a escuchar y va entera la que c
 Desde la 1.4.17 también se compara la frase del original que ya suena dentro del relleno, pegada al
 castellano: si dice lo mismo que el castellano de al lado, va sin voz (se oye su música y sus efectos);
 si el original no lleva la voz aparte, se avisa ("se oye dos veces, conviene escucharlo").
+Desde la 1.4.19, con el montaje hecho, cada unión de un relleno con el castellano se comprueba en el
+resultado: el inglés cortado a media frase, la frase inglesa que va sin voz y cabía, y un salto del
+fondo que el original no tiene. Cada cosa tienen que confirmarla dos medidas distintas (lo que oye
+Whisper y la voz del sonido, o dos largos de ventana). Solo eso va a la lista de lo que hay que
+escuchar; los rellenos con sus uniones bien, no ("uniones comprobadas, bien"). El informe lo resume:
+  Uniones con el original comprobadas: 14 (de 7 rellenos); 3 para escuchar (arriba); ...
 Tarda unos minutos más por episodio y necesita faster-whisper (si no está, se avisa y se hace como
 siempre). La casilla se recuerda.
 
@@ -455,6 +461,10 @@ en todos los desfases que han salido al medir:
     castellano iba adelantado ese rato.
   - Un trozo en el que encajan pocos cambios de plano pero cuya imagen sí va con su desfase no se da
     por "montaje distinto" ni se cambia por el audio original ("Comprobado con la imagen: ...").
+  - Desde la 1.4.19, junto a cada salto grande entre dos tramos se prueba también, con la imagen, un
+    desfase intermedio: si al doblaje le faltan dos trozos seguidos con planos largos entre ellos, lo
+    de en medio va a su desfase ("Con la imagen, entre dos saltos: ..."). Antes los dos saltos se
+    hacían en uno y ese trozo quedaba segundos desplazado sin aviso.
 Los cortes siguen siendo cortes en el castellano: nunca se estira. Cuesta unos segundos por
 episodio, porque las miniaturas ya se guardan al leer los cambios de plano.
 Desde la 1.4.9, el doblaje puede traer escenas en otro orden que el original: un bloque que en el
@@ -597,7 +607,8 @@ Al final del informe (y en la GUI) los avisos van en dos grupos:
     residual o música desplazada. Van delante. En la GUI salen con "REVISAR:" y el estado del
     episodio los cuenta aparte ("Hecho · 1 a revisar · 2 avisos").
   - Los demás solo piden escuchar algo que lo normal es que esté bien: un corte sin silencio
-    claro, un relleno con el audio original.
+    claro, un relleno con el audio original (con Whisper, solo si la comprobación de sus uniones
+    encuentra algo).
 El "desfase residual" de un tramo medido con la imagen solo se avisa a partir de un fotograma y
 10 ms (50 ms a 25 fps): por debajo es el redondeo a fotogramas, no un error.
 
