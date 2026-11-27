@@ -51,7 +51,7 @@ from scipy import fft as sp_fft
 import limpiar_vhs
 import forzados_vo
 
-VERSION = '1.4.21'
+VERSION = '1.4.22'
 
 
 def _version_programa():
@@ -75,6 +75,28 @@ def _version_programa():
 # estropeado») la primera línea de cada informe y diagnóstico dice con qué versión se hizo. Se mira al cargar: es la del
 # código que se ejecuta aunque luego cambie el de la carpeta. La ventana la usa en su título.
 VERSION_PROGRAMA = _version_programa()
+
+
+# (27-11-2026) Con numpy 1, en Windows, los enteros de np.arange son de 32 bits y desbordan: los golpes de los efectos
+# reventaban a partir de 5,6 min de audio, al final de la tanda (Sissi 1955, 106 min: se perdió entera). El usuario
+# prefiere avisar de por qué falla y cómo actualizarlo a adaptar el programa a numpy 1: se avisa al empezar (el motor no
+# empieza; la ventana lo dice al abrir). No al importar: el actualizador importa el motor para ver que la versión carga
+NUMPY_MIN = 2
+
+
+def numpy_viejo(version=None, python=None):
+    """Si el numpy de este Python es anterior a NUMPY_MIN, el aviso (por qué falla y cómo actualizarlo); si no, None."""
+    version = version or np.__version__
+    try:
+        mayor = int(re.match(r"\d+", version).group())
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if mayor >= NUMPY_MIN:
+        return None
+    return (f"numpy {version} es demasiado viejo: el programa necesita numpy {NUMPY_MIN} o posterior. Con numpy {mayor}, "
+            "en episodios y películas de más de unos 5 minutos el análisis puede fallar al final y perderse la tanda "
+            "entera. Para actualizarlo (junto con scipy, que tiene que ir con él), en una consola:\n"
+            f"  \"{python or sys.executable}\" -m pip install --upgrade numpy scipy")
 
 
 def linea_version(que="hecho"):
@@ -1514,6 +1536,54 @@ def sin_contenido(es, fs, limite=20.0):
     return plano(np.asarray(es[:n], np.float32)), plano(np.asarray(es[max(0, len(es) - n):], np.float32)[::-1])
 
 
+# Y al revés: el original puede empezar (o acabar) en silencio digital, antes (o después) del episodio, y el doblaje tener
+# sonido ahí, que no es del episodio: el final de un resumen del episodio anterior, una cortinilla de la cadena (El
+# increíble Hulk 1x02, dos episodios unidos: el original empieza con 1 s a -180 dB y ahí sonaba el final del resumen
+# del doblaje, «nada más iniciar el vídeo ya está metiendo parte del sonido que debería haber eliminado»). Lo de antes
+# de la pausa del castellano más cercana a donde empieza a sonar el original no va, si es una pausa de verdad (baja
+# BORDE_SILENCIO_CAIDA dB o más respecto a lo que suena antes): si no, es una frase que sigue y se deja
+SILENCIO_DIGITAL_DB = -90.0     # por debajo, el original no tiene nada (una escena callada no baja tanto)
+BORDE_SILENCIO_MIN = 0.2        # s de silencio digital para mirarlo
+BORDE_SILENCIO_BUSCA = 1.0      # s antes de donde empieza a sonar el original (o después de donde acaba) en que se busca
+BORDE_SILENCIO_CAIDA = 15.0     # dB
+
+
+def silencio_digital(x, fs, limite=20.0):
+    """s del principio de x (muestras, una o varias columnas) en silencio digital (SILENCIO_DIGITAL_DB, en tramas de
+    10 ms), como mucho `limite`."""
+    x = np.asarray(x[:int(limite * fs)], np.float32)
+    if x.ndim > 1:
+        x = x.mean(axis=1)
+    H = max(fs // 100, 1)
+    n = len(x) // H
+    if not n:
+        return 0.0
+    e = 10 * np.log10(np.mean(x[:n * H].reshape(n, H).astype(np.float64) ** 2, axis=1) + 1e-30)
+    sonido = np.nonzero(e > SILENCIO_DIGITAL_DB)[0]
+    return (sonido[0] if len(sonido) else n) * H / fs
+
+
+def pausa_antes_de(x, fs, hasta):
+    """La pausa de x (muestras, del principio hasta `hasta` s y algo más) donde cortar lo de antes: el instante (s) de la
+    trama de 50 ms más floja en los BORDE_SILENCIO_BUSCA s de antes de `hasta` (y 50 ms después), si baja
+    BORDE_SILENCIO_CAIDA dB o más respecto a lo más fuerte de antes de ella; si no, None."""
+    x = np.asarray(x, np.float32)
+    if x.ndim > 1:
+        x = x.mean(axis=1)
+    H = max(fs // 20, 1)
+    n = len(x) // H
+    if n < 2:
+        return None
+    e = 10 * np.log10(np.mean(x[:n * H].reshape(n, H).astype(np.float64) ** 2, axis=1) + 1e-30)
+    q0, q1 = max(int((hasta - BORDE_SILENCIO_BUSCA) * 20), 1), min(int(hasta * 20) + 1, n - 1)
+    if q1 <= q0:
+        return None
+    q = q0 + int(np.argmin(e[q0:q1 + 1]))
+    if e[:q].max() - e[q] < BORDE_SILENCIO_CAIDA:
+        return None
+    return (q + 0.5) * H / fs
+
+
 # Las costuras con el original, que no se noten (pedido del usuario, 19-11-2026): con el fundido de FADE_S el paso era
 # casi un corte, y la misma música no suena igual en las dos mezclas (El último superviviente 1x02, 9:31: la de la
 # televisión, 13 dB más fuerte que la del original; el relleno, igualado con la voz, +3,7 dB, y al acabar la voz inglesa
@@ -1663,6 +1733,32 @@ def montar(es, fs, k, L, cortes, en_len, pre, original=None, lienzo=None, sin_do
             if p:
                 p(f"Final del doblaje: {fin_:.1f} s sin contenido (ruido o silencio); va el audio original"
                   .replace(".", ","))
+        # y donde el original empieza o acaba en silencio digital (silencio_digital), lo que el doblaje tenga ahí hasta
+        # su pausa (pausa_antes_de) no va
+        if curva is None:
+            nm = int(20 * fs)
+            o_ini = silencio_digital(original([(0, nm)])[0], fs)
+            d0, t_o = max(starts[0], -L[0] / (1 + k)), (o_ini - L[0]) / (1 + k)
+            if o_ini >= BORDE_SILENCIO_MIN and t_o - d0 >= 0.05 and t_o < ends[0]:
+                x_ = es[int(d0 * fs):int((t_o + 0.05) * fs) + 1]
+                c_ = pausa_antes_de(x_, fs, t_o - d0) if silencio_digital(x_, fs) < t_o - d0 else None
+                if c_ is not None:
+                    starts[0] = d0 + c_
+                    if p:
+                        p(f"Principio: el original empieza con {o_ini:.2f} s de silencio digital y el doblaje suena ahí "
+                          f"(no es del episodio): el castellano empieza en su pausa, en {mmss(starts[0])} del doblaje"
+                          .replace(".", ",", 1))
+            o_fin = silencio_digital(original([(max(total - pre - nm, 0), total - pre)])[0][::-1], fs)
+            d1, t_o = min(ends[-1], (en_len - L[-1]) / (1 + k)), (en_len - o_fin - L[-1]) / (1 + k)
+            if o_fin >= BORDE_SILENCIO_MIN and d1 - t_o >= 0.05 and t_o > starts[-1]:
+                x_ = es[max(int((t_o - 0.05) * fs), 0):int(d1 * fs)][::-1]
+                c_ = pausa_antes_de(x_, fs, d1 - t_o) if silencio_digital(x_, fs) < d1 - t_o else None
+                if c_ is not None:
+                    ends[-1] = d1 - c_
+                    if p:
+                        p(f"Final: el original acaba con {o_fin:.2f} s de silencio digital y el doblaje suena ahí (no es "
+                          f"del episodio): el castellano acaba en su pausa, en {mmss(ends[-1])} del doblaje"
+                          .replace(".", ",", 1))
     huecos = []                         # (desde, hasta, t del doblaje) en muestras de out
     # Lo que va del doblaje: cada tramo sin lo que tenga de otro montaje (sin_doblaje: eso no se coloca), en trozos.
     # Dónde va cada trozo; los huecos entre ellos y los fundidos, en el orden en que quedan en el resultado (el del
@@ -1721,6 +1817,10 @@ def montar(es, fs, k, L, cortes, en_len, pre, original=None, lienzo=None, sin_do
                            s[6] if q == 0 and a == s[3] else None])
         ocupado_ += partes
     sitios = sorted(quedan, key=lambda s: (s[3], s[0], s[1]))
+    # (un trozo de nada, de un tramo que los cortes dejan vacío, no se pone: en medio de otro trozo, el hueco de después
+    # se contaba desde él y el original sonaba encima del castellano; El increíble Hulk 1x02, dos episodios unidos,
+    # 62:31-63:19: un tramo de 0,6 s entre dos escenas colocadas que se quedó en nada)
+    sitios = [s_ for s_ in sitios if s_[2] > 0]
     # un hueco de menos de RELLENO_HUECO_MIN s entre dos trozos que no van seguidos en el doblaje (el sitio de lo que no se
     # coloca, casi nada): el de antes se alarga hasta el siguiente y se funde con él (1x01, 35:26: 0,14 s del original
     # entre dos trozos de castellano sonaban a golpe)
@@ -1799,8 +1899,12 @@ def montar(es, fs, k, L, cortes, en_len, pre, original=None, lienzo=None, sin_do
     if original and dst0 - pre >= minimo:
         huecos.append((pre, dst0, 0.0))
     colocacion = [None] * len(L)
+    hasta = pre                             # hasta dónde llega lo ya puesto
     for pos, (i, a_, n, dst, chunk, t_fin, _) in enumerate(sitios):
-        fin = dst + n
+        # (el hueco de después, desde lo más lejos que llega lo ya puesto: si un trozo acabara antes que otro de antes,
+        # el original iría encima del castellano de ese otro)
+        fin_puesto = dst + n
+        fin = hasta = max(hasta, fin_puesto)
         # el hueco de después es el sitio de lo de otro montaje si este trozo acaba donde empieza o el siguiente empieza
         # donde acaba
         t_ = t_fin if t_fin is not None or pos == len(sitios) - 1 else sitios[pos + 1][6]
@@ -1813,7 +1917,7 @@ def montar(es, fs, k, L, cortes, en_len, pre, original=None, lienzo=None, sin_do
             sumar(chunk, dst)
         else:
             poner(a_, n, dst, entrada, salida)
-        a0, a1 = (dst - pre) / fs, (fin - pre) / fs
+        a0, a1 = (dst - pre) / fs, (fin_puesto - pre) / fs
         colocacion[i] = (a0, a1) if colocacion[i] is None else (min(colocacion[i][0], a0), max(colocacion[i][1], a1))
         if final:
             huecos.append((fin, total, ends[i] if t_ is None else t_))
@@ -7221,43 +7325,76 @@ def bloques_en_audio(segs, entre, k, cambios, calibracion, imagen, a, b, p):
     R = rasgos_de(imagen)
     segs_i, L_i, bloques, restos = bloques_lejanos(segs_i, [s[2] for s in segs_i], ev, ref, k, R, callado)
     _, _, piezas, _ = piezas_por_imagen(segs_i, L_i, ev, ref, k, R, callado, restos)
-    R = None
     nuevos, avisos, puestos = [list(s) for s in segs], [], []
     bordes = [s[1] for s in segs[:-1]]
-    for t0, t1, Lg, *_ in sorted(bloques + piezas):
-        Lb, La = Lg + c, nivel_en(segs, (t0 + t1) / 2)
-        if abs(Lb - La) < MIN_SALTO_VIDEO:
-            continue
-        ok, Lr, n, tot = audio_confirma(a, b, t0, t1, Lb, k)
-        if not ok or audio_confirma(a, b, t0, t1, La, k)[0]:
-            p(f"Escena en otro orden (con la imagen): {mmss(t0)}-{mmss(t1)} del doblaje iría en "
-              f"{mmss(t0 * (1 + k) + Lb)} del original, pero el audio no lo confirma ({n} de {tot} ventanas); se deja")
-            continue
-        # los bordes, alargados por el sonido (borde_por_sonido, con el desfase del bloque): la imagen lo encuentra de su
-        # primer cambio de plano que encaja al último, y lo de antes o después (a mitad de plano) se quedaba con el tramo
-        # de al lado salvo que hubiera un borde del audio a BORDE_DUDOSO s. Así no depende de dónde quedó ese borde (en
-        # la prueba escena_movida_audio, con el salto del audio donde lo dejó, se perdían los 3,9 s del principio de la
-        # escena; con el salto pintado en medio, la escena salía en dos mitades de 8 s, y en El último superviviente 1x02,
-        # 6:00, con mitades de 7 s no salía). Sin pisar en el original lo que se queda de los demás tramos: el sonido
-        # se pasa una ventana (0,15-0,2 s) y, solapado, el montaje ya no veía un bloque en otro orden sino 110 s que
-        # faltaban y 125 que sobraban
-        d0, d1 = min(t0, borde_por_sonido(a, b, t0, Lr, k, -1)), max(t1, borde_por_sonido(a, b, t1, Lr, k, +1))
-        if d0 < t0 or d1 > t1:
-            sitio = [(x0 * (1 + k) + s[2], x1 * (1 + k) + s[2]) for s in nuevos
-                     for x0, x1 in ((s[0], min(s[1], d0)), (max(s[0], d1), s[1])) if x1 - x0 > 1e-6]
-            r0, r1 = t0 * (1 + k) + Lr, t1 * (1 + k) + Lr      # (lo que encontró la imagen, en el original)
-            q0, q1 = d0 * (1 + k) + Lr, d1 * (1 + k) + Lr
-            q0 = max([q0] + [min(y, r0) for x, y in sitio if x < r0 and y > q0])
-            q1 = min([q1] + [max(x, r1) for x, y in sitio if y > r1 and x < q1])
-            t0, t1 = (q0 - Lr) / (1 + k), (q1 - Lr) / (1 + k)
-        t0e = max([x for x in bordes if t0 - BORDE_DUDOSO <= x <= t0], default=t0)
-        t1e = min([x for x in bordes if t1 <= x <= t1 + BORDE_DUDOSO], default=t1)
-        nuevos = pintar_tramo(nuevos, t0e, t1e, Lr)
-        puestos.append((t0e, t1e, Lr))
-        p(f"Escena en otro orden: {mmss(t0e)}-{mmss(t1e)} del doblaje va en {mmss(t0e * (1 + k) + Lr)} del original "
-          f"({Lr:+.2f} s; la imagen la encuentra ahí y el audio lo confirma: {n} de {tot} ventanas)")
-        avisos.append(f"{mmss(t0e)}-{mmss(t1e)} del doblaje: escena en otro orden que en el original (va en "
-                      f"{mmss(t0e * (1 + k) + Lr)}); conviene comprobarlo")
+    # En dos vueltas. La primera, la de siempre: en orden, lo que el audio confirma, y lo de después se pinta encima de lo
+    # de antes (una escena precisa dentro de una grande que ya se ha puesto, con su desfase). Lo que el audio no confirma
+    # ni ahí ni donde está, a la segunda, después de colocar todo lo demás y solo en lo que haya quedado libre: con las
+    # ventanas de una escena ya colocada con otro desfase que la imagen había incluido, el audio no la confirmaba, y lo
+    # libre se quedaba con un desfase que no decía nada (El increíble Hulk 1x02, dos episodios unidos: 59:27-60:01 del
+    # doblaje, 5 de 15 ventanas, con 59:27-59:39 ya colocado; 59:39-60:04 se quedaba a -130,24 y su sitio, con el
+    # original). En la segunda, si donde está no lo sostiene nada (ni una ventana del audio ni la imagen), basta con que
+    # el audio lo apoye en un tercio de las ventanas donde lo pone la imagen (ahí, 4 de 9). Un resumen que así acabe
+    # encima de su escena lo quita después repeticiones_en_audio
+    pendientes = []
+    for vuelta, propuestas in ((0, [tuple(x[:3]) + (None,) for x in sorted(bloques + piezas)]), (1, pendientes)):
+        for t0, t1, Lg, antes in propuestas:
+            Lb = Lg + c
+            if vuelta == 1:
+                libres = [(t0, t1)]
+                for q0_, q1_, Lp in puestos:
+                    if abs(Lp - Lb) >= MIN_SALTO_VIDEO:
+                        libres = [(x0, x1) for y0, y1 in libres for x0, x1 in ((y0, min(y1, q0_)), (max(y0, q1_), y1))
+                                  if x1 - x0 > 1e-6]
+                libre = max(libres, key=lambda x: x[1] - x[0]) if libres else (t0, t0)
+                if libre[1] - libre[0] < min(BLOQUE_MIN_S, t1 - t0):
+                    p(f"Escena en otro orden (con la imagen): {mmss(t0)}-{mmss(t1)} del doblaje iría en "
+                      f"{mmss(t0 * (1 + k) + Lb)} del original, pero el audio no lo confirma ({antes[0]} de {antes[1]} "
+                      "ventanas); se deja")
+                    continue
+                t0, t1 = libre
+            # (en la segunda vuelta, lo que hay ahí ahora: lo de antes de colocar los demás bloques puede no estar)
+            La = nivel_en(segs if vuelta == 0 else nuevos, (t0 + t1) / 2)
+            if abs(Lb - La) < MIN_SALTO_VIDEO:
+                continue
+            ok, Lr, n, tot = audio_confirma(a, b, t0, t1, Lb, k)
+            okA, _, nA, _ = audio_confirma(a, b, t0, t1, La, k)
+            if vuelta == 0 and not ok and not okA:
+                pendientes.append((t0, t1, Lg, (n, tot)))
+                continue
+            apoyo = (vuelta == 1 and not ok and not okA and nA == 0 and n >= 2 and n >= tot / 3
+                     and confirmado_por_imagen(R, t0, t1, La - c, k) is None)
+            if (not ok and not apoyo) or okA:
+                p(f"Escena en otro orden (con la imagen): {mmss(t0)}-{mmss(t1)} del doblaje iría en "
+                  f"{mmss(t0 * (1 + k) + Lb)} del original, pero el audio no lo confirma ({n} de {tot} ventanas); se deja")
+                continue
+            # los bordes, alargados por el sonido (borde_por_sonido, con el desfase del bloque): la imagen lo encuentra de su
+            # primer cambio de plano que encaja al último, y lo de antes o después (a mitad de plano) se quedaba con el tramo
+            # de al lado salvo que hubiera un borde del audio a BORDE_DUDOSO s. Así no depende de dónde quedó ese borde (en
+            # la prueba escena_movida_audio, con el salto del audio donde lo dejó, se perdían los 3,9 s del principio de la
+            # escena; con el salto pintado en medio, la escena salía en dos mitades de 8 s, y en El último superviviente 1x02,
+            # 6:00, con mitades de 7 s no salía). Sin pisar en el original lo que se queda de los demás tramos: el sonido
+            # se pasa una ventana (0,15-0,2 s) y, solapado, el montaje ya no veía un bloque en otro orden sino 110 s que
+            # faltaban y 125 que sobraban
+            d0, d1 = min(t0, borde_por_sonido(a, b, t0, Lr, k, -1)), max(t1, borde_por_sonido(a, b, t1, Lr, k, +1))
+            if d0 < t0 or d1 > t1:
+                sitio = [(x0 * (1 + k) + s[2], x1 * (1 + k) + s[2]) for s in nuevos
+                         for x0, x1 in ((s[0], min(s[1], d0)), (max(s[0], d1), s[1])) if x1 - x0 > 1e-6]
+                r0, r1 = t0 * (1 + k) + Lr, t1 * (1 + k) + Lr      # (lo que encontró la imagen, en el original)
+                q0, q1 = d0 * (1 + k) + Lr, d1 * (1 + k) + Lr
+                q0 = max([q0] + [min(y, r0) for x, y in sitio if x < r0 and y > q0])
+                q1 = min([q1] + [max(x, r1) for x, y in sitio if y > r1 and x < q1])
+                t0, t1 = (q0 - Lr) / (1 + k), (q1 - Lr) / (1 + k)
+            t0e = max([x for x in bordes if t0 - BORDE_DUDOSO <= x <= t0], default=t0)
+            t1e = min([x for x in bordes if t1 <= x <= t1 + BORDE_DUDOSO], default=t1)
+            nuevos = pintar_tramo(nuevos, t0e, t1e, Lr)
+            puestos.append((t0e, t1e, Lr))
+            p(f"Escena en otro orden: {mmss(t0e)}-{mmss(t1e)} del doblaje va en {mmss(t0e * (1 + k) + Lr)} del original "
+              f"({Lr:+.2f} s; la imagen la encuentra ahí y el audio lo " +
+              (f"apoya en {n} de {tot} ventanas, y donde iba no lo sostenía nada)" if apoyo else
+               f"confirma: {n} de {tot} ventanas)"))
+            avisos.append(f"{mmss(t0e)}-{mmss(t1e)} del doblaje: escena en otro orden que en el original (va en "
+                          f"{mmss(t0e * (1 + k) + Lr)}); conviene comprobarlo")
     if not avisos:
         return segs, entre, []
     # los tramos de al lado que, según el audio, se meten en el sitio del original de un bloque colocado, hasta su borde,
@@ -7265,6 +7402,27 @@ def bloques_en_audio(segs, entre, k, cambios, calibracion, imagen, a, b, p):
     # una escena de TVE movida a propósito, 4 s), y con eso el montaje ya no veía un bloque en otro orden sino 125 s que
     # sobraban y 110 que faltaban (como hacía bordes_con_imagen al medir con la imagen)
     es_puesto = lambda s: any(abs(s[2] - Lp) < 1e-9 and s[0] < p1_ and s[1] > p0_ for p0_, p1_, Lp in puestos)
+    # las rendijas entre dos bloques colocados (lo que queda de otro tramo entre el final de uno y el principio del
+    # otro, más corto que BLOQUE_MIN_S y sin que el audio confirme su desfase) son el sitio del salto de uno a otro, como
+    # los huecos que deja revisar_audio_con_imagen: se quedaban con el desfase de un tramo que ya no estaba ahí y, al
+    # montar, eran un bloque en otro orden de nada (El increíble Hulk 1x02, dos episodios unidos: de 0,6 a 3,3 s entre
+    # escenas colocadas, con el -150,56 que el audio daba a media hora sin coincidencias; por una, 141 s del original en
+    # el sitio de 144 s de castellano que se quitaban, y por otras, el original sonando encima del castellano)
+    j = 1
+    while j + 1 < len(nuevos):
+        s, A, B = nuevos[j], nuevos[j - 1], nuevos[j + 1]
+        if (not es_puesto(s) and es_puesto(A) and es_puesto(B) and abs(A[1] - s[0]) < 1e-6
+                and abs(B[0] - s[1]) < 1e-6 and s[1] - s[0] < BLOQUE_MIN_S
+                and not audio_confirma(a, b, s[0], s[1], s[2], k)[0]):
+            lo, hi = s[0], s[1]
+            x = (lo + hi) / 2
+            saltos[x] = (lo, hi, cambios, c)
+            A[1] = B[0] = x
+            del nuevos[j]
+            p(f"Entre dos escenas colocadas: {mmss(lo)}-{mmss(hi)} del doblaje es el sitio del salto de una a otra (no "
+              f"va con el desfase de {s[2]:+.2f} s, que no confirma nada)")
+        else:
+            j += 1
     for b0, b1, Lb in puestos:
         o0, o1 = b0 * (1 + k) + Lb, b1 * (1 + k) + Lb
         for j, s in enumerate(nuevos):
@@ -7423,6 +7581,30 @@ def repeticiones_en_audio(segs, entre, k, cambios, calibracion, imagen, a, b, p,
             else:
                 u[1] = s[1]
             p(f"   {mmss(s[0])}-{mmss(s[1])} del doblaje va con el tramo de al lado ({u[2]:+.2f} s; lo dice la imagen)")
+        elif ajenos is not None and (i == 0 or i == len(nuevos)):
+            # al principio o al final del doblaje, sin tramo al otro lado, lo que deja no está en el original (un resumen
+            # del episodio anterior, un avance del siguiente): sin apuntarlo, al montar el primer tramo volvía a empezar
+            # en el 0 del doblaje y lo que caía dentro del original sonaba (El increíble Hulk 1x02, dos episodios unidos:
+            # 1,1 s del final del resumen donde el original calla). Hasta donde empieza o acaba el tramo de al lado por
+            # el sonido (borde_por_sonido, como el hueco entre dos tramos), y sitio_ajeno lo saca del montaje
+            if i == 0:
+                hi = s[1]
+                if der is not None:
+                    hi2 = min(borde_por_sonido(a, b, s[1], der[2], k, -1), der[1] - 1.0)
+                    hi = hi2 if abs(hi2 - s[1]) <= BORDE_SONIDO else s[1]
+                    der[0] = hi
+                ajenos.append((0.0, hi))
+                avisos.append(f"0:00.00-{mmss(hi)} del doblaje: no está en el original (un resumen o un avance que solo "
+                              "tiene el doblaje) y no se usa; conviene comprobarlo")
+            else:
+                lo = s[0]
+                if izq is not None:
+                    lo2 = max(borde_por_sonido(a, b, s[0], izq[2], k, +1), izq[0] + 1.0)
+                    lo = lo2 if abs(lo2 - s[0]) <= BORDE_SONIDO else s[0]
+                    izq[1] = lo
+                ajenos.append((lo, float("inf")))
+                avisos.append(f"{mmss(lo)} hasta el final del doblaje: no está en el original (un resumen o un avance "
+                              "que solo tiene el doblaje) y no se usa; conviene comprobarlo")
 
     # 3) un recorte que no cabe en su hueco: lo que sobra, en el borde que la imagen no pone con su desfase
     for A, B in zip(nuevos, nuevos[1:]):
@@ -10196,6 +10378,8 @@ def forzados_de_la_vo(out_path, rellenos, sin_voz, modelo, previo, con_ocr, p=pr
 
 def mmss(t):
     t = round(float(t), 2)      # (sin redondear antes, 119,996 s salía «1:60.00»)
+    if t < 0:                   # (-3,11 s salía «-1:56.89»: el resto de la división, del minuto de antes)
+        return "-" + mmss(-t)
     return f"{int(t // 60)}:{t % 60:05.2f}"
 
 
@@ -10696,6 +10880,13 @@ def sincronizar(es_path, en_path, out_path, sub_path=None, pista=None, guia=None
                                                                    (md, (mo[0] / float(vel or 1), mo[1])), a, b, p,
                                                                    zonas_ajenas)
                     avisos_imagen += mas
+                    # lo que no está en el original al principio o al final del doblaje, sin tramo al otro lado
+                    # (repeticiones_en_audio): no se coloca, y su sitio va con el original (al montar, el primer tramo
+                    # empieza en el 0 del doblaje y el último acaba en su final: lo de fuera solo lo quitan las zonas)
+                    for z0, z1 in zonas_ajenas:
+                        if z1 <= segs[0][0] + 1e-6 or z0 >= segs[-1][1] - 1e-6:
+                            d1 = min(z1, dur_es)
+                            zonas.append(dict(z0=0.0, z1=0.0, d0=z0, d1=d1, a=z0, b=d1, n=0, m=0, tipo="ajeno"))
                 md = mo = None              # (sueltan los archivos para poder borrarlos)
                 L = [sg[2] for sg in segs]
         finally:
@@ -11090,6 +11281,8 @@ def sincronizar(es_path, en_path, out_path, sub_path=None, pista=None, guia=None
     avisos = list(avisos_pistas) + avisos_imagen + avisos_sonido + avisos_contraste + avisos_limpieza
     for z in zonas:
         con = "el audio original" if rellenar_original else "silencio (sin relleno con el original)"
+        if z.get("tipo") == "ajeno":            # (repeticiones_en_audio: ya se ha dicho)
+            continue
         if z.get("tipo") == "vo":               # (recortes_en_pausas: ya se ha dicho)
             avisos.append(f"{mmss(z['a'])}-{mmss(z['b'])} del doblaje: {z['porque']}; va con {con}, conviene "
                           "comprobarlo")
@@ -11999,6 +12192,10 @@ def main():
                          + ", ".join(f"{k} = {v[0]}" for k, v in DECODIFICADORES.items())
                          + ". Si la GPU falla, se usa la CPU (por defecto: cpu)")
     args = ap.parse_args()
+    viejo = numpy_viejo()               # (antes de nada: con él, la tanda se perdería al final)
+    if viejo:
+        print(f"ERROR: {viejo}")
+        sys.exit(1)
     # análisis en marcha: el actualizador no cambia el programa mientras tanto (si no está o falla, da igual)
     try:
         import actualizador

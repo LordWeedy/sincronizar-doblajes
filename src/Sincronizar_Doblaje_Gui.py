@@ -44,7 +44,7 @@ import zlib
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-VERSION = '1.4.21'
+VERSION = '1.4.22'
 AQUI = os.path.dirname(os.path.abspath(__file__))
 # el icono de las ondas (pedido del usuario, 29-10-2026), en la esquina de la ventana y en la barra de tareas
 ICONO = os.path.join(AQUI, "Sync_Master.ico")
@@ -1265,6 +1265,11 @@ class App:
                 self.act.empezar()
             except Exception:
                 pass
+        # numpy demasiado viejo (sd.numpy_viejo): por qué falla y cómo actualizarlo. Después de la señal de arranque que
+        # espera el actualizador (va a los 1,5 s), que sale aunque este aviso siga abierto
+        aviso = sd.numpy_viejo(python=python_analisis()) if sd else None
+        if aviso:
+            self.master.after(2500, lambda: self._show_warning("numpy demasiado viejo", aviso))
 
     def _offer_downloads(self):
         """Descarga ffmpeg si falta (numpy/scipy ya están: si faltaran, la GUI no habría llegado a abrirse)."""
@@ -1863,12 +1868,18 @@ class App:
             else:
                 status = check_module(dep['key'])
                 detail = status['version'] or "instalado"
+                if dep['key'] == 'numpy' and status['found'] and sd and sd.numpy_viejo(status['version']):
+                    status = dict(status, found=False, viejo=True)      # (sd.NUMPY_MIN: con el 1 falla)
             self.dependency_status[dep['key']] = status
             if status['found']:
                 icon, color, text = "✔", palette['ok'], f"{dep['label']}: {detail}"
             elif dep.get('opcional'):
                 icon, color = "–", palette['muted']
                 text = f"{dep['label']}: no instalado — {dep['desc']}"
+            elif status.get('viejo'):
+                icon, color = "✘", palette['error']
+                text = f"{dep['label']}: {detail}, demasiado viejo — hace falta el {sd.NUMPY_MIN} o posterior"
+                missing.append(f"{dep['label']} {sd.NUMPY_MIN} o posterior")
             else:
                 icon, color = "✘", palette['error']
                 text = f"{dep['label']}: NO encontrado — {dep['desc']}"
@@ -1883,7 +1894,9 @@ class App:
         if missing:
             self.status_text.set(
                 "Aviso: faltan dependencias obligatorias: " + ", ".join(missing) +
-                ". Pulsa «Descargar lo que falta» o instálalas y usa «Verificar de nuevo»."
+                (". Actualiza numpy como dice el aviso y vuelve a abrir el programa (el que ya está cargado no cambia)."
+                 if self.dependency_status.get('numpy', {}).get('viejo') else
+                 ". Pulsa «Descargar lo que falta» o instálalas y usa «Verificar de nuevo».")
             )
         if hasattr(self, 'descargar_button'):
             self.descargar_button.config(state=tk.DISABLED if ffmpeg_disponible() else tk.NORMAL)

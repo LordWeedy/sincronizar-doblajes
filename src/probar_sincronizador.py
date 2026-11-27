@@ -12,7 +12,7 @@ a una carpeta temporal que se borra al final (con --conservar se deja, para mira
 algún caso falla."""
 import argparse, ast, builtins, os, re, shutil, subprocess, sys, tempfile, time
 
-VERSION = '1.4.21'
+VERSION = '1.4.22'
 AQUI = os.path.dirname(os.path.abspath(__file__))
 MOTOR = os.path.join(AQUI, "sincronizar_doblaje.py")
 CARPETA = os.environ.get("SYNC_MASTER_PRUEBAS") or None     # (la de los vídeos de prueba; o --carpeta)
@@ -1076,6 +1076,136 @@ def pruebas_sueltas(carpeta=CARPETA):
     if any(ch in os.path.basename(ruta) for ch in '?*<>|:"'):
         fallos.append(f"nombre de la pista extra: {ruta}")
     out.append(("idioma_sin_valor", "«???» y «und» son «sin idioma» y no van al nombre de archivo", fallos))
+    # numpy 1 (en Windows, enteros de 32 bits que desbordan: Sissi 1955 se perdió al final de la tanda, 27-11-2026): se
+    # avisa de por qué y de cómo actualizarlo, y el motor no empieza; con numpy 2 o posterior, nada
+    import contextlib, io
+    fallos = [f"numpy {v}: avisa" for v in ("2.1.3", "2.0.0rc1", "3.0.0") if sd.numpy_viejo(v)]
+    aviso = sd.numpy_viejo("1.26.4", "C:/Python/python.exe") or ""
+    fallos += [f"el aviso no dice «{x}»: {aviso!r}" for x in ("numpy 1.26.4", f"numpy {sd.NUMPY_MIN} o posterior",
+                                                             '"C:/Python/python.exe" -m pip install --upgrade numpy scipy')
+               if x not in aviso]
+    antes_v, antes_argv, salida = sd.np.__version__, sys.argv, io.StringIO()
+    try:
+        sd.np.__version__, sys.argv = "1.26.4", ["sincronizar_doblaje.py", "no_existe_es.mkv", "no_existe_raw.mkv"]
+        with contextlib.redirect_stdout(salida):
+            sd.main()
+        fallos.append("con numpy 1.26.4 el motor empieza")
+    except SystemExit as e:
+        if e.code != 1 or not salida.getvalue().startswith("ERROR: numpy 1.26.4 es demasiado viejo"):
+            fallos.append(f"con numpy 1.26.4 sale con {e.code} y dice {salida.getvalue()[:200]!r}")
+    except Exception as e:
+        fallos.append(f"con numpy 1.26.4 el motor empieza y revienta después ({e})")
+    finally:
+        sd.np.__version__, sys.argv = antes_v, antes_argv
+    out.append(("numpy_viejo", "con numpy 1 se dice por qué falla y cómo actualizarlo, y el motor no empieza (con el 2, "
+                               "nada)", fallos))
+    # (1.4.22; El increíble Hulk 1x02, dos episodios unidos: el original empieza con 1 s de silencio digital y ahí sonaba
+    # el final del resumen del doblaje) donde el original empieza o acaba en silencio digital, lo que el doblaje tenga
+    # ahí no va si lo separa del episodio una pausa; sin pausa (una frase que sigue), sí. Montado de verdad (montar), con
+    # ruido fabricado: el episodio E, un resumen R más fuerte y una pausa a -73 dB
+    fallos = []
+    fs_b = 8000
+    rng = np.random.default_rng(3)
+    E_b, R_b = 0.1 * rng.standard_normal(20 * fs_b), 0.3 * rng.standard_normal(3 * fs_b)
+    pausa_b, nada_b = 3e-4 * rng.standard_normal(int(0.15 * fs_b)), np.zeros(fs_b)
+    db_ = lambda x: 10 * np.log10(np.mean(np.asarray(x, np.float64) ** 2) + 1e-30)
+
+    def montado_b(dob, ori, L0):
+        o2 = np.asarray(ori, np.float32)[:, None]
+        msgs = []
+        res = sd.montar(np.asarray(dob, np.float32)[:, None], fs_b, 0.0, [L0], [], len(ori) / fs_b, 0,
+                        original=lambda tr: [o2[max(a, 0):max(b, 0)] for a, b in tr], p=msgs.append)[0][:, 0]
+        return res, msgs
+    casos_b = (("un resumen con pausa antes del episodio", np.concatenate([R_b, pausa_b, E_b]),
+                np.concatenate([nada_b, E_b]), 1.0 - 3.15, "principio", True),
+               ("un resumen que sigue sin pausa", np.concatenate([R_b, E_b]), np.concatenate([nada_b, E_b]), 1.0 - 3.0,
+                "principio", False),
+               ("el original sin silencio al principio", np.concatenate([R_b, pausa_b, E_b]), E_b, -3.15, "principio",
+                None),
+               ("algo después del episodio, con pausa", np.concatenate([E_b, pausa_b, R_b]),
+                np.concatenate([E_b, nada_b]), 0.0, "final", True))
+    for nombre_b, dob_b, ori_b, L_b, donde_b, quita_b in casos_b:
+        try:
+            res_b, msgs_b = montado_b(dob_b, ori_b, L_b)
+        except Exception as e:
+            fallos.append(f"{nombre_b}: revienta ({e})")
+            continue
+        borde = res_b[:int(0.95 * fs_b)] if donde_b == "principio" else res_b[-int(0.95 * fs_b):]
+        dentro = res_b[int(1.1 * fs_b):int(19 * fs_b)] if donde_b == "principio" else res_b[int(1 * fs_b):int(19 * fs_b)]
+        esperado = E_b[int(0.1 * fs_b):int(18 * fs_b)] if donde_b == "principio" and ori_b is not E_b else None
+        dicho = any(x.startswith("Principio: el original empieza" if donde_b == "principio" else "Final: el original acaba")
+                    for x in msgs_b)
+        if quita_b and (db_(borde) > -60 or not dicho):
+            fallos.append(f"{nombre_b}: lo de fuera del episodio suena ({db_(borde):.0f} dB) o no se dice ({msgs_b})")
+        if quita_b is False and (db_(borde) < -30 or dicho):
+            fallos.append(f"{nombre_b}: se corta (la frase sigue sin pausa: {db_(borde):.0f} dB; {msgs_b})")
+        if quita_b is None and dicho:
+            fallos.append(f"{nombre_b}: corta sin silencio en el original ({msgs_b})")
+        if esperado is not None and np.corrcoef(dentro[:len(esperado)], esperado[:len(dentro)])[0, 1] < 0.99:
+            fallos.append(f"{nombre_b}: el episodio no va en su sitio")
+    out.append(("bordes_en_silencio", "donde el original empieza o acaba en silencio digital, lo que el doblaje tenga ahí "
+                                      "(un resumen, una cortinilla) no va si lo separa una pausa; una frase que sigue, sí",
+                fallos))
+    # (1.4.22; El increíble Hulk 1x02, 62:31-63:19: el original sonaba encima del castellano) un tramo que los cortes
+    # dejan en nada, con un desfase que lo pone en medio de otro trozo ya colocado: el hueco de después se contaba desde
+    # él. Tres tramos en otro orden (0-30 s del doblaje en 0-30; nada en el 10; 30-60 en 40-70): el original solo va en
+    # 30-40, y en 0-30 solo el castellano
+    fallos = []
+    D_m, O_m = 0.1 * rng.standard_normal(60 * fs_b), 0.1 * rng.standard_normal(70 * fs_b)
+    db_m = sd.niveles_db(D_m.astype(np.float32)[:, None], fs_b)
+    cortes_m = [dict(sd.corte_exacto(db_m, 30.0), reordenado=True), dict(sd.corte_exacto(db_m, 30.0), reordenado=True)]
+    o2_m = O_m.astype(np.float32)[:, None]
+    try:
+        res_m = sd.montar(D_m.astype(np.float32)[:, None], fs_b, 0.0, [0.0, -20.0, 10.0], cortes_m, 70.0, 0,
+                          original=lambda tr: [o2_m[max(a, 0):max(b, 0)] for a, b in tr], p=lambda *_: None)[0][:, 0]
+        cc = lambda x, y: float(np.corrcoef(x, y)[0, 1])
+        c_dob = cc(res_m[12 * fs_b:28 * fs_b], D_m[12 * fs_b:28 * fs_b])
+        c_ori = cc(res_m[31 * fs_b:39 * fs_b], O_m[31 * fs_b:39 * fs_b])
+        if c_dob < 0.99:
+            fallos.append(f"en 12-28 s no va solo el castellano (se parece {c_dob:.2f} a él: el original va encima)")
+        if c_ori < 0.9:
+            fallos.append(f"en 31-39 s no va el original (se parece {c_ori:.2f})")
+    except Exception as e:
+        fallos.append(f"revienta ({e})")
+    out.append(("relleno_sin_pisar", "el original solo va donde no hay castellano, aunque un tramo que se queda en nada "
+                                     "caiga en medio de otro", fallos))
+    # (1.4.22; El increíble Hulk 1x02) las escenas en otro orden medidas con el audio (bloques_en_audio), con las que
+    # «encuentra la imagen» puestas a mano (bloques_lejanos y piezas_por_imagen, sustituidas) y el sonido fabricado: del
+    # original (ruido, 360 s), 0-60 en su sitio, 150-180 en el 60 del doblaje, 2 s que el original no tiene y 201,5-309,5
+    # en el 92. El audio lo había medido todo desde el 60 con -50 s (lo que daba a la zona sin coincidencias).
+    # 1) Entre dos escenas colocadas, los 2 s de en medio no se quedan con -50: son el sitio del salto entre las dos.
+    # 2) Una escena que la imagen encuentra en 60-100 (con 60-90 ya colocado con otro desfase): lo libre, 90-100, se
+    #    coloca (con las ventanas de 60-90 el audio no la confirmaba)
+    fallos = []
+    AR = sd.AR
+    b_o = rng.standard_normal(360 * AR).astype(np.float32)
+    a_d = np.concatenate([b_o[:60 * AR], b_o[150 * AR:180 * AR], rng.standard_normal(2 * AR).astype(np.float32),
+                          b_o[int(201.5 * AR):int(309.5 * AR)]])
+    fr_o = rng.integers(0, 256, (3600, 24, 32), dtype=np.uint8)
+    img_o = ((np.arange(2000) / 10, fr_o[:2000]), (np.arange(3600) / 10, fr_o))
+    cambios_o = (np.arange(0.0, 200.0, 3.0), np.ones(67), np.arange(0.0, 360.0, 3.0), np.ones(120))
+    antes_bl, antes_pz = sd.bloques_lejanos, sd.piezas_por_imagen
+    try:
+        for nombre_o, propuestas, bien in (
+                ("la rendija entre dos escenas", [(60.0, 90.0, 90.0), (92.0, 200.0, 109.5)],
+                 lambda n, e: (not any(abs(s[2] + 50) < 1 for s in n) and any(89.9 <= v[0] and v[1] <= 92.1
+                                                                            for v in e.values()))),
+                ("una escena que incluye otra ya colocada", [(60.0, 90.0, 90.0), (60.0, 100.0, 109.5)],
+                 lambda n, e: any(abs(s[2] - 109.5) < 0.1 and s[0] <= 92.5 and s[1] >= 99.5 for s in n))):
+            sd.bloques_lejanos = lambda segs_i, L_i, *a_, _p=propuestas: (segs_i, L_i, list(_p), [])
+            sd.piezas_por_imagen = lambda *a_: (None, None, [], None)
+            msgs_o = []
+            nuevos_o, entre_o, _ = sd.bloques_en_audio([[0.0, 60.0, 0.0], [60.0, 200.0, -50.0]], {}, 0.0, cambios_o,
+                                                       0.0, img_o, a_d, b_o, msgs_o.append)
+            if not bien(nuevos_o, entre_o):
+                fallos.append(f"{nombre_o}: sale {[[round(x, 2) for x in s] for s in nuevos_o]}, saltos "
+                              f"{ {i: (round(v[0], 2), round(v[1], 2)) for i, v in entre_o.items()} }")
+    except Exception as e:
+        fallos.append(f"revienta ({type(e).__name__}: {e})")
+    finally:
+        sd.bloques_lejanos, sd.piezas_por_imagen = antes_bl, antes_pz
+    out.append(("escenas_colocadas", "entre dos escenas colocadas no queda un trozo con un desfase que no dice nada, y lo "
+                                     "libre de una escena que incluye otra ya colocada se coloca", fallos))
     # cuándo la envolvente mide bien sin la imagen: el mismo sonido con otra codificación (parecido 0,85-0,94, desfase
     # estable) sí; otra mezcla (el desfase salta 0,18 s de ida y vuelta) no
     t = np.arange(600.0)
