@@ -31,7 +31,7 @@ import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 from scipy import signal, ndimage, linalg, fft as sfft
 
-VERSION = '1.4.20'
+VERSION = '1.4.21'
 NL = 32768              # espectro para buscar los tonos fijos: 1,35 Hz por banda
 P_AR = 40               # orden del modelo AR de los chasquidos
 BLOQUE_S = 600          # se limpia por trozos de unos 10 min: la memoria no depende de la duración

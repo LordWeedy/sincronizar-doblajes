@@ -11,7 +11,7 @@ Solo vale lo que se oye: cada trozo se transcribe suelto (sin lo de al lado, que
 de Whisper, y fuera lo que Whisper se inventa en el silencio o el ruido («You», «Thanks for watching!»...)."""
 import os, re, shutil, subprocess, tempfile
 
-VERSION = '1.4.20'
+VERSION = '1.4.21'
 CACHE = os.path.join(os.path.expanduser("~"), ".cache", "sincronizar_doblaje")
 WHISPER = "medium"          # small: unas 3 veces más rápido y algo peor; nunca large (demasiado para estos equipos)
 MAX_LINEA = 42              # caracteres por línea del subtítulo, dos líneas como mucho

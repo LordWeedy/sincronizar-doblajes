@@ -51,7 +51,40 @@ from scipy import fft as sp_fft
 import limpiar_vhs
 import forzados_vo
 
-VERSION = '1.4.20'
+VERSION = '1.4.21'
+
+
+def _version_programa():
+    """La versión del código que hace el trabajo. En la copia de desarrollo (la de siempre con la herramienta de
+    publicar al lado, o el src\\ de un clon de git) el número no cambia hasta publicar: va también la fecha del código
+    (la del .py del programa más reciente)."""
+    aqui = os.path.dirname(os.path.realpath(__file__))
+    v = VERSION
+    if os.path.isfile(os.path.join(aqui, "publicacion", "publicar_version.py")) or \
+            os.path.exists(os.path.join(os.path.dirname(aqui), ".git")):
+        try:
+            v += " · desarrollo, código del " + time.strftime("%d-%m-%Y %H:%M", time.localtime(max(
+                os.path.getmtime(f) for f in glob.glob(os.path.join(aqui, "*.py"))
+                if not os.path.basename(f).startswith("probar_"))))
+        except (OSError, ValueError):
+            pass
+    return v
+
+
+# (27-11-2026, pedido del usuario: «igual estoy mandando informes de cosas que o bien se han corregido o bien se han
+# estropeado») la primera línea de cada informe y diagnóstico dice con qué versión se hizo. Se mira al cargar: es la del
+# código que se ejecuta aunque luego cambie el de la carpeta. La ventana la usa en su título.
+VERSION_PROGRAMA = _version_programa()
+
+
+def linea_version(que="hecho"):
+    """«Sync Master versión X · hecho el D a las H». Si la ventana que lo lanzó es de otra versión (se actualizó la
+    carpeta con ella abierta: su código sigue siendo el de antes), también se dice."""
+    ventana = os.environ.get("SYNC_MASTER_VENTANA", "")
+    otra = f" (la ventana es de la {ventana}: ciérrala y vuelve a abrirla)" if ventana and ventana != VERSION else ""
+    return f"Sync Master versión {VERSION_PROGRAMA}{otra} · {que} el {time.strftime('%d-%m-%Y a las %H:%M')}"
+
+
 AR = 8000            # frecuencia de análisis
 MIN_JUMP = 0.060     # saltos menores se ignoran (~1,5 frames PAL)
 # Las tareas independientes (los dos vídeos, las velocidades candidatas, las dos señales del seguimiento, los tramos
@@ -1497,6 +1530,41 @@ COSTURA_TOPE = 4.0           # veces (±12 dB) sobre lo de todo el relleno
 # parecido 0,03-0,16): con COSTURA_MISMO o más se iguala en el mismo trozo; si no, lo que se oye a cada lado (el
 # castellano junto a la costura y el original de dentro del relleno, sin voz), que es el escalón que se nota
 COSTURA_MISMO = 0.4
+# La lateral, solo donde lleva de verdad el fondo de la escena (1.4.21; en la escucha del usuario: «noto el sonido muy
+# distorsionado»). La voz de una frase del original se quitaba con su lateral (la música y los efectos sin el diálogo
+# del centro) si el episodio entero la tenía; en los trozos de los finales, allí donde se usó, la lateral quedaba de 8 a
+# 28 dB por debajo del fondo del propio original (su centro donde no se habla): un hueco de 4 s con los restos de la
+# codificación (Xena 6x10, -24 dB). Ahora solo si queda a LATERAL_FONDO dB del fondo o menos; si no, la frase va con su
+# voz (como en los episodios sin lateral) y la que se oiría dos veces se avisa
+LATERAL_FONDO = 6.0          # dB que puede quedar la lateral por debajo del fondo
+LATERAL_ALREDEDOR = 5.0      # s a cada lado donde se mide el fondo
+
+
+def lateral_frente_al_fondo(x, fs, j0, j1, hablan=None):
+    """dB de la lateral de x (estéreo) en sus muestras [j0, j1) frente al fondo del original ahí: su centro donde no se
+    habla (Silero, voz_silero_en; sin él, hablan: 100 por segundo, como x) a ±LATERAL_ALREDEDOR s. None si no hay un
+    segundo de fondo con que comparar."""
+    H = fs // 100
+    z = np.asarray(x[j0:j1], np.float64)
+    if z.ndim != 2 or z.shape[1] != 2 or len(z) < H:
+        return None
+    k0 = max(0, j0 // H - int(LATERAL_ALREDEDOR * 100))
+    k1 = min(len(x) // H, -(-j1 // H) + int(LATERAL_ALREDEDOR * 100))
+    w = np.asarray(x[k0 * H:k1 * H], np.float64)
+    e = ((((w[:, 0] + w[:, 1]) / 2) ** 2).reshape(-1, H)).mean(1)
+    v = np.zeros(len(e), bool)
+    sv = voz_silero_en(x, fs, k0 / 100, k1 / 100)
+    if sv is not None:
+        for s, f_ in sv:
+            v[max(0, int(s * 100) - k0):max(0, int(np.ceil(f_ * 100)) - k0)] = True
+    elif hablan is not None:
+        hv = np.asarray(hablan[k0:k1], bool)[:len(e)]
+        v[:len(hv)] = hv
+    fondo = e[~v]
+    if len(fondo) < 100:
+        return None
+    lat = float(np.mean(((z[:, 0] - z[:, 1]) / 2) ** 2))
+    return 10 * np.log10(lat + 1e-20) - 10 * np.log10(float(fondo.mean()) + 1e-20)
 
 
 def montar(es, fs, k, L, cortes, en_len, pre, original=None, lienzo=None, sin_doblaje=(), curva=None, puentes=(),
@@ -2246,6 +2314,20 @@ def montar(es, fs, k, L, cortes, en_len, pre, original=None, lienzo=None, sin_do
                 i0 = 0 if hacia > 0 else max(int(round(z0 * fs)) - en_x(p0), 0)
                 i1 = len(f) if hacia < 0 else min(int(round(z1 * fs)) - en_x(p0), len(f))
                 if i1 - i0 <= 0:
+                    continue
+                # (la lateral, solo si lleva el fondo: LATERAL_FONDO)
+                d_lat = lateral_frente_al_fondo(x, fs, max(en_x(p0), 0) + i0, max(en_x(p0), 0) + i1, hablan)
+                if d_lat is None or d_lat < -LATERAL_FONDO:
+                    t_z = (p0 + i0 - pre) / fs
+                    if p:
+                        p(f"Relleno {mmss(t_dob)}: {mmss(t_z)}-{mmss((p0 + i1 - pre) / fs)} del original con su voz: "
+                          f"la lateral apenas suena ahí ("
+                          + (f"{d_lat:+.0f} dB del fondo" if d_lat is not None else "sin fondo con que compararla")
+                          + ")")
+                    if por and "repite" in str(por[0]) and repetidas is not None:
+                        repetidas.append(f"relleno {mmss(t_z)}: la frase del original dice lo mismo que el castellano "
+                                         "de al lado y no se le puede quitar la voz (su lateral apenas suena); se oye "
+                                         "dos veces, conviene escucharlo")
                     continue
                 trozo = f0[i0:i1]
                 sv = np.repeat(((trozo[:, 0] - trozo[:, 1]) / 2)[:, None], ch, 1)
@@ -3303,8 +3385,8 @@ def medir_video(es_path, en_path, st_es, st_en, p, deco="cpu", vel=None, estirar
     Al leer los cambios de plano se guardan de paso miniaturas de los dos vídeos en una carpeta temporal, por si la
     velocidad resulta variable (contenido_deriva); se borran al terminar.
     Devuelve (tramos, k, L, cambios, vel, puntos, zonas con otro montaje, trechos del doblaje sin comprobar o
-    corregidos con la imagen, curva, avisos de la comprobación con la imagen); los tiempos del original, ya a la
-    velocidad del doblaje."""
+    corregidos con la imagen, curva, avisos de la comprobación con la imagen, empalmes que la imagen pone en un
+    fotograma [empalmes_con_imagen]); los tiempos del original, ya a la velocidad del doblaje."""
     tmp = tempfile.mkdtemp(prefix="miniaturas_")
     try:
         return _medir_video(es_path, en_path, st_es, st_en, p, deco, vel, estirar,
@@ -3374,7 +3456,7 @@ def _medir_video(es_path, en_path, st_es, st_en, p, deco, vel, estirar, miniatur
         if deriva is None:
             raise RuntimeError("los vídeos tampoco coinciden: ¿es el mismo episodio?")
         segs, L, v_media, pts, dudosas, curva = deriva
-        return segs, 0.0, L, (tm, sm, te / float(v_media), se), vel * v_media, pts, [], dudosas, curva, []
+        return segs, 0.0, L, (tm, sm, te / float(v_media), se), vel * v_media, pts, [], dudosas, curva, [], []
     k = 0.0
     for _ in range(3):
         segs = tramos_video(ev, ref, k, niveles_video(pts, ev, ref, k))
@@ -3396,7 +3478,7 @@ def _medir_video(es_path, en_path, st_es, st_en, p, deco, vel, estirar, miniatur
           f"desfase de los tramos de al lado; va con ellos")
     # comprobación con el contenido de la imagen (revisar_con_imagen), y lo que el doblaje tiene en otro orden que el
     # original (bloques_lejanos, piezas_por_imagen, bordes_con_imagen)
-    confirmados, avisos, zonas_orden = [], [], []
+    confirmados, avisos, zonas_orden, empalmes = [], [], [], []
     md, mo = leer_miniaturas(miniaturas[0]), leer_miniaturas(miniaturas[1])
     md_ok = bool(md and mo)
     if md_ok:
@@ -3425,6 +3507,7 @@ def _medir_video(es_path, en_path, st_es, st_en, p, deco, vel, estirar, miniatur
             k, L = reajustar(segs)
         segs, L, zonas_orden = bordes_con_imagen(segs, L, ev, ref, k, R, p)
         zonas_orden = zonas_piezas + zonas_orden
+        empalmes = empalmes_con_imagen(segs, L, k, R, p)
         R = None
         avisos += [f"{mmss(t0)}-{mmss(t1)} del doblaje: bloque en otro orden que en el original (va en "
                    f"{mmss(t0 * (1 + k) + Lg)}); conviene comprobarlo" for t0, t1, Lg, *_ in bloques]
@@ -3437,7 +3520,7 @@ def _medir_video(es_path, en_path, st_es, st_en, p, deco, vel, estirar, miniatur
     # (lo colocado con la imagen está confirmado por ella: no es otro montaje)
     colocados = [(t0, t1, Lg) for t0, t1, Lg, *_ in bloques + piezas + intermedios] if md_ok else []
     segs, L, zonas = sin_encaje(segs, L, ev, ref, k, confirmados, p, colocados)
-    return segs, k, L, (tm, sm, te, se), vel, pts, zonas + zonas_orden, None, None, avisos
+    return segs, k, L, (tm, sm, te, se), vel, pts, zonas + zonas_orden, None, None, avisos, empalmes
 
 
 def repasar_huecos(segs, L, ev, ref, k, min_s=10.0):
@@ -4809,7 +4892,59 @@ def voz_db(es, fs, a, b):
     return uniform_filter1d(10 * np.log10((y[:n * H].reshape(n, H) ** 2).mean(1) + 1e-12), 3), i0 / fs
 
 
+# Las pausas de la banda de la voz, con una segunda medida (1.4.21; en la escucha del usuario, 26-11-2026: «has pegado
+# el corte en español sin acabar su frase... "si no le impo" y acto seguido suena en inglés "you"»). Sin Whisper, la
+# banda tomaba el final flojo de una palabra por una pausa y una pausa con música por voz: empalmes_en_frases movía la
+# unión de un relleno 0,28 s a mitad de «importa» (Pan 3x02), y en los trozos de los finales, hasta 1,5 s, con 6 s de
+# castellano con voz fuera de su sitio en 5 de 21 rellenos (lo que queda entre los dos sitios va al otro lado del
+# relleno). Esos empalmes ya no se mueven (ver sincronizar); pausa_frase sigue para los bordes de lo que no se coloca
+# (bordes_de_zonas), ahora con el detector de voz de Whisper (Silero) como segunda medida: si t cae en una pausa de
+# verdad según él (PAUSA_FRASE s o más), no se mueve; y si lo lleva a donde aún se oye voz (los bordes de la banda caen
+# 0,1-0,2 s dentro de la palabra), va al borde de esa voz. Sin faster-whisper, como antes
+SILERO_MARGEN = 0.05         # s alrededor de lo que Silero da por voz
+
+
+def voz_silero_en(x, fs, a, b):
+    """[(desde, hasta)] (s) de lo que el detector de voz de Whisper (Silero) da por voz en x (muestras a fs, con
+    canales o no) entre a y b (s); None sin faster-whisper."""
+    try:
+        from faster_whisper.vad import VadOptions, get_speech_timestamps
+    except Exception:
+        return None
+    i0, i1 = max(0, int(a * fs)), min(len(x), int(b * fs))
+    if i1 - i0 < fs // 2:
+        return []
+    z = a_16k(x[i0:i1], fs)
+    return [(i0 / fs + v["start"] / 16000, i0 / fs + v["end"] / 16000)
+            for v in get_speech_timestamps(z, VadOptions(min_silence_duration_ms=100, speech_pad_ms=0))]
+
+
 def pausa_frase(es, fs, t, hacia, tope, zona=PAUSA_ZONA):
+    """Dónde acaba (hacia=+1) o empieza (hacia=-1) la frase del doblaje que cruza t (pausa_frase_banda), con el
+    detector de voz (voz_silero_en) como segunda medida: t si cae en una pausa suya de PAUSA_FRASE s o más; si donde lo
+    lleva aún se oye voz, al borde de esa voz (sin pasar de tope ni de zona; t si no cabe)."""
+    r = pausa_frase_banda(es, fs, t, hacia, tope, zona)
+    if abs(r - t) <= 0.005:
+        return r
+    # (con 3 s a cada lado: una frase cortada por el borde de lo que se escucha no es una frase que empieza o acaba ahí)
+    w0, w1 = max(0.0, min(t, r) - 3.0), max(t, r) + 3.0
+    sv = voz_silero_en(es, fs, w0, w1)
+    if sv is None:
+        return r
+    pausas = [(a, b) for a, b in zip([w0] + [e for _, e in sv], [s for s, _ in sv] + [w1]) if b - a >= PAUSA_FRASE]
+    if any(a <= t <= b for a, b in pausas):
+        return t                        # (ninguna frase lo cruza)
+    for s, e in sv:
+        if s - SILERO_MARGEN < r < e + SILERO_MARGEN:
+            if (s <= w0 + 0.01) if hacia < 0 else (e >= w1 - 0.01):
+                return t                # (la voz sigue más allá de lo que se escucha)
+            r2 = e + SILERO_MARGEN if hacia > 0 else s - SILERO_MARGEN
+            cabe = (r2 - t) * hacia > 0 and (r2 <= tope if hacia > 0 else r2 >= tope) and abs(r2 - t) <= zona + 0.005
+            return r2 if cabe else t
+    return r
+
+
+def pausa_frase_banda(es, fs, t, hacia, tope, zona=PAUSA_ZONA):
     """Dónde acaba (hacia=+1) o empieza (hacia=-1) la frase del doblaje que cruza t: la primera pausa de la voz de
     PAUSA_FRASE s o más (PAUSA_VOZ dB por debajo de la voz del lado que se queda) en ese sentido, sin pasar de tope
     (s del doblaje) ni de zona s. t si ya cae en una pausa o si no hay ninguna. (es puede ser también un trozo del
@@ -5616,6 +5751,26 @@ CONTRASTE_VOZ_PROPIA = 0.5
 # imagen). Donde en ese mismo trozo GOLPES_SEGUIDAS ventanas de golpes o más dicen otra cosa (VOZ_CONTRA_GOLPES s o más
 # de diferencia), las voces no corrigen
 VOZ_CONTRA_GOLPES = 0.1                # s
+# Y con dos rejillas de ventanas (1.4.21): las ventanas van desde el principio de cada tramo, y en Godzilla 1x09 (otra
+# mezcla, medido con la imagen) con el corte de un relleno 0,8 s más allá las voces decían «272 ms tarde» en 40 s que
+# estaban bien, y el resultado quedaba 200 ms descolocado; con la rejilla corrida 0,75, 1,5 o 2,25 s no decían nada (el
+# tramo no se partía ahí: entero, va a la par). La corrección vale solo si la rejilla corrida media ventana decide lo
+# mismo (voz_estable: una parte suya con ese desplazamiento, ±CONTRASTE_VOZ_ACUERDO y con la misma exigencia, en la mitad
+# o más de ese trozo)
+
+
+def voz_estable(cs2, desde, hasta, r, otro, parte):
+    """¿Decide lo mismo que r (pico_voz del trozo desde-hasta, s del doblaje) la rejilla corrida media ventana (cs2,
+    curvas_voz del mismo tramo)? Alguna de sus partes (partes_voz, con `parte`) que cubra la mitad o más del trozo, con su
+    pico a ±CONTRASTE_VOZ_ACUERDO del de r, CONTRASTE_VOZ_MIN curvas, la altura de siempre y la voz sola sosteniéndolo."""
+    medio = CONTRASTE_VOZ_VENTANA[0] / 2
+    for a, b, r2 in partes_voz(cs2, parte=parte):
+        if r2 is None or min(hasta, cs2[b][0] + medio) - max(desde, cs2[a][0] - medio) < 0.5 * (hasta - desde):
+            continue
+        if (abs(r2[0] - r[0]) <= CONTRASTE_VOZ_ACUERDO and r2[2] >= CONTRASTE_VOZ_MIN
+                and r2[1] >= CONTRASTE_VOZ_ALTURA * (1.5 if otro else 1.0) and voz_sostiene(cs2[a:b + 1], r2)):
+            return True
+    return False
 
 
 def voz_sonora(x, fs=AR):
@@ -5873,7 +6028,8 @@ def extremos_por_sonido(x, y, L, cortes, dur, dame_db):
     return L, cortes, partes
 
 
-def contrastar_voces(x, y, L, cortes, dur, dame_db, protegidos=(), distintas=(), planos=None, golpes=None, contra=None):
+def contrastar_voces(x, y, L, cortes, dur, dame_db, protegidos=(), distintas=(), planos=None, golpes=None, contra=None,
+                     inestables=None):
     """Después del contraste con la onda (con la imagen): los trozos donde la onda no ha medido (protegidos: donde sí,
     [(desde, hasta)] en s del doblaje) y las voces y la envolvente dicen claramente que el doblaje se aparta MIN_AV o
     más, van con ese desplazamiento; si dentro de un tramo cambia, con un corte en el silencio entre las ventanas de
@@ -5883,19 +6039,24 @@ def contrastar_voces(x, y, L, cortes, dur, dame_db, protegidos=(), distintas=(),
     voz sola (voz_sostiene); si no, se anota en descartadas. golpes: función (desde, hasta en s del doblaje, desfase del
     tramo) -> lo que miden ahí los golpes de los efectos [s, una por ventana medida] (golpes_en); donde dicen otra cosa
     (VOZ_CONTRA_GOLPES), las voces no corrigen y se añade a contra (lista) (desde, hasta, lo de las voces, lo de los
-    golpes). Devuelve (L, cortes, partes movidas [(desde, hasta en s del doblaje, desplazamiento, curvas)], cortes
-    nuevos, descartadas [(desde, hasta, desplazamiento)])."""
+    golpes). Lo que la rejilla corrida media ventana no dice igual (voz_estable) no se corrige y se añade a inestables
+    (lista) (desde, hasta, desplazamiento). Devuelve (L, cortes, partes movidas [(desde, hasta en s del doblaje,
+    desplazamiento, curvas)], cortes nuevos, descartadas [(desde, hasta, desplazamiento)])."""
     ini, fin = limites(cortes, L, dur)
     vx, vy, ex, ey = voz_sonora(x), voz_sonora(y), envolvente_log(x), envolvente_log(y)
     medio = CONTRASTE_VOZ_VENTANA[0] / 2
     db = None
     nL, nc, movidas, nuevos, descartadas = [], [], [], 0, []
     contra = [] if contra is None else contra
+    inestables = [] if inestables is None else inestables
     for i in range(len(L)):
         otro = any(q0 < fin[i] and q1 > ini[i] for q0, q1 in distintas)
-        cs = curvas_voz(vx, vy, ex, ey, ini[i], fin[i], L[i], CONTRASTE_VOZ_LEJOS if otro else CONTRASTE_BUSCA)
+        busca = CONTRASTE_VOZ_LEJOS if otro else CONTRASTE_BUSCA
+        cs = curvas_voz(vx, vy, ex, ey, ini[i], fin[i], L[i], busca)
+        cs2 = None              # (la rejilla corrida media ventana, solo si algo se va a corregir)
+        parte = CONTRASTE_VOZ_PARTE_CORTA if otro else CONTRASTE_VOZ_PARTE
         ps = []
-        for a, b, r in partes_voz(cs, parte=CONTRASTE_VOZ_PARTE_CORTA if otro else CONTRASTE_VOZ_PARTE):
+        for a, b, r in partes_voz(cs, parte=parte):
             desde, hasta = cs[a][0] - medio, cs[b][0] + medio
             vale = (r is not None and r[2] >= CONTRASTE_VOZ_MIN
                     and r[1] >= CONTRASTE_VOZ_ALTURA * (1.5 if otro else 1.0)
@@ -5903,6 +6064,12 @@ def contrastar_voces(x, y, L, cortes, dur, dame_db, protegidos=(), distintas=(),
             if vale and not voz_sostiene(cs[a:b + 1], r):
                 vale = False
                 descartadas.append((max(desde, ini[i]), min(hasta, fin[i]), r[0]))
+            if vale:
+                if cs2 is None:         # (media ventana antes: tantas ventanas como cs, o una más)
+                    cs2 = curvas_voz(vx, vy, ex, ey, ini[i] - CONTRASTE_VOZ_VENTANA[1] / 2, fin[i], L[i], busca)
+                if not voz_estable(cs2, desde, hasta, r, otro, parte):
+                    vale = False
+                    inestables.append((max(desde, ini[i]), min(hasta, fin[i]), r[0]))
             if vale and golpes is not None:
                 g = golpes(max(desde, ini[i]), min(hasta, fin[i]), L[i])
                 if len(g) >= GOLPES_SEGUIDAS and abs(float(np.median(g)) - r[0]) >= VOZ_CONTRA_GOLPES:
@@ -7310,9 +7477,104 @@ def repeticiones_en_audio(segs, entre, k, cambios, calibracion, imagen, a, b, p,
 # sitio de esos 4 s pone castellano con la escena que no es. Si al doblaje no le sobra nada ahí (le falta metraje o es
 # un bloque en otro orden), el salto es un punto: plano a plano con la imagen (etiqueta_plano, como bordes_con_imagen),
 # entre el último plano de lo de antes y el primero de lo de después, si los hay y van en orden; si entre ellos queda
-# algún plano que no se parece a ninguno, el salto va en el silencio de ahí, como antes. Al montar, sin partir la frase
-# que lo cruce (frase_en_salto). Si al doblaje le sobra algo, no: eso tiene que caber entre los dos
+# algún plano que no se parece a ninguno, el salto va en el silencio de ahí, como antes. Al montar, ahí mismo (hasta
+# la 1.4.20 se movía para no partir la frase que lo cruzara). Si al doblaje le sobra algo, no: eso tiene que caber
+# entre los dos
 SALTO_PLANOS_MIN = 1.0       # s: los saltos más pequeños, en el silencio (la imagen apenas distingue los dos desfases)
+# Y dentro de un plano, fotograma a fotograma (1.4.21): midiendo con la imagen, un hueco a mitad de plano (sin cambio de
+# plano en el original a ninguno de sus lados, que empalme_video no ve) se cortaba en el silencio más largo de entre los
+# cambios de plano de al lado, de 0,14 a 2,1 s antes o después del empalme, y lo de entre los dos sitios sonaba al otro
+# lado del relleno (el usuario, en la escucha de los rellenos: «se llega a oír parte de una frase anterior del
+# narrador»). Cada fotograma del doblaje, frente al del original con cada desfase: hasta el empalme se parece al del
+# primero mucho más que al del segundo, y desde él al revés (en 17 empalmes de 9 series, junto al empalme, de 0,43 a
+# 0,95 con el suyo y de 0,32 a 0,92 más que con el otro; todos en su fotograma). Si la imagen no lo dice así (oscura,
+# fija o igual con los dos desfases), como antes
+EMPALME_PARECIDO = 0.35      # parecido medio (imagen y movimiento) de los fotogramas junto al empalme con su desfase...
+EMPALME_SOBRE = 0.25         # ...y sobre el del otro desfase
+EMPALME_JUNTO = 6            # fotogramas de cada lado que lo tienen que decir
+EMPALME_MARGEN = 0.5         # s que se miran más allá de los dos cambios de plano de al lado...
+EMPALME_BUSCA = 3.0          # ...o, midiendo con la imagen, hasta esto, si todo lo de en medio lo dice igual: tras los
+                             # destellos de la cabecera de Becker 1x02 el salto iba en un cambio de plano que encajaba por
+                             # casualidad con los dos desfases, 2,1 s antes del empalme
+
+
+def empalme_por_fotogramas(R, lo, hi, La, Lb, k, desde=None, hasta=None):
+    """El instante (s del doblaje, en el tiempo de su imagen) en que empieza su primer fotograma con el desfase Lb tras
+    los del desfase La, entre lo y hi: donde más se parecen los de antes al original con La y los de después con Lb.
+    Se busca entre desde y hasta (por omisión, EMPALME_MARGEN más allá de lo y hi); fuera de lo y hi solo vale si todo
+    lo de en medio va claro con su lado. None si junto a él la imagen no lo dice claro (EMPALME_PARECIDO,
+    EMPALME_SOBRE). R: rasgos_de."""
+    td, xd = R["md"]
+    to, xo = R["mo"]
+    desde = lo - EMPALME_MARGEN if desde is None else desde
+    hasta = hi + EMPALME_MARGEN if hasta is None else hasta
+    i0, i1 = np.searchsorted(td, [desde, hasta])
+    i0 = max(int(i0), 1)
+    if i1 - i0 < 2 * EMPALME_JUNTO + 2:
+        return None
+    t = np.asarray(td[i0:i1], np.float64)
+    ya, yb = t * (1 + k) + La, t * (1 + k) + Lb
+    j0 = max(1, int(np.searchsorted(to, min(ya[0], yb[0]) - 0.3)))
+    j1 = int(np.searchsorted(to, max(ya[-1], yb[-1]) + 0.3))
+    if j1 - j0 < 2 * EMPALME_JUNTO:
+        return None
+    # (cada trozo con el fotograma de antes: el movimiento del primero, frente a él)
+    Id, Md = (np.asarray(z[1:], np.float32) for z in rasgos_imagen(xd[i0 - 1:i1], R["zd"]))
+    Io, Mo = (np.asarray(z[1:], np.float32) for z in rasgos_imagen(xo[j0 - 1:j1], R["zo"]))
+    tt = np.asarray(to[j0:j1], np.float64)
+
+    def cerca(y):
+        j = np.clip(np.searchsorted(tt, y), 1, len(tt) - 1)
+        return np.where(np.abs(tt[j - 1] - y) < np.abs(tt[j] - y), j - 1, j)
+    ja, jb = cerca(ya), cerca(yb)
+    ia, ib = (Id * Io[ja]).sum(1), (Id * Io[jb]).sum(1)
+    sa, sb = (ia + (Md * Mo[ja]).sum(1)) / 2, (ib + (Md * Mo[jb]).sum(1)) / 2
+    # el punto, con la imagen sola: el movimiento del primer fotograma de después es el propio salto, y si es un cambio
+    # de plano se parece al del original con el primer desfase, que ahí también cambia de plano (iba un fotograma tarde
+    # en Crash Canyon 1x01). Lo claro que es, con los dos y sin ese fotograma
+    s = int(np.argmax(np.concatenate([[0.0], np.cumsum(ia - ib)])))
+    if not EMPALME_JUNTO <= s <= len(t) - EMPALME_JUNTO - 1:
+        return None
+
+    def claro(a, b, de_a):
+        x, y = (sa[a:b], sb[a:b]) if de_a else (sb[a:b], sa[a:b])
+        return len(x) > 0 and x.mean() >= EMPALME_PARECIDO and (x - y).mean() >= EMPALME_SOBRE
+    T = float(t[s])
+    if not (claro(s - EMPALME_JUNTO, s, True) and claro(s + 1, s + 1 + EMPALME_JUNTO, False)):
+        return None
+    if T > hi + 0.05 and not claro(int(np.searchsorted(t, hi)), s, True):
+        return None
+    if T < lo - 0.05 and not claro(s + 1, int(np.searchsorted(t, lo)), False):
+        return None
+    return T
+
+
+def empalmes_con_imagen(segs, L, k, R, p=print):
+    """Los empalmes con lo que le falta al doblaje (el desfase sube SALTO_PLANOS_MIN o más de un tramo al siguiente)
+    que la imagen pone en un fotograma (empalme_por_fotogramas, hasta EMPALME_BUSCA más allá de los cambios de plano de
+    al lado y dentro de los dos tramos): [(instante, desfase de antes, el de después)]. Si va fuera de esos cambios de
+    plano, los tramos acaban y empiezan ahí."""
+    out = []
+    for i in range(len(segs) - 1):
+        if L[i + 1] - L[i] < SALTO_PLANOS_MIN:
+            continue
+        lo, hi = segs[i][1], segs[i + 1][0]
+        T = empalme_por_fotogramas(R, lo, hi, L[i], L[i + 1], k, max(segs[i][0], lo - EMPALME_BUSCA),
+                                   min(segs[i + 1][1], hi + EMPALME_BUSCA))
+        if T is None:
+            continue
+        if not lo - 0.05 <= T <= hi + 0.05:
+            p(f"Salto de {L[i + 1] - L[i]:.2f} s en {mmss(lo)}" + (f"-{mmss(hi)}" if hi - lo > 0.05 else "") +
+              f" del doblaje: la imagen, fotograma a fotograma, lo pone en {mmss(T)}")
+            segs[i][1] = segs[i + 1][0] = T
+        out.append((T, L[i], L[i + 1]))
+    return out
+
+
+def empalme_de(empalmes, lo, hi, La, Lb):
+    """El de empalmes (empalmes_con_imagen) que va entre lo y hi con esos desfases, o None."""
+    return next((T for T, a, b in empalmes if lo - 0.1 <= T <= hi + 0.1 and abs(a - La) < 0.1 and abs(b - Lb) < 0.1),
+                None)
 
 
 def salto_plano_a_plano(segs, entre, k, cambios, imagen, dur, p):
@@ -7334,12 +7596,19 @@ def salto_plano_a_plano(segs, entre, k, cambios, imagen, dur, p):
         bordes = planos_de(lo + c, hi + c, unicos)
         planos = [(s0, s1, etiqueta_plano(R, s0, s1, [L[i] - c, L[i + 1] - c], k)) for s0, s1 in zip(bordes, bordes[1:])]
         de_a, de_b = [q for q in planos if q[2] == 0], [q for q in planos if q[2] == 1]
-        if not de_a and not de_b:
-            continue                    # (la imagen no dice nada)
         fin_a = max([q[1] for q in de_a] + [lo + c])
         ini_b = min([q[0] for q in de_b] + [hi + c])
         if fin_a > ini_b + 1e-6:
             continue                    # (planos de los dos en desorden: no se sabe)
+        # (entre el último plano de lo de antes y el primero de lo de después, fotograma a fotograma: un empalme a
+        # mitad de plano)
+        T = empalme_por_fotogramas(R, fin_a, ini_b, L[i] - c, L[i + 1] - c, k) if ini_b - fin_a > 1e-6 else None
+        if T is not None and not fin_a - 0.05 <= T <= ini_b + 0.05:
+            T = None                    # (no dentro de un plano que ya es de un lado)
+        if T is not None:
+            fin_a = ini_b = T
+        elif not de_a and not de_b:
+            continue                    # (la imagen no dice nada)
         fin_a, ini_b = fin_a - c, ini_b - c
         if ini_b - fin_a > 1e-6:
             if fin_a - lo > 0.05 or hi - ini_b > 0.05:
@@ -7349,19 +7618,11 @@ def salto_plano_a_plano(segs, entre, k, cambios, imagen, dur, p):
             continue
         out[i] = (fin_a, fin_a, v[2], c, (lo, hi))
         segs[i][1] = segs[i + 1][0] = fin_a
-        p(f"Salto entre {mmss(lo)} y {mmss(hi)} del doblaje: plano a plano con la imagen, en {mmss(fin_a)} ("
-          f"{len(de_a)} plano(s) con lo de antes y {len(de_b)} con lo de después)")
+        p(f"Salto entre {mmss(lo)} y {mmss(hi)} del doblaje: " + (
+            f"fotograma a fotograma con la imagen, en {mmss(fin_a)} (a mitad de plano)" if T is not None else
+            f"plano a plano con la imagen, en {mmss(fin_a)} ({len(de_a)} plano(s) con lo de antes y {len(de_b)} con lo "
+            "de después)"))
     return segs, out
-
-
-def frase_en_salto(es, fs, segs, L, k, i, v):
-    """Dónde cortar el salto i, que va en un punto (salto_plano_a_plano: v = (T, T, cambios, calibración, (desde,
-    hasta))), sin partir la frase del doblaje que lo cruce: donde acaba o donde empieza (pausa_frase), lo que quede más
-    cerca, sin salir de (desde, hasta) ni hacer que lo que se alarga pise en el original otro tramo; T si cae en una
-    pausa o si no hay ninguna a mano."""
-    T, (lo, hi) = v[0], v[4]
-    sitio = [(sg[0] * (1 + k) + Lj, sg[1] * (1 + k) + Lj) for j, (sg, Lj) in enumerate(zip(segs, L)) if j not in (i, i + 1)]
-    return frase_entera_en(es, fs, T, lo, hi, L[i], L[i + 1], sitio, k)[0]
 
 
 def frase_entera_en(es, fs, T, lo, hi, La, Lb, sitio, k, palabras=None):
@@ -7396,14 +7657,12 @@ def frase_entera_en(es, fs, T, lo, hi, La, Lb, sitio, k, palabras=None):
             sorted((x for x in fronteras if desde <= x <= hasta), key=lambda x: abs(x - T))
     return next(((x, False) for x in otros if not corta(x)), (nT, True))
 
-
-# Las frases, enteras también donde se empalma con el original (pedido del usuario, 18-11-2026: «prefiero que no se corte
-# la frase, en ambos idiomas, con preferencia SIEMPRE en castellano»). Un corte que empalma con lo que le falta al doblaje
-# (exacto: en el empalme, para que nada suene dos veces) cortaba la frase castellana que lo cruzara; ahora va donde acaba
-# o empieza (frase_entera_en, hasta PAUSA_ZONA s: lo que se alarga es poco y puede sonar otra vez en el relleno, que es
-# lo de menos). Y en el relleno, la frase del original que cruce su principio o su final (hasta RELLENO_FRASE s) va sin
-# voz (montar): media frase inglesa cortada contra el castellano (El último superviviente 1x02, 9:10: «I've abseiled
-# into the...» y luego la pausa con que empieza la escena castellana)
+# Las frases, enteras también donde se empalma con el original (pedido del usuario, 18-11-2026). El corte que empalma
+# con lo que le falta al doblaje se movía hasta donde acaba o empieza la frase castellana que lo cruzara; desde la
+# 1.4.21, no (va en su sitio: ver sincronizar). En el relleno, la frase del original que cruce su principio o su final
+# (hasta RELLENO_FRASE s) va sin voz (montar) si su lateral lleva el fondo (LATERAL_FONDO): media frase inglesa cortada
+# contra el castellano (El último superviviente 1x02, 9:10: «I've abseiled into the...» y luego la pausa con que empieza
+# la escena castellana)
 RELLENO_FRASE = 4.0          # s
 # Qué es voz: las pausas de la banda de la voz (pausa_frase) también las hacen la música y los efectos, y en el episodio
 # quitaban 2-3 s de música donde no se habla (31:28-31:35, 37:49-37:55 del original). Con la lateral sin diálogo, la voz
@@ -7675,7 +7934,40 @@ def se_habla(es, fs, t, cerca=0.1, alrededor=10.0):
     return bool(v[max(0, j - int(cerca * 100)):j + int(cerca * 100) + 1].any())
 
 
-def empalmes_en_frases(es, fs, cortes, L, dur, k, saltar=(), centro=False, palabras=None):
+
+
+# Un corte que empalma con lo que le falta al doblaje va donde se mide (1.4.21). Hasta la 1.4.20 se movía siempre hasta
+# donde acaba o empieza la frase castellana que lo cruzara, y con la medida bien hecha lo de entre los dos sitios iba
+# al otro lado del relleno, fuera de su sitio (en la escucha del usuario partía «importa»). Pero donde a los dos lados
+# se habla fuerte, el sonido no ve el empalme (en la prueba empalme_solape la medida caía 1,6 s tarde, a mitad de
+# «Mañana saldremos | temprano hacia el norte», y los dos trozos de la frase se iban con el audio original): se lleva al
+# borde de la frase solo si lo de entre los dos sitios no encaja claramente con ninguno de los dos lados (lado_claro).
+# Los que la imagen pone en un fotograma (empalme_video, empalme_por_fotogramas, salto_plano_a_plano) no se mueven
+EMPALME_CLARO = 0.3          # parecido del trozo con el original con el desfase de su lado...
+EMPALME_CLARO_SOBRE = 0.15   # ...y sobre el del otro
+
+
+def lado_claro(a, b, t0, t1, L, Lotro, k):
+    """¿El trozo t0-t1 (s) del doblaje encaja claramente con el original con el desfase L, y no con Lotro? a, b: las
+    señales de análisis (a AR) del doblaje y del original; False si no las hay o el trozo es muy corto."""
+    if a is None or b is None:
+        return False
+    i0, i1, F = int(round(t0 * AR)), int(round(t1 * AR)), int(0.01 * AR)
+    if i1 - i0 < int(0.05 * AR) or i0 < 0 or i1 > len(a):
+        return False
+    x = np.asarray(a[i0:i1], np.float32)
+
+    def parecido(Lx):
+        j0 = int(round((t0 * (1 + k) + Lx) * AR)) - F
+        if j0 < 0 or j0 + (i1 - i0) + 2 * F > len(b):
+            return 0.0
+        cc = ncc_curve(x, np.asarray(b[j0:j0 + (i1 - i0) + 2 * F], np.float32))
+        return float(np.abs(cc).max()) if cc is not None else 0.0       # (con los canales cambiados, al revés)
+    s_ = parecido(L)
+    return s_ >= EMPALME_CLARO and s_ >= parecido(Lotro) + EMPALME_CLARO_SOBRE
+
+
+def empalmes_en_frases(es, fs, cortes, L, dur, k, saltar=(), centro=False, palabras=None, senales=(None, None)):
     """Los cortes que no quitan nada (los que empalman con lo que falta, que se rellena con el original, y los de un
     bloque en otro orden), sin partir la frase del doblaje que los cruce (frase_entera_en, a PAUSA_ZONA s como mucho y sin
     salir de sus tramos); los que quitan algo ya van a pausas (recortes_en_pausas). Antes solo los exactos (los que se
@@ -7683,11 +7975,13 @@ def empalmes_en_frases(es, fs, cortes, L, dur, k, saltar=(), centro=False, palab
     partidas por un relleno («Después de cuatro días de búsqueda [2 s del original] lo encontraron deshidratado»).
     centro: el doblaje es estéreo con la lateral sin diálogo; solo se mueve si ahí se habla (se_habla), no por una bajada
     de la música. palabras (palabras_doblaje): con Whisper (frase_entera_en). Si no hay dónde no partirla, lo que queda
-    de ella lo arregla la comprobación del montaje (castellano_a_medias).
+    de ella lo arregla la comprobación del montaje (castellano_a_medias). Desde la 1.4.21, solo si el sonido no dice
+    con qué desfase va lo de entre los dos sitios (lado_claro, con senales: las de análisis del doblaje y del original;
+    sin ellas, no lo dice), y nunca los que ha puesto la imagen en un fotograma (firme).
     Cambia cortes; devuelve [(i, de, a)]."""
     movidos = []
     for i, c in enumerate(cortes):
-        if i in saltar or i + 1 >= len(L) or sobra_en_corte(cortes, L, dur, i) > 0:
+        if i in saltar or i + 1 >= len(L) or c.get("firme") or sobra_en_corte(cortes, L, dur, i) > 0:
             continue
         ini, fin = limites(cortes, L, dur)
         T = float(c["c"])
@@ -7700,13 +7994,15 @@ def empalmes_en_frases(es, fs, cortes, L, dur, k, saltar=(), centro=False, palab
                  if j not in (i, i + 1) and fin[j] > ini[j]]
         nT = frase_entera_en(es, fs, T, lo, hi, L[i], L[i + 1], sitio, k, palabras)[0]
         if abs(nT - T) > 0.005:
+            # (si lo de entre los dos sitios encaja claramente con el lado en que lo pone la medida, está bien medido)
+            if (lado_claro(*senales, nT, T, L[i], L[i + 1], k) if nT < T
+                    else lado_claro(*senales, T, nT, L[i + 1], L[i], k)):
+                continue
             # (el suelo, como en corte_exacto: lo más flojo a ±50 ms)
             db = niveles_db(np.asarray(es[max(0, int((nT - 0.05) * fs)):int((nT + 0.05) * fs)], np.float32), fs)
             cortes[i] = dict(c, c=nT, q0=nT, q1=nT, suelo=float(db.min()) if len(db) else c["suelo"])
             movidos.append((i, T, nT))
     return movidos
-
-
 def comprobar_con_imagen(segs, k, pts, cambios, p):
     """Doble medida (siempre que los dos archivos sean vídeos; pedido del usuario, 12-10-2026): el episodio entero
     medido también con los cambios de plano y comparado tramo a tramo con lo que se va a montar. Lo que difieren
@@ -8868,6 +9164,7 @@ def sincronizar_subtitulos(video, sub_path, out_path, p=print):
         p(msg)
         log.append(msg)
 
+    p2(linea_version())
     p2(f"Vídeo: {os.path.basename(video)}")
     p2(f"Subtítulo: {os.path.basename(sub_path)}")
     pistas = pistas_audio(video)
@@ -10130,6 +10427,7 @@ def sincronizar(es_path, en_path, out_path, sub_path=None, pista=None, guia=None
     CRONO.clear()
     global RECORTE_ORIGINAL
     RECORTE_ORIGINAL = None             # (el recorte del original de otro episodio no vale: poner_recorte)
+    p(linea_version())
     p(f"Doblaje : {os.path.basename(es_path)}")
     p(f"Original: {os.path.basename(en_path)}")
     objetivo = idioma_iso(forz_idioma) or "spa"
@@ -10305,13 +10603,14 @@ def sincronizar(es_path, en_path, out_path, sub_path=None, pista=None, guia=None
     curva = None            # con velocidad variable y estirar_variable: el desfase continuo con que se estira
     voz8 = None             # con la imagen, el doblaje a AR en mono: para ver si su sonido va desfasado de su imagen
     avisos_sonido = []      # si ese desfase cambia a lo largo del episodio (seguir_al_sonido)
+    empalmes_img = []       # con la imagen, los empalmes a mitad de plano (empalmes_con_imagen)
     if video:
         mezcla = None
         voz8 = es8.mean(1).astype(np.float32)
         del es8
         p("Señal de análisis: vídeo (cambios de plano)")
         v_previa = vel if vel and vel != 1 else Fraction(1)
-        segs, k, L, cambios, vel_v, pts, zonas, dudosas, curva, avisos_v = medir_video(
+        segs, k, L, cambios, vel_v, pts, zonas, dudosas, curva, avisos_v, empalmes_img = medir_video(
             es_path, en_path, st_es, st_en, p, decodificar, v_previa if v_previa != 1 else None, estirar_variable)
         if vel_v != v_previa:       # la velocidad (o lo que se suma a la del audio) la han dado los cambios de plano
             en_len /= float(vel_v / v_previa)
@@ -10432,10 +10731,8 @@ def sincronizar(es_path, en_path, out_path, sub_path=None, pista=None, guia=None
         cortes = [punto_entre(db, entre_video[i][0], entre_video[i][1], saltos[i]) if i in entre_video
                   else punto_silencio(db, sg[1]) for i, sg in enumerate(segs[:-1])]
         for i, v in entre_video.items():
-            if len(v) > 4:          # un salto en su punto (salto_plano_a_plano): ahí, sin partir la frase que lo cruce
-                # (con la lateral sin diálogo, solo si ahí se habla de verdad: no por una bajada de la música)
-                habla = not (lateral and ch == 2) or se_habla(es, fs, v[0])
-                cortes[i] = corte_exacto(db, frase_en_salto(es, fs, segs, L, k, i, v) if habla else v[0])
+            if len(v) > 4:          # un salto en su punto (salto_plano_a_plano): ahí (lo pone la imagen: no se mueve)
+                cortes[i] = dict(corte_exacto(db, v[0]), firme=True)
         for i, sg in enumerate(segs[:-1]):
             if i not in entre_video and saltos[i] is not None and saltos[i] < 0:
                 # (el recorte, en el silencio a ±2,5 s del salto medido: recortes_en_pausas no lo lleva más lejos)
@@ -10450,16 +10747,22 @@ def sincronizar(es_path, en_path, out_path, sub_path=None, pista=None, guia=None
                 continue
             if i not in reordenados and (not rellenar_original or L[i + 1] - L[i] < UMBRAL_ORIGINAL):
                 continue
-            if video:
+            firme = True    # (lo pone la imagen: empalmes_en_frases no lo mueve)
+            if video:       # (en un cambio de plano que el original tiene a los dos lados, o a mitad de plano)
                 t = empalme_video(cambios, k, L[i], L[i + 1], segs[i][1], segs[i + 1][0])
+                if t is None:
+                    t = empalme_de(empalmes_img, segs[i][1], segs[i + 1][0], L[i], L[i + 1])
+                    if t is not None:
+                        p(f"Empalme {mmss(t)} del doblaje: a mitad de plano, fotograma a fotograma con la imagen")
             elif i in entre_video and len(entre_video[i]) > 4:
                 continue                    # (ya va en su punto)
             elif i in entre_video:
                 t = empalme_video(entre_video[i][2], k, L[i], L[i + 1], entre_video[i][0], entre_video[i][1])
             else:               # con la lateral, también con la mezcla (afinar_salto)
                 t = afinar_salto(a, b, segs[i][1], L[i], L[i + 1], k, (es8, en8, ana) if lateral else None)
+                firme = False
             if t is not None:
-                cortes[i] = corte_exacto(db, t)
+                cortes[i] = dict(corte_exacto(db, t), firme=firme)
     for i, c in enumerate(cortes):      # (lo que es un bloque en otro orden lo decide esto, no los cortes: es_reordenado)
         c["reordenado"] = i in reordenados
 
@@ -10637,12 +10940,12 @@ def sincronizar(es_path, en_path, out_path, sub_path=None, pista=None, guia=None
             # (los golpes de los efectos, ya aquí: las voces no corrigen donde ellos dicen otra cosa; VOZ_CONTRA_GOLPES)
             gx16 = senal_golpes(cargar(es_path, st_es, GOLPES_FS, 1)[:, 0], GOLPES_FS)
             gy16 = senal_golpes(acelerar(cargar(en_path, st_en, GOLPES_FS, 1)[:, 0], vel), GOLPES_FS)
-            contra_g = []
+            contra_g, inestables_v = [], []
             L, cortes, movidas, nuevos_v, sin_voz = contrastar_voces(
                 x_contraste, y8, L, cortes, dur_es, dame_db,
                 contraste.get("apoyos", []) + [(a_, b_) for _, a_, b_, _, _ in extremos], distintas,
                 cambios[0][cambios[1] > 0.5], golpes=lambda d0, d1, Li: golpes_en(gx16, gy16, d0, d1, Li),
-                contra=contra_g)
+                contra=contra_g, inestables=inestables_v)
             movidas_voz = movidas
             for a_, b_, d in sin_voz:
                 p(f"Contraste con las voces: {mmss(a_)}-{mmss(b_)} del doblaje, la mezcla decía {d * 1000:+.0f} ms, "
@@ -10650,6 +10953,9 @@ def sincronizar(es_path, en_path, out_path, sub_path=None, pista=None, guia=None
             for a_, b_, d, g in contra_g:
                 p(f"Contraste con las voces: {mmss(a_)}-{mmss(b_)} del doblaje, las voces decían {d * 1000:+.0f} ms, "
                   f"pero los golpes de los efectos dicen {g * 1000:+.0f} ms: no se toca")
+            for a_, b_, d in inestables_v:
+                p(f"Contraste con las voces: {mmss(a_)}-{mmss(b_)} del doblaje, las voces decían {d * 1000:+.0f} ms, "
+                  "pero con las ventanas corridas media ventana no lo dicen: no se toca")
             if movidas:
                 pct = lambda d: f"{abs(d) * 1000:.0f} ms {'tarde' if d < 0 else 'adelantado'}"
                 p("Contraste con las voces, donde no hay sonido en común (los actores de doblaje siguen los labios: "
@@ -10717,16 +11023,23 @@ def sincronizar(es_path, en_path, out_path, sub_path=None, pista=None, guia=None
         if db is None:
             db = niveles_db(es, fs)
         palabras = palabras_doblaje(es, fs, forz_idioma, p) if cortes_whisper else None
+        # (las señales de análisis, para empalmes_en_frases, antes de que los bucles de aquí usen «a»; con la imagen, el
+        # sonido no encaja con el original y no dice nada)
+        senales_ab = (a, b) if not video else (None, None)
         for i, de, a, como in recortes_en_pausas(es, fs, cortes, L, dur_es, db, set(puentes), palabras, zonas_ajenas):
             p(f"Recorte del corte {mmss(de)}: a {mmss(a)}, con sus dos bordes en pausas de la voz (antes partía "
               f"una frase; {como})")
         for de, a in bordes_de_zonas(es, fs, zonas, L, cortes, dur_es, k):
             p(f"Lo que no se coloca {'empieza' if a > de else 'acaba'} en {mmss(a)} del doblaje y no en {mmss(de)}: "
               f"ahí {'acaba' if a > de else 'empieza'} la frase")
-        for i, de, a in empalmes_en_frases(es, fs, cortes, L, dur_es, k, set(puentes),
-                                           centro=not video and lateral and ch == 2, palabras=palabras):
-            p(f"Empalme del corte {mmss(de)}: a {mmss(a)}, donde {'acaba' if a > de else 'empieza'} la frase "
-              "(antes la partía)")
+        # (los cortes que no quitan nada —donde al doblaje le falta metraje, o un bloque va en otro orden— se quedan
+        # donde se miden; solo se llevan al borde de la frase castellana que los cruce si el sonido no dice a qué lado va
+        # lo de entre los dos sitios, y nunca los que pone la imagen: empalmes_en_frases)
+        for i, de, a_ in empalmes_en_frases(es, fs, cortes, L, dur_es, k, set(puentes),
+                                            centro=not video and lateral and ch == 2, palabras=palabras,
+                                            senales=senales_ab):
+            p(f"Empalme del corte {mmss(de)}: a {mmss(a_)}, donde {'acaba' if a_ > de else 'empieza'} la frase (el "
+              "sonido no dice a qué lado va lo de entre los dos sitios)")
         # lo que no tiene remedio (recortes_en_pausas, con Whisper): con el audio original, como lo que no se coloca
         for c in cortes:
             for d0, d1, porque in c.pop("vo", ()):
@@ -11781,9 +12094,14 @@ def main():
             anotar(salida, [lista])
         return ", muxeado"
 
+    escritos = set()        # informes hechos en esta ejecución: ya dicen su versión en la primera línea
+
     def anotar(salida, lineas):
         informe = os.path.splitext(salida)[0] + "_informe.txt"
         if os.path.exists(informe):
+            if informe not in escritos:     # (el de otra ejecución, quizá con otra versión: lo que se añade dice la suya)
+                lineas = [linea_version("añadido") + ":"] + list(lineas)
+                escritos.add(informe)
             with open(informe, "a", encoding="utf-8") as f:
                 f.write("".join(x + "\n" for x in lineas))
 
@@ -11840,6 +12158,7 @@ def main():
                                  args.decodificar, not args.solo_pista_principal, args.formato, args.sin_cortes,
                                  args.estirar_variable, correcciones, limpiar=args.limpiar, canales=args.canales,
                                  kbps=args.kbps, forzados_vo=args.forzados_vo, cortes_whisper=args.cortes_whisper)
+            escritos.add(os.path.splitext(salida)[0] + "_informe.txt")
             hecho_mux = mux(es_path, en_path, salida)
             if args.muxear is None:         # (sin muxear, la lista de saltos con el audio sincronizado)
                 lista = lista_para_vlc(os.path.splitext(salida)[0] + "_informe.txt", salida)

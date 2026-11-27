@@ -61,7 +61,9 @@ explica qué hace.)
        pregunta. Pero si se ha elegido 2.0 o unos kb/s que no son los que ya tiene, se recodifica
        sin preguntar (tal cual no se pueden cambiar). Su velocidad no se cambia nunca.
      ..._[es-ES]_SYNC.srt (si había subtítulo; si se muxea, va solo dentro del .mkv)
-     ..._[es-ES]_SYNC_informe.txt
+     ..._[es-ES]_SYNC_informe.txt (su primera línea dice con qué versión del programa se hizo y
+       cuándo; si luego se le añade algo, por ejemplo al muxear más tarde, va con la suya. Si
+       mandas un informe para consultar algo, se sabe así si ya estaba arreglado)
    Y, con la opción "Muxear en la RAW" (marcada de serie), un .mkv nuevo con el
    nombre del original, junto a él: el doblaje va como primera pista de audio y
    predeterminada, con idioma es-ES y título "Castellano" (se pueden cambiar). El archivo
@@ -513,6 +515,17 @@ habla a ningún lado, el original se iguala en nivel con el castellano y se fund
 ("Costura del relleno ...: fundido de ... s, y el original al nivel del castellano ahí"). Y si el
 doblaje es un recorte del original (una emisión de TV que corta los bordes), se detecta y la imagen se
 compara con el original recortado igual ("Imagen: el doblaje es un recorte del centro del original").
+Desde la 1.4.21, el empalme con lo que le falta al doblaje va donde se mide: si la medida es buena,
+moverlo hasta donde acaba la frase castellana dejaba lo de entre los dos sitios al otro lado del relleno
+(tras el relleno se oía el final de la frase de antes). Solo se lleva al borde de la frase si el sonido
+no dice a qué lado va lo de entre los dos sitios ("Empalme del corte ...: a ..., donde empieza la frase
+(el sonido no dice ...)"), y nunca si lo ha puesto la imagen. Midiendo con la imagen, si el hueco cae a
+mitad de plano, su sitio se busca fotograma a fotograma: cada fotograma del doblaje se compara con el del
+original con el desfase de antes y con el de después ("Empalme ... del doblaje: a mitad de plano,
+fotograma a fotograma con la imagen"); antes iba en el silencio más largo entre los cambios de plano
+de al lado, hasta 2 s fuera de su sitio. Y la frase del original que cruza el borde de un relleno solo
+va sin voz si su lateral lleva el fondo; si ahí apenas suena, va con su voz ("... del original con su
+voz: la lateral apenas suena ahí"): sin ella quedaba un hueco con los restos de la codificación.
 Desde la 1.4.11, el contraste con las voces solo corrige si la voz sola lo sostiene: con música fuerte, la
 envolvente de la mezcla sigue a la música, y eso no se distingue por el sonido de un doblaje desfasado. Donde
 manda la música, las voces no corrigen ("... la voz sola no lo sostiene ...: no se toca") y deciden los golpes

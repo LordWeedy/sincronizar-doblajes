@@ -12,7 +12,7 @@ a una carpeta temporal que se borra al final (con --conservar se deja, para mira
 algún caso falla."""
 import argparse, ast, builtins, os, re, shutil, subprocess, sys, tempfile, time
 
-VERSION = '1.4.20'
+VERSION = '1.4.21'
 AQUI = os.path.dirname(os.path.abspath(__file__))
 MOTOR = os.path.join(AQUI, "sincronizar_doblaje.py")
 CARPETA = os.environ.get("SYNC_MASTER_PRUEBAS") or None     # (la de los vídeos de prueba; o --carpeta)
@@ -1628,11 +1628,28 @@ def pruebas_sueltas(carpeta=CARPETA):
     # lo que no se coloca (la imagen acaba en 7,5 s y vuelve en 15 s) empieza tras la frase que cruza 7,5 s y acaba antes
     # de la que cruza 15 s
     es_z = voces([(5.0, 8.0), (14.6, 17.0)])
-    zonas_v = [dict(d0=7.5, d1=15.0)]
-    sd.bordes_de_zonas(es_z, fs_v, zonas_v, [0.0], [], 30.0)
-    if not (8.03 <= zonas_v[0]["d0"] <= 8.5 and 14.0 <= zonas_v[0]["d1"] <= 14.57):
-        fallos.append(f"lo que no se coloca va de {zonas_v[0]['d0']:.2f} a {zonas_v[0]['d1']:.2f} s (tenía que ir de "
-                      "tras la frase que acaba en 8 s a antes de la que empieza en 14,6 s)")
+    silero = sd.voz_silero_en
+    try:
+        sd.voz_silero_en = lambda *a: None          # (la banda sola: la voz fabricada no es habla para Silero)
+        zonas_v = [dict(d0=7.5, d1=15.0)]
+        sd.bordes_de_zonas(es_z, fs_v, zonas_v, [0.0], [], 30.0)
+        if not (8.03 <= zonas_v[0]["d0"] <= 8.5 and 14.0 <= zonas_v[0]["d1"] <= 14.57):
+            fallos.append(f"lo que no se coloca va de {zonas_v[0]['d0']:.2f} a {zonas_v[0]['d1']:.2f} s (tenía que ir "
+                          "de tras la frase que acaba en 8 s a antes de la que empieza en 14,6 s)")
+        # (1.4.21) con Silero de segunda medida (uno de mentira, que oye lo que se le dice): si oye una pausa de
+        # verdad donde está el borde, no se mueve; si donde lo lleva la banda aún oye voz, al final de esa voz; y una voz
+        # que sigue más allá de lo que se escucha no es un principio ni un final de frase
+        for voz_s, esperado, que in (([(5.0, 7.2), (7.7, 8.0)], (7.49, 7.51), "con una pausa de 0,5 s en el borde"),
+                                     ([(5.0, 8.2)], (8.2, 8.3), "con la voz hasta 8,2 s"),
+                                     ([(0.0, 30.0)], (7.49, 7.51), "con voz más allá de lo que se escucha")):
+            sd.voz_silero_en = lambda x, fs, a, b, v=voz_s: [(max(s, a), min(e, b)) for s, e in v if e > a and s < b]
+            zonas_v = [dict(d0=7.5, d1=15.0)]
+            sd.bordes_de_zonas(es_z, fs_v, zonas_v, [0.0], [], 30.0)
+            if not esperado[0] <= zonas_v[0]["d0"] <= esperado[1]:
+                fallos.append(f"{que}, lo que no se coloca empieza en {zonas_v[0]['d0']:.2f} s (se esperaba "
+                              f"{esperado[0]:.2f}-{esperado[1]:.2f})")
+    finally:
+        sd.voz_silero_en = silero
     out.append(("frases_enteras", "un recorte va donde sus dos bordes caen en pausas de la voz, y lo que no se coloca, "
                                   "del final de una frase al principio de otra", fallos))
     # el recorte, dentro de donde la medida pone el salto (1.4.11, repaso de puntos débiles) salvo que ahí parta una frase
@@ -1784,7 +1801,9 @@ def nombres_sin_definir(ruta):
 # trozos (s del trozo): dob = lo que lleva el doblaje, raw = la RAW, audio_dob = el audio del doblaje si va a trozos
 # distintos que su imagen; cortes esperados: (s del doblaje, ms con signo, tolerancia s, tolerancia ms), y hasta
 # cortes_extra más (los del contraste); excl: s del resultado que no se comparan; banda: desfase admitido (ms; el
-# negativo, castellano más tarde que en el final) entre lo que dice la imagen y lo que dicen los efectos
+# negativo, castellano más tarde que en el final) entre lo que dice la imagen y lo que dicen los efectos. Desde la
+# 1.4.21, el empalme con lo que le falta al doblaje, a 0,05 s de su sitio (en su fotograma: antes se daba por bueno a
+# 1,6-2,5 s, y en la escucha del usuario se oía lo de entre los dos sitios al otro lado del relleno)
 FINALES = "finales"
 REALES = [
     dict(nombre="real_buzz_cabecera", trozo="buzz_1x09.mkv", que="Buzz Lightyear 1x09: a la cabecera doblada (sin sonido "
@@ -1799,11 +1818,11 @@ REALES = [
     dict(nombre="real_crash_rellenos", trozo="crash_1x01.mkv", que="Crash Canyon 1x01 (otra mezcla, con la imagen): al "
          "doblaje le faltan un plano de 3,1 s y 12 s: rellenos en su sitio, y nada más se mueve fuera de lo que dicen la "
          "imagen y los efectos", dob=[(0, 51.24), (54.36, 92.56), (104.56, 180)], raw=[(0, 180)],
-         cortes=[(51.24, 3120, 1.6, 60), (89.44, 12000, 1.6, 60)], excl=[(51.24, 54.36), (92.56, 104.56)], tol_ms=45,
+         cortes=[(51.24, 3120, 0.05, 60), (89.44, 12000, 0.05, 60)], excl=[(51.24, 54.36), (92.56, 104.56)], tol_ms=45,
          banda=(-115, 45)),
     dict(nombre="real_godzilla_pal", trozo="godzilla_1x09.mkv", que="Godzilla 1x09: doblaje PAL (castellano mono, otra "
          "mezcla) frente a la RAW a 23,976; le faltan 2 s", dob=[(0, 80.0), (82.0, 180)], raw=[(0, 180)],
-         raw_lento=True, cortes=[(80.0, 2000, 1.6, 60)], excl=[(80.0, 82.0)], tol_ms=45, texto=["23,976"],
+         raw_lento=True, cortes=[(80.0, 2000, 0.05, 60)], excl=[(80.0, 82.0)], tol_ms=45, texto=["23,976"],
          banda=(-117, 45), bajas=1),
     dict(nombre="real_becker_destellos", trozo="becker_1x02.mkv", que="Becker 1x02: cabecera de destellos y el castellano con "
          "1,4 s de retraso en el contenedor; le falta 1,5 s al principio", dob=[(1.5, 180)], raw=[(0, 180)], cortes=[],
@@ -1814,15 +1833,28 @@ REALES = [
     dict(nombre="real_becker_huecos", trozo="becker_1x02.mkv", que="Becker 1x02 (sin sonido en común: solo con la "
          "imagen): al doblaje le faltan 2 s tras los destellos de la cabecera y luego 5 s y, 17 s después en planos "
          "largos, otros 2,5: cada hueco en su sitio", dob=[(0, 20.38), (22.38, 63.94), (68.94, 86.37), (88.87, 180)],
-         raw=[(0, 180)], cortes=[(20.38, 2000, 2.5, 60), (61.94, 5000, 2.5, 60), (79.37, 2500, 2.5, 60)],
+         raw=[(0, 180)], cortes=[(20.38, 2000, 0.05, 60), (61.94, 5000, 0.05, 60), (79.37, 2500, 0.05, 60)],
          excl=[(20.38, 22.38), (63.94, 68.94), (86.37, 88.87)], tol_ms=45),
     dict(nombre="real_pan_guia", trozo="pan_3x02.mkv", que="La pelu del señor Pan 3x02: con la guía inglesa (lateral "
          "estropeada, onda distinta); le sobran 2 s", dob=[(0, 92.0), (90.0, 180)], raw=[(0, 180)], guia=True,
          cortes=[(91.0, -2000, 2.0, 60)], excl=[(90.0, 92.0)], tol_ms=10),
     dict(nombre="real_xena_audio", trozo="xena_6x10.mkv", que="Xena 6x10 (medida con el audio): le sobran 2 s y le falta 1 s",
          dob=[(0, 82.0), (80.0, 140.0), (141.0, 180)], raw=[(0, 180)],
-         cortes=[(81.0, -2000, 2.6, 60), (142.0, 1000, 1.6, 60)], cortes_extra=1, excl=[(77.5, 82.5), (140.0, 141.0)],
+         cortes=[(81.0, -2000, 2.6, 60), (142.0, 1000, 0.05, 60)], cortes_extra=1, excl=[(77.5, 82.5), (140.0, 141.0)],
          tol_ms=10, banda=(-91, 15)),
+    # (1.4.21, en la escucha del usuario) sin Whisper, la unión del relleno iba 0,28 s antes, a mitad de «¿...si no le
+    # importa?» (la banda de la voz tomaba el final flojo de la palabra por una pausa) y lo de entre los dos sitios, al
+    # otro lado del relleno: ahora el empalme se queda donde se mide (en la pausa de 0,45 s de después)
+    dict(nombre="real_pan_frase", trozo="pan_3x02.mkv", que="La pelu del señor Pan 3x02: al doblaje le faltan 4 s justo "
+         "tras «¿...si no le importa?»: la unión, en la pausa de después (no a mitad de la palabra)",
+         dob=[(0, 120.0), (124.0, 180)], raw=[(0, 180)], guia=True, cortes=[(120.0, 4000, 0.12, 60)],
+         excl=[(120.0, 124.0)], tol_ms=10),
+    # (1.4.21, en la escucha del usuario: «muy distorsionado») la frase inglesa que cruza la unión iba con la lateral de
+    # Xena, 24 dB por debajo de su fondo: 4 s de hueco con los restos de la codificación
+    dict(nombre="real_xena_lateral", trozo="xena_6x10.mkv", que="Xena 6x10: al doblaje le faltan 4 s donde una frase "
+         "inglesa cruza la unión y la lateral apenas suena: va con su voz, no un hueco de 4 s",
+         dob=[(0, 30.0), (34.0, 180)], raw=[(0, 180)], cortes=[(30.0, 4000, 0.05, 60)], cortes_extra=1,
+         excl=[(30.0, 34.0)], tol_ms=10, banda=(-91, 15), texto=["la lateral apenas suena"], no_texto=["va su lateral"]),
     dict(nombre="real_topdog_golpes", trozo="topdog.mkv", que="Top Dog: el castellano 300 ms adelantado de su imagen en "
          "0:48-2:15 del trozo (donde los golpes ya lo corrigieron en su día): se corrige con los golpes",
          dob=[(0, 180)], audio_dob=[(0, 48.0), (48.3, 135.3), (135.0, 180)], raw=[(0, 180)], cortes=[], cortes_extra=4,
@@ -1943,7 +1975,7 @@ def casos_reales(c, tmp):
             return [] if e <= n <= e + caso.get("cortes_extra", 0) else [f"{n} cortes {r['cortes']}, se esperaban {e}"]
         comprobaciones = [sin_error, cuantos, comprobar_ref] + \
             [corte_cerca(te, de, tol_ms, tol_s) for te, de, tol_s, tol_ms in caso["cortes"]] + \
-            [contiene(x) for x in caso.get("texto", [])] + \
+            [contiene(x) for x in caso.get("texto", [])] + [no_contiene(x) for x in caso.get("no_texto", [])] + \
             ([inicio(*caso["inicio"])] if "inicio" in caso else [])
         out.append((caso["nombre"], caso["que"], fabricar, comprobaciones))
     return out

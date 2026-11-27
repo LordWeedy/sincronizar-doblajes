@@ -44,7 +44,7 @@ import zlib
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-VERSION = '1.4.20'
+VERSION = '1.4.21'
 AQUI = os.path.dirname(os.path.abspath(__file__))
 # el icono de las ondas (pedido del usuario, 29-10-2026), en la esquina de la ventana y en la barra de tareas
 ICONO = os.path.join(AQUI, "Sync_Master.ico")
@@ -1193,16 +1193,11 @@ class App:
         self.master = master
         # la versión del código cargado al abrir: una ventana abierta antes de actualizar sigue con el código de antes
         # (23-10-2026: una ventana del Servidor seguía con el fallo de la tanda ya arreglado y no había forma de verlo).
-        # En la copia de desarrollo el número no cambia hasta publicar: ahí va también la fecha del código.
+        # En la copia de desarrollo el número no cambia hasta publicar: ahí va también la fecha del código (la misma
+        # que apunta el motor en la primera línea de cada informe: sd.VERSION_PROGRAMA).
         version = VERSION
-        # (la de siempre, con la herramienta de publicar al lado, o el src\ de un clon de git: .git en la de arriba)
-        if os.path.isfile(os.path.join(AQUI, "publicacion", "publicar_version.py")) or \
-                os.path.exists(os.path.join(os.path.dirname(os.path.realpath(AQUI)), ".git")):
-            try:
-                version += " · desarrollo, código del " + time.strftime("%d-%m-%Y %H:%M", time.localtime(max(
-                    os.path.getmtime(__file__), os.path.getmtime(sd.__file__))))
-            except OSError:
-                pass
+        if str(getattr(sd, "VERSION_PROGRAMA", "")).startswith(VERSION):
+            version = sd.VERSION_PROGRAMA
         master.title(f"Sync Master — sincroniza doblajes con la RAW · versión {version}")
         master.geometry("1060x900")
         master.minsize(980, 600)
@@ -2746,7 +2741,8 @@ class App:
         cortes_whisper: los recortes y las uniones, comprobados con Whisper (--cortes-whisper)."""
         total = len(trabajos)
         hechos = con_avisos = errores = saltados = muxeados = 0
-        entorno = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
+        # SYNC_MASTER_VENTANA: el motor apunta en el informe si esta ventana es de otra versión que él
+        entorno = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8", SYNC_MASTER_VENTANA=VERSION)
 
         for n, j in enumerate(trabajos, 1):
             if self.stop_event.is_set():
