@@ -90,7 +90,8 @@ except ImportError:
     DND_FILES = TkinterDnD = None
 
 EXTENSIONES_VIDEO = ('.mkv', '.mp4', '.m4v', '.avi', '.mov', '.wmv', '.ts', '.m2ts')
-FORMATOS_AUDIO = {"flac": "FLAC", "aac": "AAC", "ac3": "AC3", "opus": "Opus"}     # --formato del motor
+FORMATOS_AUDIO = {"flac": "FLAC", "aac": "AAC", "ac3": "AC3", "opus": "Opus",     # --formato del motor
+                  "original": "Original"}       # (Original: cada pista con sus parámetros; sin canales ni kb/s)
 CANALES_AUDIO = {"igual": "Como el castellano", "2.0": "Estéreo 2.0"}               # --canales del motor
 KBPS_AUTO = "Automático"                                                           # --kbps sin poner
 EXTENSIONES_SUB = ('.srt',)
@@ -539,11 +540,19 @@ def leer_informe(lineas):
              retraso=None, verif=None, verif_cast=None, subs=None, error=None, pista=None, guia=None, pistas=None, video=False,
              mux=None, mux_info=None, mux_error=None, forzados=None, forz_nota=None, forz_vo=None, subs_dob=[],
              pistas_extra=[],
-             velocidad=None, audio_doblado=None, reparto=None, pista_ori=None, variable=None, tiempo=None)
+             velocidad=None, audio_doblado=None, reparto=None, pista_ori=None, variable=None, tiempo=None,
+             solo_video=None, referencia_fija=None)
     en_avisos = False
     for linea in lineas:
         if linea.startswith("Señal de análisis: vídeo"):
             r['video'] = True
+        elif linea.startswith("Vídeo final verificado: "):      # --solo-video: el MKV es lo único que queda
+            r['solo_video'] = linea[len("Vídeo final verificado: "):]
+        elif linea.startswith(("Aviso: no se limpian los auxiliares:", "Aviso: no se ha podido borrar el auxiliar ",
+                               "Aviso: archivo conservado por protección de entradas o de ruta:")):
+            r['avisos'].append(linea[len("Aviso: "):])
+        elif linea.startswith(sd.MARCA_REFERENCIA if sd else "Referencia fija: "):
+            r['referencia_fija'] = linea.split(": ", 1)[1]
         elif (m := RE_VELOCIDAD.match(linea)):
             r['velocidad'] = m[1]
         elif (m := RE_VARIABLE.match(linea)):
@@ -622,6 +631,8 @@ def leer_informe(lineas):
             en_avisos = False
     for c in r['cortes']:
         c['aviso'] = any(a.startswith(f"corte {c['txt']}") for a in r['avisos'])
+    if r['referencia_fija']:            # con el original fijo, el vídeo no cambia de velocidad
+        r['velocidad'] = None
     return r
 
 
@@ -678,6 +689,7 @@ class Trabajo:
     """Una fila de la lista: un doblaje con su original y, si lo hay, su subtítulo."""
 
     def __init__(self, clave):
+        self.pareja_manual = False      # doblaje y original elegidos a mano: manda sobre los nombres
         self.clave = clave              # (temporada, episodio) o None
         self.doblaje = self.original = self.sub = None
         self.sub_quitado = False        # el usuario quitó el subtítulo: no se vuelve a poner solo
@@ -716,6 +728,8 @@ class Trabajo:
         return "Listo · con correcciones a mano" if self.correcciones else "Listo"
 
     def etiqueta(self):
+        if self.pareja_manual:
+            return "Manual"
         return f"{self.clave[0]}x{self.clave[1]:02d}" if self.clave else "—"
 
 
@@ -1209,6 +1223,7 @@ class App:
         self.dependency_icon_labels = {}
 
         self.trabajos = []
+        self.archivos_media = set()     # doblajes y originales cargados (para elegirlos en «Editar pareja»)
         self._por_iid = {}
         self.output_folder = tk.StringVar()
         self.sobrescribir = tk.BooleanVar(value=False)
@@ -1219,6 +1234,8 @@ class App:
         self.forzados_vo = tk.BooleanVar(value=False)  # forzados de lo que va en VO (Whisper y traductor)
         self.cortes_whisper = tk.BooleanVar(value=False)   # recortes y uniones comprobados con Whisper
         self.limpiar = tk.BooleanVar(value=False)     # VHS: quitar el ruido de la cinta del castellano (limpiar_vhs)
+        self.mantener_original = tk.BooleanVar(value=False)  # --mantener-original: el vídeo original no se toca
+        self.solo_video = tk.BooleanVar(value=False)  # --solo-video: tras muxear y verificar, solo queda el MKV
         self.decodificar = tk.StringVar(value="cpu")      # clave de sd.DECODIFICADORES
         self.formato = tk.StringVar(value="flac")         # clave de FORMATOS_AUDIO
         self.canales = tk.StringVar(value="igual")        # clave de CANALES_AUDIO
@@ -1478,6 +1495,7 @@ class App:
         vsb.grid(row=0, column=1, padx=(6, 0), sticky="ns")
         self.tree.bind("<<TreeviewSelect>>", lambda e: self._mostrar_detalle())
         self.tree.bind("<Button-3>", self._on_right_click)
+        self.tree.bind("<Double-1>", self._doble_clic_pareja)
         self.tree.bind("<Delete>", lambda e: self._remove_selected())
 
         pista = "Añade los doblajes y las RAW en los recuadros de arriba"
@@ -1486,6 +1504,10 @@ class App:
         self.lista_vacia = tk.Label(tree_frame, text=pista, justify="center")
 
         self.menu_fila = tk.Menu(self.master, tearoff=0)
+        self.menu_fila.add_command(label="Editar pareja...", command=self._editar_pareja)
+        self.menu_fila.add_command(label="Intercambiar doblaje y RAW", command=self._intercambiar_pareja)
+        self.menu_fila.add_command(label="Añadir pareja...", command=self._nueva_pareja)
+        self.menu_fila.add_separator()
         self.menu_fila.add_command(label="Cambiar doblaje...", command=lambda: self._change_file("doblaje"))
         self.menu_fila.add_command(label="Cambiar RAW...", command=lambda: self._change_file("original"))
         self.menu_fila.add_command(label="Cambiar subtítulo...", command=lambda: self._change_file("sub"))
@@ -1645,6 +1667,13 @@ class App:
                   "resultado se escucha con él: si queda una frase partida o dos pegadas, el informe lo dice con sus "
                   "palabras.\n\nUnos minutos más por episodio. Hace falta faster-whisper; si no está, se avisa y se "
                   "hace como siempre.", self._get_palette)
+        cb = ttk.Checkbutton(sinc, text="Mantener el vídeo de la RAW fijo", variable=self.mantener_original)
+        cb.grid(row=6, column=0, sticky="w")
+        Globo(cb, "Marcado: el vídeo de la RAW y sus pistas se quedan como están (sus fps) y el castellano y sus "
+                  "subtítulos se llevan a su reloj (velocidad y tono juntos, al corregir PAL), en una sola "
+                  "codificación final.\nSin marcar: los fps de la RAW se adaptan al doblaje, como siempre.\n\n"
+                  "Sirve también para reunir doblajes de varios archivos: se procesa el primero sobre la RAW con "
+                  "esto marcado y el .mkv resultante se usa como RAW del segundo.", self._get_palette, ancho=520)
 
         mux = grupo(2, "Muxeado")
         cb = ttk.Checkbutton(mux, text="Muxear en la RAW, como primer audio", variable=self.muxear)
@@ -1681,6 +1710,12 @@ class App:
                   "adapta): conviene repasarla.\n\nHace falta faster-whisper y sentencepiece (y, solo para "
                   "preparar el traductor la primera vez, transformers y torch); si falta algo, se avisa.",
               self._get_palette)
+        cb = ttk.Checkbutton(mux, text="Dejar solo el vídeo final", variable=self.solo_video)
+        cb.grid(row=5, column=0, sticky="w")
+        Globo(cb, "Al muxear, se comprueba el .mkv nuevo (que tiene vídeo y todas las pistas esperadas) y solo "
+                  "entonces se borran los archivos de trabajo de ese episodio: el audio sincronizado, sus otras "
+                  "pistas, sus subtítulos y el informe. Nunca se borran el doblaje ni la RAW. Si la comprobación "
+                  "falla, se conserva todo.", self._get_palette)
         self.plantilla.trace_add("write", lambda *a: self._mostrar_detalle())
         self.muxear.trace_add("write", lambda *a: self._mostrar_detalle())
 
@@ -1953,6 +1988,14 @@ class App:
             elif os.path.isfile(ruta):
                 archivos.append(ruta)
         ya = {os.path.normcase(x) for j in self.trabajos for x in (j.doblaje, j.original, j.sub) if x}
+        # (fuera también lo que crea el programa: el audio sincronizado y el vídeo «[con subtítulos]», que si no
+        # entraba como otra RAW del mismo episodio y se volvía a procesar: Becker 1x01, 23-10-2026)
+        creado = lambda r: "_SYNC" in os.path.basename(r) or " [con subtítulos]" in os.path.basename(r)
+        archivos = list(dict.fromkeys(r for r in archivos if os.path.normcase(r) not in ya and not creado(r)))
+        # varios vídeos soltados a la vez: el usuario dice cuál es el doblaje y cuál la RAW
+        roles = self._elegir_roles(archivos) if rol is None else {}
+        if roles is None:
+            return
         nuevos = 0
         for ruta in archivos:
             ext = os.path.splitext(ruta)[1].lower()
@@ -1961,15 +2004,15 @@ class App:
             elif rol:
                 rol_archivo = rol if ext in sd.AUDIO_EXT + EXTENSIONES_VIDEO else None
             else:
-                rol_archivo = rol_por_extension(ruta)
-            # (fuera también lo que crea el programa: el audio sincronizado y el vídeo «[con subtítulos]», que si no
-            # entraba como otra RAW del mismo episodio y se volvía a procesar: Becker 1x01, 23-10-2026)
-            nombre = os.path.basename(ruta)
-            if rol_archivo is None or "_SYNC" in nombre or " [con subtítulos]" in nombre or os.path.normcase(ruta) in ya:
+                rol_archivo = roles.get(ruta, rol_por_extension(ruta))
+            if rol_archivo is None:
                 continue
             self._place(ruta, rol_archivo, sd.episodio(os.path.basename(ruta)))
+            if rol_archivo in ("doblaje", "original"):
+                self.archivos_media.add(ruta)
             ya.add(os.path.normcase(ruta))
             nuevos += 1
+        self._unir_pareja_unica()
         self._auto_subs()
         self.trabajos.sort(key=lambda j: (j.clave is None, j.clave or (0, 0), j.doblaje or j.original or ""))
         self._refresh_list()
@@ -1984,8 +2027,11 @@ class App:
         self.status_text.set(mensaje)
 
     def _place(self, ruta, rol, clave):
-        """Coloca un archivo en la fila de su episodio (o en una nueva)."""
-        mismos = [j for j in self.trabajos if j.clave == clave and not j.estado]
+        """Coloca un archivo en la fila de su episodio (o en una nueva). Solo se empareja solo con un episodio
+        identificado y nunca en una pareja elegida a mano; ningún archivo se descarta por no tener pareja."""
+        mismos = [j for j in self.trabajos if clave is not None and j.clave == clave and not j.estado
+                  and not j.pareja_manual]
+        mismos.sort(key=lambda j: not (j.original or "").lower().endswith(".mkv"))
         if rol == "doblaje":
             fila = next((j for j in mismos if j.doblaje is None), None)
             if fila is None:
@@ -1995,18 +2041,25 @@ class App:
                 self.trabajos.append(fila)
             fila.doblaje = ruta
             return
-        if not mismos:
+        destinos = [j for j in mismos if getattr(j, rol) is None]
+        if not destinos and rol == "original" and ruta.lower().endswith(".mkv"):
+            # si hay MKV y MP4 del mismo episodio, manda el MKV; el otro no se pierde: queda en su propia fila
+            destinos = [j for j in mismos if j.original and not j.original.lower().endswith(".mkv")]
+            for anterior in dict.fromkeys(j.original for j in destinos):
+                aparte = Trabajo(clave)
+                aparte.original = anterior
+                self.trabajos.append(aparte)
+            for j in destinos:
+                if j.sub_auto:
+                    j.sub, j.sub_auto = None, False
+        if not destinos:
             fila = Trabajo(clave)
             self.trabajos.append(fila)
-            mismos = [fila]
-        for fila in mismos:
-            actual = getattr(fila, rol)
-            # si hay MKV y MP4 del mismo episodio, manda el MKV
-            if actual is None or (rol == "original" and ruta.lower().endswith(".mkv")
-                                  and not actual.lower().endswith(".mkv")):
-                setattr(fila, rol, ruta)
-                if rol == "sub":
-                    fila.sub_quitado = fila.sub_auto = False
+            destinos = [fila]
+        for fila in destinos:
+            setattr(fila, rol, ruta)
+            if rol == "sub":
+                fila.sub_quitado = fila.sub_auto = False
 
     def _auto_subs(self):
         for j in self.trabajos:
@@ -2092,6 +2145,21 @@ class App:
         ruta = filedialog.askopenfilename(title="Selecciona el archivo", filetypes=tipos)
         if not ruta:
             return
+        if rol in ("doblaje", "original"):
+            # cambiar a mano el doblaje o la RAW es elegir la pareja: manda sobre los nombres
+            valores = {"doblaje": j.doblaje, "original": j.original}
+            valores[rol] = os.path.normpath(ruta)
+            if all(valores.values()):
+                try:
+                    self._asignar_pareja(valores["doblaje"], valores["original"], j)
+                except ValueError as e:
+                    self._show_warning("Pareja", str(e))
+                    return
+                self._refresh_list()
+                return
+            j.pareja_manual = True
+            self.archivos_media.add(os.path.normpath(ruta))
+            j.salida = j.plan_mux = j.inicio = None
         setattr(j, rol, os.path.normpath(ruta))
         if rol == "sub":
             j.sub_quitado = j.sub_auto = False
@@ -2129,7 +2197,240 @@ class App:
             if j.estado not in EN_CURSO[1:]:
                 j.quitado = True
                 self.trabajos.remove(j)
+        self.archivos_media = {x for j in self.trabajos for x in (j.doblaje, j.original) if x}
         self._refresh_list()
+
+    # --- parejas elegidas a mano: doblaje y RAW no necesitan nombres ni episodios que coincidan ---
+
+    def _recoger_filas_sueltas(self, destino):
+        """Retira de las demás filas los archivos que ahora forman la pareja, conservando sus subtítulos manuales."""
+        for j in list(self.trabajos):
+            if j is destino or j.estado or j.pareja_manual or j.completo():
+                continue
+            consumida = False
+            for rol in ("doblaje", "original"):
+                if getattr(j, rol) and getattr(j, rol) == getattr(destino, rol):
+                    setattr(j, rol, None)
+                    consumida = True
+            if consumida and not j.doblaje and not j.original:
+                if j.sub and not j.sub_auto and not destino.sub and not destino.sub_quitado:
+                    destino.sub, destino.sub_auto = j.sub, False
+                    j.sub = None
+                if not j.sub or j.sub_auto or j.sub == destino.sub:
+                    self.trabajos.remove(j)
+
+    def _unir_pareja_unica(self):
+        """Un único doblaje y un único original no necesitan nombres ni numeración coincidentes."""
+        doblajes = {j.doblaje for j in self.trabajos if j.doblaje}
+        originales = {j.original for j in self.trabajos if j.original}
+        if len(doblajes) != 1 or len(originales) != 1:
+            return
+        o = next(iter(originales))
+        filas = [j for j in self.trabajos if j.doblaje or j.original]
+        if any(j.estado for j in filas):
+            return
+        destino = next(j for j in filas if j.doblaje)
+        if destino.original and destino.original != o:
+            return
+        if not destino.original:
+            destino.pareja_manual = True
+        destino.original = o
+        self._recoger_filas_sueltas(destino)
+        sueltos = [j for j in self.trabajos if not j.doblaje and not j.original and j.sub and not j.estado]
+        if len(sueltos) == 1 and not destino.sub and not destino.sub_quitado:
+            destino.sub, destino.sub_auto = sueltos[0].sub, False
+            self.trabajos.remove(sueltos[0])
+
+    def _asignar_pareja(self, doblaje, original, trabajo=None):
+        """Una elección explícita manda sobre los nombres y queda fijada para futuras cargas."""
+        doblaje, original = os.path.normpath(doblaje), os.path.normpath(original)
+        if os.path.normcase(os.path.abspath(doblaje)) == os.path.normcase(os.path.abspath(original)):
+            raise ValueError("El doblaje y la RAW deben ser dos archivos distintos.")
+        if trabajo is None:
+            trabajo = next((j for j in self.trabajos
+                            if j.doblaje == doblaje and not j.estado and not j.pareja_manual), None)
+        if trabajo is None:
+            trabajo = next((j for j in self.trabajos if j.original == original and not j.doblaje and not j.estado
+                            and not j.pareja_manual), None)
+        if trabajo is None:
+            trabajo = Trabajo(None)
+            self.trabajos.append(trabajo)
+        if trabajo.estado in EN_CURSO:
+            raise ValueError("Esa pareja está en proceso o en cola; espera a que termine.")
+        if trabajo.original != original and trabajo.sub_auto:
+            trabajo.sub, trabajo.sub_auto = None, False
+        self.archivos_media.update(x for x in (trabajo.doblaje, trabajo.original, doblaje, original) if x)
+        trabajo.doblaje, trabajo.original = doblaje, original
+        trabajo.clave = sd.episodio(os.path.basename(doblaje)) or sd.episodio(os.path.basename(original))
+        trabajo.pareja_manual = True
+        trabajo.estado, trabajo.res, trabajo.log = None, None, []
+        trabajo.salida = trabajo.plan_mux = trabajo.inicio = None
+        self._recoger_filas_sueltas(trabajo)
+        self._auto_subs()
+        return trabajo
+
+    def _nueva_pareja(self):
+        self._dialogo_pareja()
+
+    def _editar_pareja(self):
+        trabajo = self._selected_one()
+        if trabajo:
+            self._dialogo_pareja(trabajo)
+
+    def _doble_clic_pareja(self, event):
+        iid = self.tree.identify_row(event.y)
+        if iid:
+            self.tree.selection_set(iid)
+            self._editar_pareja()
+
+    def _intercambiar_pareja(self):
+        trabajo = self._selected_one()
+        if not trabajo or not trabajo.completo():
+            return
+        try:
+            self._asignar_pareja(trabajo.original, trabajo.doblaje, trabajo)
+        except ValueError as e:
+            self._show_warning("Pareja", str(e))
+            return
+        self._refresh_list()
+
+    def _dialogo_pareja(self, trabajo=None):
+        if trabajo and trabajo.estado in EN_CURSO:
+            self._show_warning("En proceso", "Esa pareja está en proceso o en cola; espera a que termine.")
+            return
+        dialog = tk.Toplevel(self.master)
+        dialog.title("Editar pareja" if trabajo else "Añadir pareja")
+        dialog.transient(self.master)
+        dialog.configure(background=self._get_palette()["bg"])
+        dialog.resizable(True, False)
+        frame = ttk.Frame(dialog, padding=15)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(1, weight=1)
+        ttk.Label(frame, text="Elige libremente los dos archivos. Sus títulos y números de episodio pueden ser "
+                              "distintos.", wraplength=740).grid(row=0, column=0, columnspan=3, sticky="w",
+                                                                 pady=(0, 12))
+        variables = {rol: tk.StringVar(dialog, (getattr(trabajo, rol) or "") if trabajo else "")
+                     for rol in ("doblaje", "original")}
+        disponibles = sorted(self.archivos_media | {x for j in self.trabajos for x in (j.doblaje, j.original) if x})
+        error = tk.StringVar(dialog)
+        patrones = " ".join("*" + e for e in sd.AUDIO_EXT + EXTENSIONES_VIDEO)
+        nombres = {"doblaje": "Doblaje", "original": "RAW"}
+
+        def explorar(rol):
+            ruta = filedialog.askopenfilename(parent=dialog, title=f"Selecciona: {nombres[rol]}",
+                                              filetypes=[("Audio o vídeo", patrones), ("Todos los archivos", "*.*")])
+            if ruta:
+                variables[rol].set(os.path.normpath(ruta))
+
+        def soltar(event, rol):
+            rutas = self.master.tk.splitlist(event.data)
+            if len(rutas) == 1:
+                variables[rol].set(os.path.normpath(rutas[0]))
+            else:
+                error.set("Suelta un solo archivo en cada campo.")
+            return event.action
+
+        for fila, rol in enumerate(("doblaje", "original"), 1):
+            ttk.Label(frame, text=nombres[rol] + ":").grid(row=fila, column=0, sticky="w", padx=(0, 8))
+            entrada = ttk.Combobox(frame, textvariable=variables[rol], values=disponibles, width=85)
+            entrada.grid(row=fila, column=1, sticky="ew", pady=5)
+            ttk.Button(frame, text="Explorar...", command=lambda r=rol: explorar(r)).grid(row=fila, column=2,
+                                                                                         padx=(8, 0))
+            if self.dnd:
+                entrada.drop_target_register(DND_FILES)
+                entrada.dnd_bind("<<Drop>>", lambda e, r=rol: soltar(e, r))
+
+        def intercambiar():
+            d, o = variables["doblaje"].get(), variables["original"].get()
+            variables["doblaje"].set(o)
+            variables["original"].set(d)
+
+        def aceptar():
+            rutas = {r: os.path.normpath(v.get().strip().strip('"')) for r, v in variables.items()}
+            for rol, ruta in rutas.items():
+                if not os.path.isfile(ruta) or os.path.splitext(ruta)[1].lower() not in sd.AUDIO_EXT + EXTENSIONES_VIDEO:
+                    error.set(f"Elige un archivo de audio o vídeo válido para: {nombres[rol]}.")
+                    return
+            try:
+                pareja = self._asignar_pareja(rutas["doblaje"], rutas["original"], trabajo)
+            except ValueError as e:
+                error.set(str(e))
+                return
+            self._refresh_list()
+            self.tree.selection_set(str(id(pareja)))
+            self.tree.see(str(id(pareja)))
+            self.status_text.set("Pareja fijada: se usarán los archivos elegidos, se llamen como se llamen.")
+            dialog.destroy()
+
+        ttk.Label(frame, textvariable=error, style="Aviso.TLabel", wraplength=740).grid(row=3, column=0, columnspan=3,
+                                                                                       sticky="w", pady=(4, 8))
+        botones = ttk.Frame(frame)
+        botones.grid(row=4, column=0, columnspan=3, sticky="e")
+        ttk.Button(botones, text="Intercambiar doblaje y RAW", command=intercambiar).pack(side="left", padx=(0, 20))
+        ttk.Button(botones, text="Guardar pareja", command=aceptar).pack(side="left", padx=5)
+        ttk.Button(botones, text="Cancelar", command=dialog.destroy).pack(side="left", padx=5)
+        dialog.bind("<Return>", lambda e: aceptar())
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
+        dialog.grab_set()
+        dialog.wait_window()
+
+    def _elegir_roles(self, archivos):
+        """Al soltar o añadir varios vídeos sin decir qué son, el usuario elige el papel de cada uno. Devuelve
+        {ruta: rol}, o None si cancela. Con un solo vídeo no se pregunta (vídeo = RAW, audio = doblaje)."""
+        medios = [r for r in archivos if os.path.splitext(r)[1].lower() in sd.AUDIO_EXT + EXTENSIONES_VIDEO]
+        roles = {r: rol_por_extension(r) for r in medios}
+        if sum(os.path.splitext(r)[1].lower() in EXTENSIONES_VIDEO for r in medios) < 2:
+            return roles
+        if len(medios) == 2:
+            roles[medios[0]], roles[medios[1]] = "doblaje", "original"
+        nombres = {"doblaje": "Doblaje", "original": "RAW"}
+        dialog = tk.Toplevel(self.master)
+        dialog.title("Elegir doblajes y RAW")
+        dialog.transient(self.master)
+        dialog.configure(background=self._get_palette()["bg"])
+        frame = ttk.Frame(dialog, padding=15)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
+        ttk.Label(frame, text="Selecciona uno o varios archivos y elige su papel. Después se emparejan por episodio; "
+                              "si solo hay una pareja, da igual el nombre. Para otras combinaciones, clic derecho → "
+                              "«Editar pareja».", wraplength=740, justify="left").grid(row=0, column=0, columnspan=2,
+                                                                                    sticky="w", pady=(0, 10))
+        lista = ttk.Treeview(frame, columns=("rol", "archivo"), show="headings", height=min(12, len(medios)),
+                             selectmode="extended")
+        lista.heading("rol", text="Usar como")
+        lista.heading("archivo", text="Archivo")
+        lista.column("rol", width=100, stretch=False)
+        lista.column("archivo", width=640)
+        lista.grid(row=1, column=0, sticky="nsew")
+        barra = ttk.Scrollbar(frame, orient="vertical", command=lista.yview)
+        lista.configure(yscrollcommand=barra.set)
+        barra.grid(row=1, column=1, sticky="ns")
+        for i, ruta in enumerate(medios):
+            lista.insert("", "end", iid=str(i), values=(nombres[roles[ruta]], ruta))
+
+        def asignar(rol):
+            for iid in lista.selection():
+                ruta = medios[int(iid)]
+                roles[ruta] = rol
+                lista.item(iid, values=(nombres[rol], ruta))
+
+        botones = ttk.Frame(frame)
+        botones.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        ttk.Button(botones, text="Usar como doblaje", command=lambda: asignar("doblaje")).pack(side="left")
+        ttk.Button(botones, text="Usar como RAW", command=lambda: asignar("original")).pack(side="left", padx=5)
+        resultado = {"aceptado": False}
+
+        def aceptar():
+            resultado["aceptado"] = True
+            dialog.destroy()
+
+        ttk.Button(botones, text="Añadir archivos", command=aceptar).pack(side="right", padx=5)
+        ttk.Button(botones, text="Cancelar", command=dialog.destroy).pack(side="right")
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
+        dialog.grab_set()
+        dialog.wait_window()
+        return roles if resultado["aceptado"] else None
 
     def _open_folder(self):
         j = self._selected_one()
@@ -2158,7 +2459,8 @@ class App:
                            ("decodificar", self.decodificar), ("formato", self.formato),
                            ("canales", self.canales), ("kbps", self.kbps),
                            ("mux_idioma", self.mux_idioma), ("mux_titulo", self.mux_titulo),
-                           ("plantilla", self.plantilla)):
+                           ("plantilla", self.plantilla), ("mantener_original", self.mantener_original),
+                           ("solo_video", self.solo_video)):
             if clave in a:
                 try:
                     var.set(a[clave])
@@ -2180,7 +2482,8 @@ class App:
                            "decodificar": self.decodificar.get(), "formato": self.formato.get(),
                            "canales": self.canales.get(), "kbps": self.kbps.get(),
                            "mux_idioma": self.mux_idioma.get(),
-                           "mux_titulo": self.mux_titulo.get(), "plantilla": self.plantilla.get()},
+                           "mux_titulo": self.mux_titulo.get(), "plantilla": self.plantilla.get(),
+                           "mantener_original": self.mantener_original.get(), "solo_video": self.solo_video.get()},
                           f, ensure_ascii=False, indent=1)
         except OSError:
             pass
@@ -2329,7 +2632,9 @@ class App:
                 if res['video']:
                     texto += "   · medido con los cambios de plano del vídeo"
                 v['audio'].set(texto)
-            if res['variable']:
+            if res['referencia_fija']:
+                v['velocidad'].set(res['referencia_fija'])
+            elif res['variable']:
                 v['velocidad'].set(f"variable (VHS): se estira el castellano ({res['variable']}); la RAW no se "
                                    "toca")
             elif res['velocidad']:
@@ -2570,7 +2875,7 @@ class App:
                   (self.mux_idioma.get().strip() or "es-ES") if self.forzados.get() else None,
                   self.decodificar.get(), self.otras_pistas.get(), self.formato.get(), self.estirar_variable.get(),
                   self.limpiar.get(), self.canales.get(), self.kbps.get(), self.forzados_vo.get(),
-                  self.cortes_whisper.get()),
+                  self.cortes_whisper.get(), self.mantener_original.get(), self.solo_video.get()),
             daemon=True,
         )
         self.respuesta_tanda = None
@@ -2671,14 +2976,19 @@ class App:
             codigo = -1
         return lineas, codigo
 
-    def _solo_subs(self, j, carpeta, idioma, sobrescribir, mux, entorno):
+    def _solo_subs(self, j, carpeta, idioma, sobrescribir, mux, entorno, solo_video=False):
         """(Hilo de trabajo) Una fila de solo subtítulos: el subtítulo ajustado al vídeo, que ya está hecho, comparándolo
         con su voz, y, si se muxea, un MKV nuevo con él (el vídeo de partida no se toca). Devuelve cómo ha ido:
-        "hecho", "avisos", "error", "existe" o "cancelado", y si se ha muxeado."""
+        "hecho", "avisos", "error", "existe" o "cancelado", y si se ha muxeado.
+        solo_video: tras muxear y verificar el MKV, se borran los auxiliares (--solo-video)."""
         salida = sd.ruta_subs_solo(j.original, idioma, carpeta or None)
         informe = os.path.splitext(salida)[0] + "_informe.txt"
         mkv = sd.ruta_mux(j.original, carpeta or None, "con subtítulos") if mux else None
         hacer_mux = bool(mkv and not os.path.exists(mkv))
+        if solo_video and mkv and not hacer_mux:     # (con --solo-video lo único que queda es el MKV)
+            lineas = leer_lineas(informe) + [f"Ya existe el vídeo muxeado, no se toca: {mkv}"]
+            self.progress_queue.put(("fin", (j, "Ya existe", lineas, mkv)))
+            return "existe", False
         # hecho: el subtítulo o, si se muxea, el vídeo con él (al muxear no se deja copia del subtítulo)
         if os.path.exists(salida) or (mkv and not hacer_mux):
             if not sobrescribir:
@@ -2689,7 +2999,8 @@ class App:
         self.en_curso_salidas = [salida, informe] + ([mkv] if hacer_mux else [])
         cmd = [python_analisis(), SCRIPT, "--solo-subs", j.original, "--subs", j.sub, "-o", salida, "--idioma", idioma]
         if hacer_mux:
-            cmd += ["--muxear", mkv, "--mux-idioma", mux[0], "--mux-titulo", mux[1]]
+            cmd += (["--solo-video"] if solo_video else []) + ["--muxear", mkv, "--mux-idioma", mux[0],
+                                                                "--mux-titulo", mux[1]]
         lineas, codigo = self._ejecutar(cmd, j, entorno)
         if self.stop_event.is_set():
             borrar(self.en_curso_salidas)
@@ -2699,8 +3010,9 @@ class App:
             return "cancelado", False
         self.en_curso_salidas = []
         res = leer_informe(lineas)
+        final = res['solo_video'] if res['solo_video'] and os.path.isfile(res['solo_video']) else None
         muxeado = bool(hacer_mux and os.path.exists(mkv) and not res['mux_error'])
-        if codigo != 0 or res['error'] or not (os.path.exists(salida) or muxeado):
+        if codigo != 0 or res['error'] or not (final or os.path.exists(salida) or muxeado):
             if not res['error']:
                 lineas.append(f"ERROR: el análisis terminó con código {codigo}")
             borrar((salida, informe) + ((mkv,) if hacer_mux else ()))
@@ -2711,7 +3023,7 @@ class App:
         estado = "Hecho" + texto_avisos(res)
         if res['mux_error']:
             estado += " · sin muxear"
-        self.progress_queue.put(("fin", (j, estado, lineas, salida)))
+        self.progress_queue.put(("fin", (j, estado, lineas, final or salida)))
         return ("avisos" if res['avisos'] else "hecho"), muxeado
 
     def _worker(self, *args):
@@ -2727,8 +3039,10 @@ class App:
 
     def _tanda(self, trabajos, carpeta, idioma, sobrescribir, mux=None, rellenar=True, forzados=None, deco="cpu",
                otras_pistas=True, formato="flac", estirar=False, limpiar=False, canales="igual", kbps="",
-               forzados_vo=False, cortes_whisper=False):
+               forzados_vo=False, cortes_whisper=False, mantener_original=False, solo_video=False):
         """mux: (idioma, título) para meter el audio en el vídeo original, o None.
+        mantener_original: el vídeo original no se toca; el doblaje va a su reloj (--mantener-original).
+        solo_video: al muxear, se verifica el MKV y se borran los auxiliares (--solo-video).
         rellenar: lo que le falte al doblaje se rellena con el audio original.
         forzados: idioma con el que leer (OCR) los forzados quemados en la imagen del doblaje, o None.
         deco: con qué se decodifica el vídeo (clave de sd.DECODIFICADORES).
@@ -2739,6 +3053,8 @@ class App:
         canales: los del audio doblado (clave de CANALES_AUDIO). kbps: sus kb/s ("" = automáticos; no en FLAC).
         forzados_vo: lo que va con el audio de la RAW, transcrito y traducido en _forzados.srt (forzados_vo).
         cortes_whisper: los recortes y las uniones, comprobados con Whisper (--cortes-whisper)."""
+        if formato == "original":       # conserva los canales y los kb/s de cada pista
+            canales, kbps = "igual", ""
         total = len(trabajos)
         hechos = con_avisos = errores = saltados = muxeados = 0
         # SYNC_MASTER_VENTANA: el motor apunta en el informe si esta ventana es de otra versión que él
@@ -2754,7 +3070,7 @@ class App:
             # (el 23-10-2026 un fallo así, sin avisar, dejó sin hacer todos los de «solo subtítulos» tras el primero)
             try:
                 if j.solo_subs():
-                    como, muxeado = self._solo_subs(j, carpeta, idioma, sobrescribir, mux, entorno)
+                    como, muxeado = self._solo_subs(j, carpeta, idioma, sobrescribir, mux, entorno, solo_video)
                     if como == "cancelado":
                         break
                     hechos += como in ("hecho", "avisos")
@@ -2786,6 +3102,12 @@ class App:
                 mkv = sd.ruta_mux(j.original, carpeta or None, mux[1], j.plan_mux) if mux else None
                 hacer_mux = bool(mkv and not os.path.exists(mkv))
                 solo_mux = False
+                if solo_video and mkv and not hacer_mux:
+                    # con --solo-video los auxiliares ya no están: el trabajo hecho es el MKV
+                    lineas = leer_lineas(informe) + [f"Ya existe el vídeo muxeado, no se toca: {mkv}"]
+                    self.progress_queue.put(("fin", (j, "Ya existe", lineas, mkv)))
+                    saltados += 1
+                    continue
                 if any(x and os.path.exists(x) for x in (salida, sub_out)):
                     if not sobrescribir:
                         if not (hacer_mux and os.path.exists(salida)):
@@ -2850,10 +3172,16 @@ class App:
                     cmd += ["--decodificar", deco]
                 if not otras_pistas:
                     cmd += ["--solo-pista-principal"]
+                if mantener_original:
+                    cmd += ["--mantener-original"]
                 if hacer_mux:
+                    if solo_video:
+                        cmd += ["--solo-video"]
                     cmd += ["--muxear", mkv, "--mux-idioma", mux[0], "--mux-titulo", mux[1]]
                     if j.plan_mux:          # sin él, el script copia el título del castellano si lo tiene
                         cmd += ["--titulo-video", j.plan_mux]
+                # (con --solo-video el informe se borra al acabar: lo de antes se lee ya)
+                informe_previo = leer_lineas(informe) if solo_mux else []
                 lineas, codigo = self._ejecutar(cmd, j, entorno)
 
                 if self.stop_event.is_set():
@@ -2867,20 +3195,25 @@ class App:
                 if solo_mux:
                     # el informe ya lleva la línea del muxeado si ha ido bien (la añade el script)
                     res = leer_informe(lineas)
-                    previo = leer_lineas(informe)
+                    final = res['solo_video'] if res['solo_video'] and os.path.isfile(res['solo_video']) else None
+                    previo = leer_lineas(informe) if os.path.exists(informe) else list(informe_previo)
                     if not any(RE_MUX.match(x) for x in previo):     # sin informe (audio hecho fuera)
                         previo += [x for x in lineas if RE_MUX.match(x)]
-                    if res['mux_error']:
-                        previo.append(f"No se pudo muxear: {res['mux_error']}")
+                    if final:       # lo de la limpieza (--solo-video), que el informe borrado ya no lleva
+                        previo += [x for x in lineas if x.startswith(("Limpieza: ", "Vídeo final verificado: ",
+                                                                      "Aviso: "))]
+                    if codigo != 0 or res['error'] or res['mux_error']:
+                        previo.append(f"No se pudo muxear: {res['mux_error'] or res['error'] or codigo}")
                         self.progress_queue.put(("fin", (j, "Sin muxear", previo, salida)))
                         errores += 1
                     else:
-                        self.progress_queue.put(("fin", (j, "Muxeado", previo, salida)))
+                        self.progress_queue.put(("fin", (j, "Muxeado", previo, final or salida)))
                         muxeados += 1
                     continue
 
                 res = leer_informe(lineas)
-                if codigo != 0 or res['error'] or not os.path.exists(salida):
+                final = res['solo_video'] if res['solo_video'] and os.path.isfile(res['solo_video']) else None
+                if codigo != 0 or res['error'] or not (final or os.path.exists(salida)):
                     if not res['error']:
                         lineas.append(f"ERROR: el análisis terminó con código {codigo}")
                     borrar((salida, sub_out, informe) + ((forz_out,) if forz_nuevo else ()) + tuple(subs_nuevos))
@@ -2901,7 +3234,7 @@ class App:
                 elif hacer_mux:
                     muxeados += 1
                 hechos += 1
-                self.progress_queue.put(("fin", (j, estado, lineas, salida)))
+                self.progress_queue.put(("fin", (j, estado, lineas, final or salida)))
             except Exception as e:
                 import traceback
                 donde = traceback.extract_tb(e.__traceback__)[-1]
