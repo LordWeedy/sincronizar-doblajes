@@ -1723,6 +1723,124 @@ def pruebas_sueltas(carpeta=CARPETA):
         fallos.append("bien medido, cambia algo")
     out.append(("repeticiones", "dos trozos del doblaje en el mismo sitio del original: se queda el que dice la imagen "
                                 "(o el largo) y lo que no está en el original va en el recorte", fallos))
+    # formato «Original»: una pista E-AC3 5.1 y otra FLAC de 24 bits se vuelven a codificar con sus mismos parámetros
+    # (códec, frecuencia, canales, distribución, bits y bitrate) y se rechaza lo que no se puede conservar
+    fallos = []
+    with tempfile.TemporaryDirectory(prefix="formato_original_") as d:
+        fs = 48000
+        t = np.arange(fs * 2) / fs
+        senal = lambda ch: np.column_stack([0.15 * np.sin(2 * np.pi * (200 + 90 * i) * t)
+                                            for i in range(ch)]).astype(np.float32)
+        for codec, layout, ch, extra in (("eac3", "5.1(side)", 6, ["-b:a", "256000"]),
+                                         ("flac", "stereo", 2, ["-sample_fmt", "s32", "-bits_per_raw_sample", "24"])):
+            fuente = os.path.join(d, f"fuente_{codec}.mka")
+            r = subprocess.run(["ffmpeg", "-v", "error", "-f", "f32le", "-ar", str(fs), "-ch_layout", layout, "-i", "-",
+                                "-c:a", sd.ENCODERS_ORIGINALES[codec]] + extra + [fuente],
+                               input=senal(ch).tobytes(), capture_output=True)
+            if r.returncode:
+                fallos.append(f"{codec}: no se pudo fabricar la fuente ({r.stderr.decode(errors='replace')[-200:]})")
+                continue
+            st = sd.probe_audio(fuente)
+            salida = os.path.join(d, f"salida_{codec}.mka")
+            try:
+                plan = sd.preparar_original(fuente, st, salida, lambda *_: None)
+                sd.codificar_original(senal(ch), plan, salida, lambda *_: None)
+                real = sd.probe_audio(salida)
+            except Exception as e:
+                fallos.append(f"{codec}: revienta ({e})")
+                continue
+            for campo in ("codec_name", "sample_rate", "channels", "channel_layout"):
+                if str(real.get(campo)) != str(st.get(campo)):
+                    fallos.append(f"{codec}: {campo} {st.get(campo)} -> {real.get(campo)}")
+            if codec == "flac" and sd.bits_audio(real) != 24:
+                fallos.append(f"flac: sale con {sd.bits_audio(real)} bits en vez de 24")
+            try:
+                sd.codificar_original(senal(ch), plan, salida, lambda *_: None)
+                fallos.append(f"{codec}: sobrescribe un audio que ya existe")
+            except RuntimeError:
+                pass
+        try:
+            sd.preparar_original("x.mka", dict(codec_name="truehd", profile="Dolby TrueHD + Dolby Atmos", _n=1,
+                                               sample_rate="48000", channels=8), "y.mka", lambda *_: None)
+            fallos.append("acepta Atmos (no se puede reconstruir)")
+        except RuntimeError:
+            pass
+        try:
+            sd.sincronizar("a.mka", "b.mkv", os.path.join(d, "c.mka"), formato="original", canales="2.0")
+            fallos.append("el formato Original acepta cambiar los canales")
+        except ValueError:
+            pass
+    out.append(("formato_original", "el formato «Original» conserva los parámetros de cada pista o da error", fallos))
+    # referencia fija (--mantener-original): el mapa pasa al reloj del original (velocidad 1: el vídeo no se toca)
+    fallos = []
+    mapa = dict(pre=1.0, k=0.001, L=[0.5, 2.0], inicios=[0.0, 60.0], fines=[60.0, 120.0], vel=[25, 24],
+                curva=[[0.0, 0.0], [100.0, 1.0]])
+    f = sd.Fraction(25, 24)
+    nuevo = sd.mapa_al_original(mapa, f)
+    if nuevo["vel"] != [1, 1] or sd.velocidad_del_mapa(nuevo) != 1:
+        fallos.append(f"velocidad {nuevo['vel']}")
+    if abs(nuevo["pre"] - float(f)) > 1e-9 or abs((1 + nuevo["k"]) - 1.001 * float(f)) > 1e-9:
+        fallos.append(f"pre/k: {nuevo['pre']}, {nuevo['k']}")
+    if [round(x, 9) for x in nuevo["L"]] != [round(x * float(f), 9) for x in mapa["L"]]:
+        fallos.append(f"L: {nuevo['L']}")
+    if nuevo["velocidad_doblaje"] != [25, 24] or not nuevo["referencia_fija"]:
+        fallos.append("no apunta la velocidad del doblaje")
+    with tempfile.TemporaryDirectory(prefix="referencia_fija_") as d:
+        x = np.random.default_rng(0).uniform(-0.2, 0.2, (48000, 2)).astype(np.float32)
+        try:
+            with sd.muestras_al_original(x, 48000, f) as y:
+                n = len(y)
+            if abs(n - round(len(x) * float(f))) > 4:
+                fallos.append(f"muestras: {n} en vez de {round(len(x) * float(f))}")
+        except Exception as e:
+            fallos.append(f"muestras: revienta ({e})")
+        srt = os.path.join(d, "s.srt")
+        with open(srt, "w", encoding="utf-8") as fh:
+            fh.write("1\n00:00:24,000 --> 00:00:48,000\nHola\n")
+        sd.escalar_subtitulo(srt, f)
+        with open(srt, encoding="utf-8") as fh:
+            if "00:00:25,000 --> 00:00:50,000" not in fh.read():
+                fallos.append("el subtítulo no pasa al reloj del original")
+    if sd.referencia_requiere_cambio():
+        fallos.append("sin --mantener-original pide cambiar el reloj")
+    out.append(("referencia_fija", "con el original fijo, mapa, muestras y subtítulos van a su reloj", fallos))
+    # --solo-video: tras verificar el MKV solo se borran los auxiliares de ese trabajo, nunca las entradas; si el MKV
+    # no tiene las pistas esperadas, no se borra nada
+    fallos = []
+    with tempfile.TemporaryDirectory(prefix="solo_video_") as d:
+        ori, dob = os.path.join(d, "Serie 1x01.mkv"), os.path.join(d, "Serie 1x01 castellano.mka")
+        salida = os.path.join(d, "Serie 1x01 castellano_[es-ES]_SYNC.mka")
+        mkv = os.path.join(d, "Serie 1x01 [Dual].mkv")
+        hechos = [subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=64x48:rate=25:d=1", "-f",
+                                  "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "1", "-c:v", "mpeg4", "-c:a",
+                                  "flac", ori], capture_output=True).returncode,
+                  subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "1",
+                                  "-c:a", "flac", salida], capture_output=True).returncode,
+                  subprocess.run(["ffmpeg", "-v", "error", "-i", ori, "-i", salida, "-map", "0", "-map", "1", "-c",
+                                  "copy", mkv], capture_output=True).returncode]
+        if any(hechos):
+            fallos.append("no se pudieron fabricar los archivos")
+        else:
+            informe = os.path.splitext(salida)[0] + "_informe.txt"
+            srt = os.path.splitext(salida)[0] + ".srt"
+            ajeno = os.path.join(d, "otro_informe.txt")
+            for ruta in (informe, srt, ajeno, dob):
+                open(ruta, "w").close()
+            try:
+                sd.finalizar_solo_video(mkv, salida, ori, audios=[salida, salida], subtitulos=[srt], fuentes=[dob],
+                                        p=lambda *_: None)
+                fallos.append("con una pista de menos en el MKV, borra")
+            except RuntimeError:
+                pass
+            if not all(os.path.exists(x) for x in (salida, informe, srt)):
+                fallos.append("con la verificación fallida ha borrado algo")
+            sd.finalizar_solo_video(mkv, salida, ori, audios=[salida], subtitulos=[], fuentes=[dob, ori],
+                                    p=lambda *_: None)
+            if any(os.path.exists(x) for x in (salida, informe)):
+                fallos.append("no borra el audio sincronizado o su informe")
+            if not all(os.path.exists(x) for x in (ori, dob, mkv, ajeno, srt)):
+                fallos.append("borra algo que no es suyo (entradas, MKV, otros archivos o lo no muxeado)")
+    out.append(("solo_video", "--solo-video verifica el MKV y solo borra los auxiliares de ese trabajo", fallos))
     # un nombre sin definir solo revienta al pasar por esa línea (así se paró la tanda de «solo subtítulos» de la GUI
     # tras el primer episodio, 23-10-2026): se buscan en todos los archivos del programa sin ejecutarlos
     fallos = [f"{os.path.basename(f)}, línea {ln} ({func}): «{nombre}» no existe"

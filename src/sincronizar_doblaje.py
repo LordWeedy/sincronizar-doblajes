@@ -39,8 +39,11 @@ Con --forzados-vo, lo que va con el audio original y lleva voz se transcribe con
 _forzados.srt (forzados_vo.py, en esta misma carpeta; opcional: faster-whisper y sentencepiece).
 Requiere ffmpeg/ffprobe en el PATH y numpy + scipy.
 """
-import argparse, atexit, base64, difflib, glob, hashlib, json, os, re, shutil, subprocess, sys, tempfile, threading, time
+import argparse, atexit, base64, difflib, functools, glob, hashlib, inspect, json, os, re, shutil, subprocess, sys, \
+    tempfile, threading, time
 from collections import Counter, deque
+from contextlib import contextmanager
+from contextvars import ContextVar
 from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
 import numpy as np
@@ -123,7 +126,8 @@ if sys.stdout is not None:          # con pythonw (la GUI) no hay consola
 def pistas_audio(path):
     """Pistas de audio del archivo; '_n' es su número entre las pistas de audio (1, 2...)."""
     r = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
-                        "stream=index,codec_type,codec_name,start_time,channels,channel_layout,bit_rate,sample_rate"
+                        "stream=index,codec_type,codec_name,profile,start_time,channels,channel_layout,bit_rate,"
+                        "sample_rate,sample_fmt,bits_per_sample,bits_per_raw_sample:stream_side_data"
                         ":stream_tags=language,title", "-of", "json", path],
                        capture_output=True, text=True, encoding="utf-8", errors="replace", check=True, **SIN_VENTANA)
     st = [s for s in json.loads(r.stdout)["streams"] if s["codec_type"] == "audio"]
@@ -484,10 +488,14 @@ def mka_apunta_retardo_ac3():
     return _MKA_APUNTA_AC3
 
 
-def codificar(out, fs, layout, codec, bitrate, path, canales="igual"):
+def codificar(out, fs, layout, codec, bitrate, path, canales="igual", original=None):
     """out (muestras float32) a `path` en el formato `codec` (clave de FORMATOS) y `bitrate` b/s.
     canales: "2.0" pasa a estéreo lo que no lo sea (matriz_estereo); si la mezcla saturaría, se baja todo lo justo
-    (como la limpieza). Devuelve el cambio de canales para el informe («5.1 → 2.0», con los dB si se ha bajado) o ""."""
+    (como la limpieza). Devuelve el cambio de canales para el informe («5.1 → 2.0», con los dB si se ha bajado) o "".
+    original: el plan de preparar_original (formato «Original»): se codifica con los parámetros de la pista."""
+    if original is not None:
+        _codificar_con_plan(out, fs, layout, codec, bitrate, path, original)
+        return ""
     M, g, cambio = None, 1.0, ""
     if canales == "2.0" and out.shape[1] != 2:
         nombres = nombres_canales(layout, out.shape[1])
@@ -540,6 +548,307 @@ def codificar(out, fs, layout, codec, bitrate, path, canales="igual"):
     if p.wait() != 0:
         raise RuntimeError("ffmpeg falló al codificar")
     return cambio
+
+
+# ---------------------------------------------------------------- formato «Original» (--formato original)
+# Conserva los parámetros técnicos de cada pista del doblaje (códec, frecuencia, canales, distribución, perfil, bits y
+# bitrate). Lo que el codificador de ffmpeg no puede reproducir se rechaza: nunca se sustituye por otro perfil. Recodificar
+# un formato con pérdida no es una copia de la señal; se conservan los parámetros, no los datos comprimidos.
+
+ENCODERS_ORIGINALES = {"aac": "aac", "ac3": "ac3", "eac3": "eac3", "opus": "libopus", "mp3": "libmp3lame",
+                       "mp2": "mp2", "flac": "flac", "alac": "alac", "dts": "dca", "truehd": "truehd", "mlp": "mlp"}
+SIN_PERDIDA = {"flac", "alac", "truehd", "mlp"}
+
+
+def bits_audio(st):
+    return int(st.get("bits_per_raw_sample") or 0) or int(st.get("bits_per_sample") or 0)
+
+
+def bitrate_paquetes(path, st):
+    """Bytes comprimidos / muestras reales: las duraciones de Matroska pueden estar redondeadas a ms.
+    Descartar los extremos evita contar el priming/padding como audio útil. No usa etiquetas BPS antiguas."""
+    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", str(st["index"]), "-read_intervals", "%+60",
+                        "-show_frames", "-show_entries", "frame=pkt_size,nb_samples", "-of", "json", path],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace", check=True, **SIN_VENTANA)
+    frames = json.loads(r.stdout).get("frames", [])
+    frames = frames[1:-1] if len(frames) > 2 else frames
+    validos = [(int(x["pkt_size"]), int(x["nb_samples"])) for x in frames
+               if x.get("pkt_size") and int(x.get("nb_samples") or 0) > 0]
+    if not validos:
+        return None
+    return round(sum(n for n, t in validos) * 8 * int(st["sample_rate"]) / sum(t for n, t in validos))
+
+
+def validar_original(ruta, plan, comprobar_bitrate=True):
+    """Releer lo codificado: nunca aceptar un cambio automático de perfil, canales, frecuencia o bits."""
+    real, st = probe_audio(ruta), plan["stream"]
+    for campo in ("codec_name", "sample_rate", "channels"):
+        if str(real.get(campo)) != str(st.get(campo)):
+            raise RuntimeError(f"Formato Original: {campo} cambió de {st.get(campo)} a {real.get(campo)}")
+    layout_real = real.get("channel_layout") or {1: "mono", 2: "stereo"}.get(int(real["channels"]))
+    if layout_real != plan["layout"]:
+        raise RuntimeError(f"Formato Original: la distribución {plan['layout']} no se conserva "
+                           f"(sale {real.get('channel_layout') or 'desconocida'})")
+    perfil = st.get("profile")
+    if perfil and perfil.lower() != "unknown" and real.get("profile") != perfil:
+        raise RuntimeError(f"Formato Original: no se conserva el perfil {perfil} (sale {real.get('profile')})")
+    if plan["bits"] and bits_audio(real) != plan["bits"]:
+        raise RuntimeError(f"Formato Original: no se conservan los {plan['bits']} bits de la fuente")
+    if comprobar_bitrate and plan["bitrate"] and st["codec_name"] in ("ac3", "eac3", "mp2", "dts"):
+        br = bitrate_paquetes(ruta, real)
+        if br is None or abs(br - plan["bitrate"]) > max(1000, plan["bitrate"] * 0.005):
+            raise RuntimeError(f"Formato Original: bitrate de salida {br}, esperado {plan['bitrate']} b/s")
+    return real
+
+
+def preparar_original(path, st, ruta, p=print):
+    """Parámetros de ESTA pista del doblaje y prueba del codificador/contenedor antes de montar el audio."""
+    codec = st["codec_name"]
+    encoder = ENCODERS_ORIGINALES.get(codec) or (codec if codec.startswith("pcm_") else None)
+    if not encoder:
+        raise RuntimeError(f"Formato Original: no se admite recodificar {codec}; elige otro formato explícitamente")
+    perfil = st.get("profile", "")
+    especiales = json.dumps(st.get("side_data_list", []), ensure_ascii=False).lower() + perfil.lower()
+    if any(x in especiales for x in ("atmos", "joc", "dts-hd", "dts:x", "dts express")):
+        raise RuntimeError(f"Formato Original: FFmpeg no puede reconstruir {perfil or 'los metadatos de objetos'} "
+                           "tras editar el audio; no se sustituirá por un perfil inferior")
+    fs, ch = int(st["sample_rate"]), int(st["channels"])
+    layout = st.get("channel_layout") or {1: "mono", 2: "stereo"}.get(ch)
+    if not layout:
+        raise RuntimeError("Formato Original: se desconoce la distribución de canales; no se puede garantizar")
+    pcm = codec.startswith("pcm_")
+    bits = bits_audio(st) if codec in SIN_PERDIDA or pcm else 0
+    if codec in SIN_PERDIDA and not bits:
+        raise RuntimeError("Formato Original: no se ha podido determinar la profundidad de bits de la fuente")
+    bitrate = None if codec in SIN_PERDIDA or pcm else bitrate_paquetes(path, st)
+    if bitrate is None and codec not in SIN_PERDIDA and not pcm:
+        bitrate = int(st.get("bit_rate") or 0) or None
+        if bitrate is None:
+            raise RuntimeError("Formato Original: no se ha podido medir el bitrate de esta pista")
+    if bitrate and codec in ("ac3", "eac3", "mp2", "mp3", "dts"):
+        nominal = round(bitrate / 1000) * 1000
+        if abs(bitrate - nominal) <= 100:
+            bitrate = nominal
+    opciones = []
+    if codec == "aac":
+        perfiles = {"LC": "aac_low", "Main": "aac_main", "LTP": "aac_ltp"}
+        if perfil not in perfiles:
+            raise RuntimeError(f"Formato Original: el codificador AAC disponible no puede garantizar el perfil {perfil}")
+        opciones += ["-profile:a", perfiles[perfil]]
+        if perfil == "LTP":
+            opciones += ["-strict", "-2"]
+    if codec in ("dts", "truehd", "mlp"):
+        opciones += ["-strict", "-2"]
+    if codec in SIN_PERDIDA:
+        sf = ("s16" if bits <= 16 else "s32") + ("p" if codec in ("truehd", "mlp", "alac") else "")
+        opciones += ["-sample_fmt", sf, "-bits_per_raw_sample", str(bits)]
+    for clave in ("language", "title"):
+        if (st.get("tags") or {}).get(clave):
+            opciones += ["-metadata:s:a:0", f"{clave}={st['tags'][clave]}"]
+    plan = dict(stream=st, encoder=encoder, bitrate=bitrate, layout=layout, bits=bits, opciones=opciones)
+    with tempfile.TemporaryDirectory(prefix="original_prueba_") as tmp:
+        prueba = os.path.join(tmp, "prueba" + os.path.splitext(ruta)[1])
+        try:
+            senal = np.random.default_rng(0).uniform(-0.1, 0.1, (fs // 2, ch)).astype(np.float32)
+            codificar(senal, fs, layout, codec, bitrate, prueba, original=plan)
+            validar_original(prueba, plan, comprobar_bitrate=False)
+            if codec == "dts":
+                # el codificador DTS de ffmpeg adelanta su propio relleno: se mide y se compensa
+                def retardo(r):
+                    dec = cargar(r, probe_audio(r), fs, ch)
+                    inicio, largo, radio = fs // 8, fs // 8, min(2048, fs // 16)
+                    cc = ncc_curve(senal[inicio:inicio + largo, 0], dec[inicio - radio:inicio + largo + radio, 0])
+                    if cc is None or float(np.max(cc)) < 0.2:
+                        raise RuntimeError("no se ha podido verificar el retardo del codificador DTS")
+                    return int(np.argmax(cc)) - radio
+                demora = retardo(prueba)
+                if demora > 2:
+                    plan["quitar"] = demora
+                    compensado = os.path.join(tmp, "compensado" + os.path.splitext(ruta)[1])
+                    codificar(senal, fs, layout, codec, bitrate, compensado, original=plan)
+                    demora = retardo(compensado)
+                if abs(demora) > 2:
+                    raise RuntimeError("el codificador DTS no permite conservar la sincronización")
+        except RuntimeError as e:
+            raise RuntimeError(f"Formato Original: no se pueden conservar los parámetros de la pista {st['_n']}: "
+                               f"{e}") from e
+    p(f"Formato Original, pista {st['_n']}: {texto_formato(codec, bitrate)}, {fs} Hz, {layout}"
+      + (f", {bits} bits" if bits else "") + (f", perfil {perfil}" if perfil else ""))
+    if codec in SIN_PERDIDA:
+        p("  Compresión sin pérdida: el bitrate resultante depende del contenido editado.")
+    elif codec in ("aac", "opus", "mp3"):
+        p("  Bitrate medio de origen como objetivo; el bitrate efectivo puede variar con el contenido.")
+    if plan.get("quitar"):
+        p(f"  Retardo del codificador medido y compensado: {plan['quitar']} muestras.")
+    return plan
+
+
+def codificar_original(out, plan, ruta, p=print):
+    """Una única codificación final, desde las muestras montadas; se publica solo después de verificarla."""
+    st = plan["stream"]
+    if os.path.exists(ruta):
+        raise RuntimeError(f"Ya existe el audio de salida: {ruta}")
+    with tempfile.TemporaryDirectory(prefix="original_salida_", dir=os.path.dirname(os.path.abspath(ruta))) as tmp:
+        temporal = os.path.join(tmp, "audio" + os.path.splitext(ruta)[1])
+        codificar(out, int(st["sample_rate"]), plan["layout"], st["codec_name"], plan["bitrate"], temporal,
+                  original=plan)
+        real = validar_original(temporal, plan)
+        os.rename(temporal, ruta)
+    p(f"Parámetros originales verificados: {st['codec_name']}, {real['sample_rate']} Hz, {real['channels']} canales, "
+      f"{plan['layout']}" + (f", {plan['bits']} bits" if plan["bits"] else ""))
+    return plan["bitrate"]
+
+
+def _codificar_con_plan(out, fs, layout, codec, bitrate, path, original):
+    """out (muestras float32) a `path` con el plan de preparar_original."""
+    quitar = min(256, len(out)) if codec in ("ac3", "eac3") and not (
+        path.lower().endswith(".mka") and mka_apunta_retardo_ac3()) else 0
+    quitar = min(len(out), quitar + original.get("quitar", 0))
+    cmd = ["ffmpeg", "-v", "error", "-n", "-f", "f32le", "-ar", str(fs), "-ch_layout", layout, "-i", "-",
+           "-c:a", original["encoder"], "-ar", str(fs), "-ac", str(out.shape[1]), "-ch_layout", layout]
+    cmd += original["opciones"]
+    if bitrate:
+        cmd += ["-b:a", str(bitrate)]
+    cmd.append(path)
+    with tempfile.TemporaryFile() as err:
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=err, **SIN_VENTANA)
+        try:
+            step = fs * 10
+            for i in range(quitar, len(out), step):
+                p.stdin.write(np.ascontiguousarray(out[i:i + step], np.float32).tobytes())
+            p.stdin.write(bytes(quitar * out.shape[1] * 4))
+        except BrokenPipeError:
+            pass
+        finally:
+            try:
+                p.stdin.close()
+            except BrokenPipeError:
+                pass
+            codigo = p.wait()
+        if codigo != 0:
+            err.seek(0)
+            detalle = err.read().decode("utf-8", errors="replace").strip()
+            raise RuntimeError("ffmpeg falló al codificar: " + " ".join(detalle.splitlines()[-4:]))
+
+
+# ---------------------------------------------------------------- referencia fija (--mantener-original)
+# En vez de adaptar la RAW al doblaje, el vídeo original y sus pistas se quedan como están (sus fps) y el doblaje y sus
+# subtítulos se llevan a su reloj. La medida y el montaje no cambian: las muestras ya montadas cambian de reloj justo
+# antes de su única codificación final (sin una recodificación intermedia con pérdida); el mapa y los subtítulos
+# reciben la misma transformación. Al corregir PAL, velocidad y tono cambian juntos.
+# Para reunir doblajes de varios archivos: se procesa el primero sobre la RAW con esta opción; el MKV resultante es
+# el «original» del segundo.
+
+MANTENER_ORIGINAL = False     # --mantener-original
+_REFERENCIA = ContextVar("referencia_fija", default=None)
+MARCA_REFERENCIA = "Referencia fija: "
+
+
+def _ruta_normal(ruta):
+    return os.path.normcase(os.path.abspath(ruta))
+
+
+def referencia_fijar_velocidad(vel):
+    """La llama sincronizar con la velocidad medida: es la que se deshace en el doblaje."""
+    contexto = _REFERENCIA.get()
+    if contexto is not None:
+        contexto["factor"] = Fraction(vel)
+        if contexto["factor"] != 1 and contexto["subs_existentes"]:
+            raise RuntimeError("Referencia fija: hay subtítulos auxiliares de una ejecución anterior. Retíralos de "
+                               "la carpeta de salida o elige otra carpeta antes de rehacer el audio.")
+
+
+def referencia_requiere_cambio():
+    contexto = _REFERENCIA.get()
+    return contexto is not None and contexto["factor"] != 1
+
+
+def _referencia_para(ruta):
+    """El contexto si el audio de `ruta` hay que llevarlo al reloj del original; si no, None."""
+    contexto = _REFERENCIA.get()
+    return contexto if referencia_requiere_cambio() and _ruta_normal(ruta) in contexto["audios"] else None
+
+
+def mapa_al_original(mapa, factor):
+    factor = float(factor)
+    nuevo = dict(mapa, pre=mapa["pre"] * factor, k=(1 + mapa["k"]) * factor - 1, L=[x * factor for x in mapa["L"]],
+                 vel=[1, 1], referencia_fija=True, velocidad_doblaje=list(mapa.get("vel") or [1, 1]))
+    if mapa.get("curva"):
+        nuevo["curva"] = [[t, d * factor + (factor - 1) * t] for t, d in mapa["curva"]]
+    return nuevo
+
+
+@contextmanager
+def muestras_al_original(out, fs, factor):
+    """Cambio de reloj por bloques a disco, sin cargar otra película completa en memoria."""
+    factor = Fraction(factor)
+    ch = out.shape[1]
+    with tempfile.TemporaryDirectory(prefix="referencia_fija_") as tmp:
+        ruta = os.path.join(tmp, "muestras.f32")
+        with open(ruta, "wb") as destino:
+            proceso = subprocess.Popen(["ffmpeg", "-v", "error", "-f", "f32le", "-ar", str(fs), "-ac", str(ch),
+                                        "-i", "-", "-af", filtro_velocidad(fs, 1 / factor, fs), "-f", "f32le",
+                                        "-c:a", "pcm_f32le", "-"],
+                                       stdin=subprocess.PIPE, stdout=destino, stderr=subprocess.PIPE, **SIN_VENTANA)
+            try:
+                for inicio in range(0, len(out), 1 << 17):
+                    proceso.stdin.write(np.asarray(out[inicio:inicio + (1 << 17)], dtype=np.float32).tobytes())
+                proceso.stdin.close()
+                proceso.stdin = None
+                _, error = proceso.communicate(timeout=180)
+                if proceso.returncode:
+                    raise RuntimeError("No se ha podido adaptar el doblaje: "
+                                       + error.decode("utf-8", "replace")[-1200:])
+            except BaseException:
+                if proceso.poll() is None:
+                    proceso.kill()
+                proceso.communicate()
+                raise
+        n, resto = divmod(os.path.getsize(ruta), 4 * ch)
+        if resto or abs(n - round(len(out) * float(factor))) > 4:
+            raise RuntimeError("La adaptación no tiene el número de muestras esperado.")
+        datos = np.memmap(ruta, dtype=np.float32, mode="r", shape=(n, ch))
+        try:
+            yield datos
+        finally:
+            datos._mmap.close()
+
+
+def escalar_subtitulo(ruta, factor):
+    if not os.path.isfile(ruta):
+        return
+    if os.path.islink(ruta):
+        raise RuntimeError("Referencia fija: no se modifica un subtítulo que sea un enlace.")
+    escala = dict(pre=0, k=float(factor) - 1, L=[0], inicios=[0], fines=[float("inf")], vel=[1, 1])
+    convertir = _ass_mapeado if ruta.lower().endswith((".ass", ".ssa")) else _srt_mapeado
+    with open(ruta, "rb") as f:
+        datos, _ = convertir(f.read(), escala)
+    with open(ruta, "wb") as f:
+        f.write(datos)
+
+
+def _al_reloj_original(funcion):
+    """codificar / codificar_original: con la referencia fija, las muestras pasan antes al reloj del original."""
+    firma = inspect.signature(funcion)
+
+    @functools.wraps(funcion)
+    def envoltorio(*args, **kwargs):
+        v = firma.bind(*args, **kwargs).arguments
+        ruta = v.get("path") or v.get("ruta")
+        contexto = _referencia_para(ruta)
+        if contexto is None:
+            return funcion(*args, **kwargs)
+        fs = v["fs"] if "fs" in v else int(v["plan"]["stream"]["sample_rate"])
+        with muestras_al_original(v["out"], fs, contexto["factor"]) as muestras:
+            v["out"] = muestras
+            resultado = funcion(**v)
+        contexto["convertidos"].add(_ruta_normal(ruta))
+        return resultado
+    return envoltorio
+
+
+codificar = _al_reloj_original(codificar)
+codificar_original = _al_reloj_original(codificar_original)
 
 
 # ---------------------------------------------------------------- medida
@@ -8472,8 +8781,9 @@ def subs_para_muxear(es_path, out_path, idioma, pistas=None):
 def sin_copia_subs(rutas, mkv):
     """Los subtítulos ajustados ya van dentro del vídeo muxeado: no se deja copia aparte (lo pidió el usuario,
     18-10-2026). Solo si el vídeo existe. Los forzados del OCR no pasan por aquí: se quedan, porque son los que se
-    corrigen a mano antes de volver a muxear. Devuelve la línea para el informe (o ninguna)."""
-    if not mkv or not os.path.exists(mkv):
+    corrigen a mano antes de volver a muxear. Devuelve la línea para el informe (o ninguna).
+    Con --solo-video no se borra aquí: lo hace finalizar_solo_video después de verificar el MKV."""
+    if SOLO_VIDEO or not mkv or not os.path.exists(mkv):
         return []
     borrados = []
     for ruta in rutas:
@@ -10379,7 +10689,7 @@ def convertir_sin_cortes(sin_cortes, formato, st, p=print):
     """Sin cortes ni rellenos el doblaje puede ir tal cual: ¿se pasa al formato elegido? sin_cortes: "intacto",
     "convertir" o "preguntar" (en la GUI, una ventana; en una consola, aquí; sin nadie que conteste, intacto).
     Si ya va en ese formato no se pregunta: recodificarlo solo perdería calidad."""
-    if sin_cortes == "intacto" or st.get("codec_name") == formato:
+    if formato == "original" or sin_cortes == "intacto" or st.get("codec_name") == formato:
         return False
     if sin_cortes == "convertir":
         return True
@@ -10418,7 +10728,11 @@ def sincronizar(es_path, en_path, out_path, sub_path=None, pista=None, guia=None
     forzados_vo: el modelo de Whisper («small», «medium») con el que lo que va con el audio original se transcribe y se
     traduce en _forzados.srt (forzados_de_la_vo), o None.
     cortes_whisper: los recortes van donde acaban las frases según Whisper (recortes_en_pausas) y cada unión del
-    resultado se escucha con él (revisar_uniones)."""
+    resultado se escucha con él (revisar_uniones).
+    formato "original": cada pista se recodifica con sus propios parámetros (preparar_original); no admite canales
+    ni kbps."""
+    if formato == "original" and (canales != "igual" or kbps is not None):
+        raise ValueError("El formato Original conserva los canales y el bitrate de cada pista.")
     log = []
     def p(msg=""):
         print(msg, flush=True); log.append(msg)
@@ -10776,6 +11090,7 @@ def sincronizar(es_path, en_path, out_path, sub_path=None, pista=None, guia=None
         nueva = velocidad_final(vel * Fraction(1 + k), en_len)
         f, vel = nueva / vel, nueva
     resto = (1 + k) / float(f) - 1
+    referencia_fijar_velocidad(vel)     # con --mantener-original, la velocidad que se deshace en el doblaje
     bordes = [0.0] + [c["c"] for c in cortes] + [dur_es]
     if curva is None:
         L = [Li / float(f) + resto * (bordes[i] + bordes[i + 1]) / 2 for i, Li in enumerate(L)]
@@ -11053,17 +11368,26 @@ def sincronizar(es_path, en_path, out_path, sub_path=None, pista=None, guia=None
     hueco = (rellenar_original and (inicio >= UMBRAL_ORIGINAL or en_len - inicio - dur_es >= UMBRAL_ORIGINAL)
              or bool(zonas))
     # el formato: el de la extensión si se ha pedido un .ac3/.eac3; si no, el elegido (FLAC de serie)
-    formato = {".ac3": "ac3", ".eac3": "eac3"}.get(ext, formato if formato in FORMATOS else "flac")
-    # estirado o limpio nunca va tal cual
-    tal_cual = len(L) == 1 and not hueco and ext == ".mka" and curva is None and not limpiar
+    if formato != "original":
+        formato = {".ac3": "ac3", ".eac3": "eac3"}.get(ext, formato if formato in FORMATOS else "flac")
+    # estirado o limpio nunca va tal cual; con la referencia fija y otra velocidad, tampoco
+    tal_cual = (len(L) == 1 and not hueco and ext == ".mka" and curva is None and not limpiar
+                and not referencia_requiere_cambio())
     # canales o kb/s pedidos que no son los suyos: se recodifica sin preguntar (intacto no puede cambiarlos)
-    pedido = motivo_recodificar(canales, kbps, formato, st_es, es_path) if tal_cual else None
+    pedido = motivo_recodificar(canales, kbps, formato, st_es, es_path) if tal_cual and formato != "original" else None
     convertir = tal_cual and (bool(pedido) or convertir_sin_cortes(sin_cortes, formato, st_es, p))
+    planes_originales = {}          # formato «Original»: el plan de cada pista (preparar_original)
     sin_voz, piezas = [], []        # (los trozos de los rellenos que van sin voz; dónde va cada trozo del doblaje)
     revisados = []                  # (los rellenos con sus uniones comprobadas y bien: autocomprobar_uniones)
     if tal_cual and not convertir:
         out, coloc, rellenos = None, [(L[0], L[0] + dur_es)], []     # va tal cual: no hay nada que montar
     else:
+        if formato == "original":
+            # antes de montar: si el codificador no puede conservar alguna pista, se sabe ya y no tras el montaje
+            for s in [st_es] + list(otras):
+                ruta = out_path if s["index"] == st_es["index"] else ruta_pista_extra(out_path, s)
+                if not os.path.exists(ruta):
+                    planes_originales[s["index"]] = preparar_original(es_path, s, ruta, p)
         if es is None:
             es = cargar_es()
         # con Whisper, el montaje se comprueba antes de guardarlo: donde empieza o acaba cada trozo del doblaje, lo que
@@ -11310,7 +11634,9 @@ def sincronizar(es_path, en_path, out_path, sub_path=None, pista=None, guia=None
     motivos =[x for x, c in (("hay cortes", len(L) > 1), ("se rellena con el original", bool(rellenos)),
                              ("convertido a petición; no había cortes", convertir and not pedido),
                              (f"{pedido}; no había cortes", bool(pedido)),
-                             ("se estira por la velocidad variable", curva is not None)) if c]
+                             ("se estira por la velocidad variable", curva is not None),
+                             ("se limpia el ruido VHS", limpiar),
+                             ("el castellano se adapta al original fijo", referencia_requiere_cambio())) if c]
     intacto = not motivos and ext == ".mka"
     if intacto:
         copiar_intacto(es_path, st_es, pre_s + L[0], out_path)
@@ -11318,10 +11644,16 @@ def sincronizar(es_path, en_path, out_path, sub_path=None, pista=None, guia=None
           f"de desfase")
     else:
         layout = st_es.get("channel_layout") or {1: "mono", 2: "stereo", 6: "5.1"}.get(ch, f"{ch}c")
-        # los kb/s pedidos o, en el mismo formato y canales que el doblaje, los suyos (medidos si el MKV no los apunta)
-        bitrate = bitrate_salida(formato, st_es, es_path, canales, kbps)
-        cambio_canales = codificar(out, fs, layout, formato, bitrate, out_path, canales)
-        p(f"Audio doblado: en {texto_formato(formato, bitrate)}" + (f", {cambio_canales}" if cambio_canales else "")
+        if formato == "original":
+            bitrate = codificar_original(out, planes_originales[st_es["index"]], out_path, p)
+            cambio_canales = ""
+        else:
+            # los kb/s pedidos o, en el mismo formato y canales que el doblaje, los suyos (medidos si el MKV no los
+            # apunta)
+            bitrate = bitrate_salida(formato, st_es, es_path, canales, kbps)
+            cambio_canales = codificar(out, fs, layout, formato, bitrate, out_path, canales)
+        p(f"Audio doblado: en {texto_formato(st_es['codec_name'] if formato == 'original' else formato, bitrate)}"
+          + (f", {cambio_canales}" if cambio_canales else "")
           + " (" + (", ".join(motivos) if motivos else "el archivo de salida no es .mka") + ")")
     p(f"Guardado: {out_path}")
     if cortes_whisper:
@@ -11373,12 +11705,15 @@ def sincronizar(es_path, en_path, out_path, sub_path=None, pista=None, guia=None
                     x_s = db_s = None
                 br, cambio_canales = sincronizar_otra_pista(es_path, s, st_es, en_path, st_en, k, L_s, cortes_s, en_len,
                                                     pre_s, rellenar_original, ruta, vel, intacto and len(L_s) == 1,
-                                                    formato, curva, puentes, canales, kbps)
+                                                    formato, curva, puentes, canales, kbps,
+                                                    plan_original=planes_originales.get(s["index"]), p=p)
+                formato_s = s["codec_name"] if formato == "original" else formato
                 p(f"Pista del doblaje {describir_pista(s)}: sincronizada con los mismos cortes -> {ruta}"
-                  + (" (intacta)" if br is False else f" ({texto_formato(formato, br)}"
+                  + (" (intacta)" if br is False else f" ({texto_formato(formato_s, br)}"
                      + (f", {cambio_canales}" if cambio_canales else "") + ")"))
             except Exception as e:
                 borrar_si_existe(ruta)
+                avisos.append(f"pista {s['_n']}: no se ha podido sincronizar ({e})")
                 p(f"Pista del doblaje {describir_pista(s)}: no se ha podido sincronizar ({e})")
 
     escribir_pendientes(subs_pendientes, p)
@@ -11474,32 +11809,42 @@ def ruta_pista_extra(out_path, s):
 
 def sincronizar_otra_pista(es_path, s, st_ref, en_path, st_en, k, L, cortes, en_len, pre_s, rellenar, ruta,
                            vel=Fraction(1), intacto=False, formato="flac", curva=None, puentes=(), canales="igual",
-                           kbps=None):
+                           kbps=None, plan_original=None, p=print):
     """Otra pista doblada del mismo archivo con los mismos cortes que la principal (van a la par dentro del
     archivo; si empieza en otro momento, se alinea con ella). Lo que le falte, del original, como a la principal.
     intacto: la principal va sin recodificar (no hay cortes): esta también, con su mismo desfase, salvo que se hayan
     pedido canales o kb/s que no son los suyos (motivo_recodificar). Si no, en `formato`, `canales` y `kbps`, como la
     principal. curva: estirada como la principal (velocidad variable).
+    formato "original": con sus propios parámetros (plan_original, o se prepara aquí).
     Devuelve (bitrate con que se ha codificado (None en FLAC; False si va intacta), cambio de canales)."""
+    contexto = _REFERENCIA.get()
+    if contexto is not None:            # --mantener-original: esta pista también va al reloj del original
+        contexto["audios"].add(_ruta_normal(ruta))
     d_s = float(s.get("start_time") or 0) - float(st_ref.get("start_time") or 0)
     codec = {".ac3": "ac3", ".eac3": "eac3"}.get(os.path.splitext(ruta)[1].lower(), formato)
-    if intacto and not motivo_recodificar(canales, kbps, codec, s, es_path):
+    if intacto and (formato == "original" or not motivo_recodificar(canales, kbps, codec, s, es_path)):
         copiar_intacto(es_path, s, pre_s + L[0] + d_s, ruta)
         return False, ""
     fs, ch = int(s["sample_rate"]), int(s["channels"])
     tmp = carpeta_temporal(en_len * fs * ch * 4)
-    x = cargar_pista(es_path, s, fs, ch, tmp, int(round(d_s * fs)))
-    original = (lambda tramos: cargar_tramos(en_path, st_en, fs, ch, tramos, vel)) if rellenar else None
-    out = montar(x, fs, k, L, cortes, en_len, int(round(pre_s * fs)), original, lienzo(tmp), curva=curva,
-                 puentes=puentes)[0]
-    x = None
-    layout = s.get("channel_layout") or {1: "mono", 2: "stereo", 6: "5.1"}.get(ch, f"{ch}c")
-    bitrate = bitrate_salida(codec, s, es_path, canales, kbps)
-    cambio = codificar(out, fs, layout, codec, bitrate, ruta, canales)
-    out = None
-    if tmp:
-        shutil.rmtree(tmp, ignore_errors=True)
-    return bitrate, cambio
+    x = out = None
+    try:
+        x = cargar_pista(es_path, s, fs, ch, tmp, int(round(d_s * fs)))
+        original = (lambda tramos: cargar_tramos(en_path, st_en, fs, ch, tramos, vel)) if rellenar else None
+        out = montar(x, fs, k, L, cortes, en_len, int(round(pre_s * fs)), original, lienzo(tmp), curva=curva,
+                     puentes=puentes)[0]
+        x = None
+        layout = s.get("channel_layout") or {1: "mono", 2: "stereo", 6: "5.1"}.get(ch, f"{ch}c")
+        if formato == "original":
+            plan = plan_original or preparar_original(es_path, s, ruta, p)
+            return codificar_original(out, plan, ruta, p), ""
+        bitrate = bitrate_salida(codec, s, es_path, canales, kbps)
+        cambio = codificar(out, fs, layout, codec, bitrate, ruta, canales)
+        return bitrate, cambio
+    finally:
+        x = out = None
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 def audios_para_muxear(es_path, out_path):
@@ -11920,6 +12265,186 @@ def episodio(nombre):
     return (1, int(nums[-1])) if nums else None
 
 
+# ---------------------------------------------------------------- referencia fija: sincronizar y muxear
+
+def _subtitulos_de_la_salida(valores):
+    """Los subtítulos auxiliares que sincronizar deja junto a la salida: también van al reloj del original."""
+    salida, fuente = valores["out_path"], valores["es_path"]
+    rutas = []
+    if valores.get("sub_path"):
+        rutas.append(os.path.splitext(salida)[0] + os.path.splitext(valores["sub_path"])[1])
+    rutas += [ruta_sub_doblaje(salida, s) for s in pistas_sub_doblaje(fuente) if s["ext"]]
+    if valores.get("forzados") or valores.get("forzados_vo"):
+        rutas.append(ruta_forzados(salida))
+    return list(dict.fromkeys(rutas))
+
+
+def _con_referencia_fija(funcion):
+    """sincronizar con --mantener-original: el doblaje, sus pistas y sus subtítulos van al reloj del original y el
+    mapa del informe lo dice (velocidad 1: al muxear, el original no se toca)."""
+    firma = inspect.signature(funcion)
+
+    @functools.wraps(funcion)
+    def envoltorio(*args, mantener_original=None, **kwargs):
+        if not (MANTENER_ORIGINAL if mantener_original is None else mantener_original):
+            return funcion(*args, **kwargs)
+        valores = firma.bind(*args, **kwargs)
+        valores.apply_defaults()
+        valores = valores.arguments
+        salida = valores["out_path"]
+        rutas_subs = _subtitulos_de_la_salida(valores)
+        contexto = dict(factor=Fraction(1), audios={_ruta_normal(salida)}, convertidos=set(), subs_convertidos=set(),
+                        subs_existentes=[s for s in rutas_subs if os.path.exists(s)])
+        token = _REFERENCIA.set(contexto)
+        try:
+            resultado = funcion(*args, **kwargs)
+            mapa = leer_mapa(salida)
+            if not mapa:
+                raise RuntimeError("Referencia fija: falta el mapa del audio; no se puede confirmar su reloj.")
+            factor = contexto["factor"]
+            if factor != velocidad_del_mapa(mapa):
+                raise RuntimeError("Referencia fija: la medida y el mapa no utilizan la misma velocidad.")
+            if factor != 1 and _ruta_normal(salida) not in contexto["convertidos"]:
+                raise RuntimeError("Referencia fija: no se ha adaptado la pista principal; no se muxea.")
+            if factor != 1:
+                for ruta in rutas_subs:
+                    if ruta not in contexto["subs_convertidos"]:
+                        escalar_subtitulo(ruta, factor)
+            nuevo = mapa_al_original(mapa, factor)
+            marca = (MARCA_REFERENCIA + "vídeo y pistas originales intactos; factor de duración del doblaje "
+                     + str(factor) + ".")
+            informe = os.path.splitext(salida)[0] + "_informe.txt"
+            with open(informe, encoding="utf-8") as f:
+                lineas = [x for x in f.read().splitlines() if not x.startswith(("Mapa: ", MARCA_REFERENCIA))]
+            lineas += [marca, "Mapa: " + json.dumps(nuevo)]
+            with open(informe, "w", encoding="utf-8") as f:
+                f.write("\n".join(lineas) + "\n")
+            print(marca, flush=True)
+            print("Mapa: " + json.dumps(nuevo), flush=True)
+            return resultado
+        finally:
+            _REFERENCIA.reset(token)
+    return envoltorio
+
+
+def _forzados_al_original(funcion):
+    @functools.wraps(funcion)
+    def envoltorio(out_path, rellenos, sin_voz, modelo, previo, con_ocr, p=print):
+        if not referencia_requiere_cambio() or previo:
+            return funcion(out_path, rellenos, sin_voz, modelo, previo, con_ocr, p)
+        contexto = _REFERENCIA.get()
+        factor = float(contexto["factor"])
+        ruta = ruta_forzados(out_path)
+        # el OCR se hizo antes de recodificar; Whisper lee el audio final, ya en el reloj del original
+        escalar_subtitulo(ruta, factor)
+        contexto["subs_convertidos"].add(ruta)
+        return funcion(out_path, [(a * factor, b * factor) for a, b in rellenos],
+                       [(a * factor, b * factor) for a, b in sin_voz], modelo, previo, con_ocr, p)
+    return envoltorio
+
+
+def _uniones_al_original(funcion):
+    @functools.wraps(funcion)
+    def envoltorio(out_path, piezas, idioma, p=print, original=None, pre_s=0.0, rellenos=()):
+        if referencia_requiere_cambio():
+            factor = float(_REFERENCIA.get()["factor"])
+            piezas = [(a * factor, b * factor) for a, b in piezas]
+            rellenos = [(a * factor, b * factor) for a, b in rellenos]
+            pre_s *= factor
+        return funcion(out_path, piezas, idioma, p, original, pre_s, rellenos)
+    return envoltorio
+
+
+def _muxear_con_referencia_fija(funcion):
+    firma = inspect.signature(funcion)
+
+    @functools.wraps(funcion)
+    def envoltorio(*args, **kwargs):
+        if MANTENER_ORIGINAL:
+            v = firma.bind(*args, **kwargs)
+            v.apply_defaults()
+            v = v.arguments
+            if velocidad_del_mapa(leer_mapa(v["audio_path"])) != 1 or Fraction(v["vel"]) != 1:
+                raise RuntimeError("Referencia fija: este audio se calculó para adaptar el vídeo. Vuelve a "
+                                   "sincronizarlo (con «Sobrescribir resultados») para rehacerlo con el original fijo.")
+        return funcion(*args, **kwargs)
+    return envoltorio
+
+
+sincronizar = _con_referencia_fija(sincronizar)
+forzados_de_la_vo = _forzados_al_original(forzados_de_la_vo)
+revisar_uniones = _uniones_al_original(revisar_uniones)
+muxear = _muxear_con_referencia_fija(muxear)
+
+
+# ---------------------------------------------------------------- --solo-video
+
+SOLO_VIDEO = False      # --solo-video: los auxiliares se borran en finalizar_solo_video, tras verificar el MKV
+
+
+def finalizar_solo_video(mkv, salida, referencia, audios=(), subtitulos=(), fuentes=(), p=print):
+    """Verificar el nuevo MKV y retirar exclusivamente sus auxiliares, nunca las entradas ni otros trabajos.
+    audios/subtitulos son las rutas exactas que se han añadido en este muxeado; sin glob ni borrados de carpetas.
+    Un error de verificación conserva todos los auxiliares. Un error de borrado se avisa sin invalidar el vídeo.
+    Devuelve los que se han conservado."""
+    def inventario(ruta):
+        r = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
+                            "stream=codec_type,codec_name:stream_disposition=attached_pic", "-of", "json", ruta],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", **SIN_VENTANA)
+        if r.returncode != 0:
+            raise RuntimeError("no se puede verificar " + ruta + ": " + r.stderr.strip()[-300:])
+        try:
+            return json.loads(r.stdout)["streams"]
+        except (ValueError, KeyError) as e:
+            raise RuntimeError("FFprobe no ha devuelto las pistas de " + ruta) from e
+
+    def contar(pistas, tipo):
+        return sum(s.get("codec_type") == tipo for s in pistas)
+
+    audios, subtitulos = list(audios), list(subtitulos)
+    final, original = inventario(mkv), inventario(referencia)
+    if not any(s.get("codec_type") == "video" and not s.get("disposition", {}).get("attached_pic") for s in final):
+        raise RuntimeError("el MKV final no tiene vídeo; se conservan los archivos auxiliares")
+    for tipo, nuevas in (("audio", audios), ("subtitle", subtitulos)):
+        esperadas = contar(original, tipo) + len(nuevas)
+        if contar(final, tipo) != esperadas:
+            raise RuntimeError(f"el MKV final tiene {contar(final, tipo)} pistas de {tipo}, se esperaban {esperadas}; "
+                               "se conservan los archivos auxiliares")
+    normalizar = lambda ruta: os.path.normcase(os.path.realpath(os.path.abspath(ruta)))
+    protegidas = {normalizar(r) for r in [mkv, referencia, *fuentes] if r}
+    base = os.path.splitext(os.path.abspath(salida))[0]
+    carpeta = normalizar(os.path.dirname(base))
+    nombre = os.path.basename(base)
+    auxiliares = list(dict.fromkeys([salida, *audios, *subtitulos, base + "_informe.txt"]))
+    pendientes, eliminados = [], 0
+    for ruta in auxiliares:
+        if not os.path.lexists(ruta):
+            continue
+        real = normalizar(ruta)
+        archivo = os.path.basename(os.path.abspath(ruta))
+        sufijo = archivo[len(nombre):]
+        # solo lo que este trabajo crea con el nombre de su salida, en su misma carpeta
+        permitido = (os.path.abspath(ruta) == os.path.abspath(salida) or sufijo in ("_informe.txt", "_forzados.srt")
+                     or re.fullmatch(r"_sub\d+\.(srt|ass)", sufijo)
+                     or re.fullmatch(r"_pista\d+(?:_\[[\w-]+\])?\.mka", sufijo)
+                     or sufijo in (".srt", ".ass", ".ssa"))
+        permitido = permitido and archivo.startswith(nombre)
+        if (not permitido or normalizar(os.path.dirname(os.path.abspath(ruta))) != carpeta or real in protegidas
+                or os.path.islink(ruta) or not os.path.isfile(ruta)):
+            pendientes.append(ruta)
+            p(f"Aviso: archivo conservado por protección de entradas o de ruta: {ruta}")
+            continue
+        try:
+            os.remove(ruta)
+            eliminados += 1
+        except OSError as e:
+            pendientes.append(ruta)
+            p(f"Aviso: no se ha podido borrar el auxiliar {ruta}: {e}")
+    p(f"Limpieza: {eliminados} archivo(s) auxiliar(es) eliminado(s).")
+    p(f"Vídeo final verificado: {mkv}")
+    return pendientes
+
+
 def main():
     ap = argparse.ArgumentParser(description="Sincroniza un doblaje con la pista original usando música y efectos.")
     ap.add_argument("doblaje", nargs="?")
@@ -11934,9 +12459,11 @@ def main():
                     help="los .srt con el mismo nombre que cada MKV se ajustan también")
     ap.add_argument("--idioma", default=None,
                     help="etiqueta del nombre del audio sincronizado (…_[es-ES]_SYNC.mka); por defecto, --mux-idioma")
-    ap.add_argument("--formato", choices=("flac", "aac", "ac3", "opus"), default="flac",
+    ap.add_argument("--formato", choices=("flac", "aac", "ac3", "opus", "original"), default="flac",
                     help="formato del audio doblado cuando hay que recodificarlo (cortes o rellenos); por defecto flac. "
-                         "Los kb/s, automáticos (los del doblaje si ya iba en ese formato) salvo que se pidan con --kbps")
+                         "Los kb/s, automáticos (los del doblaje si ya iba en ese formato) salvo que se pidan con --kbps. "
+                         "original: cada pista con sus propios parámetros (códec, frecuencia, canales, perfil, bits y "
+                         "bitrate); lo que no se pueda conservar da error")
     ap.add_argument("--canales", choices=CANALES_SALIDA, default="igual",
                     help="canales del audio doblado: los suyos (igual, por defecto) o 2.0 (un mono va igual a los dos "
                          "lados; un 5.1 se mezcla a estéreo); con 2.0 se recodifica aunque no haya cortes")
@@ -11998,7 +12525,16 @@ def main():
                     help="con qué se decodifica el vídeo al medir con los cambios de plano o leer forzados: "
                          + ", ".join(f"{k} = {v[0]}" for k, v in DECODIFICADORES.items())
                          + ". Si la GPU falla, se usa la CPU (por defecto: cpu)")
+    ap.add_argument("--solo-video", action="store_true",
+                    help="con --muxear: verificar el MKV final y después borrar los auxiliares de este trabajo (el audio "
+                         "sincronizado, sus pistas, subtítulos e informe); nunca las entradas. Si la verificación falla, "
+                         "se conservan; si el MKV ya existe, no se toca")
+    ap.add_argument("--mantener-original", action="store_true",
+                    help="conservar el vídeo y las pistas del original (sus fps) y llevar el doblaje y sus subtítulos "
+                         "a su reloj, en vez de adaptar el original al doblaje")
     args = ap.parse_args()
+    global MANTENER_ORIGINAL, SOLO_VIDEO
+    MANTENER_ORIGINAL, SOLO_VIDEO = args.mantener_original, args.solo_video
     # análisis en marcha: el actualizador no cambia el programa mientras tanto (si no está o falla, da igual)
     try:
         import actualizador
@@ -12040,6 +12576,11 @@ def main():
                 print(lineas[0])
             with open(os.path.splitext(salida)[0] + "_informe.txt", "a", encoding="utf-8") as f:
                 f.write("".join(x + "\n" for x in lineas))
+            if args.solo_video and any(x.startswith("Muxeado:") for x in lineas):
+                try:
+                    finalizar_solo_video(mkv, salida, args.solo_subs, subtitulos=[salida], fuentes=[args.subs])
+                except Exception as e:
+                    print(f"Aviso: no se limpian los auxiliares: {e}")
         return
 
     trabajos = []
@@ -12081,9 +12622,9 @@ def main():
             forz = ruta_forzados(salida) if (args.forzados or args.forzados_vo) and \
                 os.path.exists(ruta_forzados(salida)) else None
             subs = subs_para_muxear(es_path, salida, args.mux_idioma)
+            audios = [] if args.solo_pista_principal else audios_para_muxear(es_path, salida)
             linea = muxear(en_path, salida, mkv, args.mux_idioma, args.mux_titulo, titulo_video=titulo_video,
-                           forzados=forz, forz_titulo=args.forz_titulo, subtitulos=subs,
-                           audios=[] if args.solo_pista_principal else audios_para_muxear(es_path, salida),
+                           forzados=forz, forz_titulo=args.forz_titulo, subtitulos=subs, audios=audios,
                            vel=velocidad_del_mapa(leer_mapa(salida)))
         except Exception as e:
             print(f"No se pudo muxear: {e}")
@@ -12092,6 +12633,13 @@ def main():
         lista = lista_para_vlc(os.path.splitext(salida)[0] + "_informe.txt", mkv)
         if lista:
             anotar(salida, [lista])
+        if args.solo_video:
+            try:
+                finalizar_solo_video(mkv, salida, en_path, audios=[salida] + [a["ruta"] for a in audios],
+                                     subtitulos=[s["ruta"] for s in subs] + ([forz] if forz else []),
+                                     fuentes=[es_path, en_path, args.subs])
+            except Exception as e:
+                print(f"Aviso: no se limpian los auxiliares: {e}")
         return ", muxeado"
 
     escritos = set()        # informes hechos en esta ejecución: ya dicen su versión en la primera línea
@@ -12132,6 +12680,18 @@ def main():
     for es_path, en_path, salida, sub in trabajos:
         salida = salida or ruta_salida(es_path, args.idioma, pista=args.pista)
         print("\n" + "=" * 78)
+        if args.solo_video and args.muxear is not None:
+            # con --solo-video los auxiliares ya no están: lo que dice que el trabajo está hecho es el MKV final
+            nombre = None
+            if args.plantilla:
+                ep = episodio(os.path.basename(es_path)) or episodio(os.path.basename(en_path))
+                nombre = expandir_plantilla(args.plantilla, ep, nombre_episodio(es_path))
+            destino = (args.muxear if args.muxear and len(trabajos) == 1
+                       else ruta_mux(en_path, titulo=args.mux_titulo, nombre=nombre))
+            if os.path.exists(destino):
+                print(f"Ya existe el vídeo muxeado, no se toca: {destino}")
+                resumen.append((es_path, "vídeo muxeado ya existía"))
+                continue
         existe = [x for x in (salida, sub and os.path.splitext(salida)[0] + os.path.splitext(sub)[1])
                   if x and os.path.exists(x)]
         if args.solo_muxear:
