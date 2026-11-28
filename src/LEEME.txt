@@ -571,6 +571,20 @@ uno con su resumen del anterior):
   la imagen), va donde la pone la imagen con que el audio la apoye ahí en un tercio de las ventanas ("... el audio lo
   apoya en 4 de 9 ventanas, y donde iba no lo sostenía nada");
 - el audio original ya no suena nunca encima del castellano colocado (salía en 48 s del 1x02 de El increíble Hulk).
+Desde la 1.4.23, con una pista guía (el idioma del original dentro del archivo del doblaje): junto a un salto
+entre dos tramos (el final de un episodio y el principio del siguiente, una pausa para anuncios), el montaje de la
+tele a veces quita los planos donde se dice una frase y la pone unos segundos antes o después, encima de otros
+planos. La imagen pone esos planos con su tramo (y son los de la RAW), así que el castellano sonaba antes o después
+de que lo dijeran, y donde lo dicen quedaba el silencio del fundido. Ahora, lo último y lo primero de cada tramo
+junto a un salto que no encaja en su sitio se busca con la envolvente de la voz de la guía (cuándo se habla y cómo
+sube y baja), y una frase que encaja claramente en otro sitio, dentro del hueco del salto que ningún tramo
+confirma, va ahí: "Frase junto a un salto: 47:39.80-47:44.81 del doblaje va en 47:43.78 del original (+4.21 s; la
+voz de la guía la pone ahí, 0.81, y en su sitio 0.33 ...)". La frase va entera en los dos idiomas: desde la pausa
+antes de la primera de las dos voces hasta la pausa después de la última (el castellano no empieza ni acaba
+donde la guía); y lo que el original dice justo al lado y el doblaje no tiene (una frase que quitó el montaje de
+la tele) no se tapa. Donde iba, y lo que en la junta no es de ningún sitio, va con el original (con sus forzados,
+si se piden). Solo se mueven frases: si en ese trozo la guía y el castellano suenan igual (la música o los efectos,
+que comparten), no se toca. Sus dos cortes van ahí mismo, y sale en los avisos para comprobarlo.
 
 Y si en un trozo la música y los efectos del doblaje van desplazados de su voz y de su imagen (en El último
 superviviente 1x02, los primeros 2:33), el audio, que mide la música y los efectos, ya no manda sin más: cuando la

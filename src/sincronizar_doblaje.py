@@ -51,7 +51,7 @@ from scipy import fft as sp_fft
 import limpiar_vhs
 import forzados_vo
 
-VERSION = '1.4.22'
+VERSION = '1.4.23'
 
 
 def _version_programa():
@@ -5150,7 +5150,7 @@ def recortes_en_pausas(es, fs, cortes, L, dur, db, saltar=(), palabras=None, aje
     for i, c in enumerate(cortes):
         ini, fin = limites(cortes, L, dur)
         R = sobra_en_corte(cortes, L, dur, i)
-        if R < 0.05 or i in saltar or recorte_desplazado(cortes, L, dur, i, fin):
+        if R < 0.05 or i in saltar or c.get("fijo") or recorte_desplazado(cortes, L, dur, i, fin):
             continue
         s0 = fin[i]
         if c.get("entre"):
@@ -7650,6 +7650,347 @@ def repeticiones_en_audio(segs, entre, k, cambios, calibracion, imagen, a, b, p,
                           "; conviene comprobarlo")
     nuevos = fusionar_iguales(nuevos)
     return nuevos, {i: saltos[s[1]] for i, s in enumerate(nuevos[:-1]) if s[1] in saltos}, avisos
+
+
+# Frases junto a un salto que solo la voz pone en su sitio (El increíble Hulk 1x02: dos episodios unidos frente a la
+# película entera). Al final del primero, el montaje de la tele quitó los planos donde se dicen «I think he's headed
+# toward the house. Come on, we'll take my car» y puso las frases 8 s antes, encima de los planos de antes: la imagen
+# ponía esos planos con su tramo (con razón: son los de la RAW, 0,97), la onda del audio apenas encajaba en ningún sitio
+# (0,24) y el castellano sonaba 8 s antes de que lo dijeran; donde lo dicen, el silencio del fundido del episodio. Con
+# una guía (el idioma del original), en lo último y lo primero de cada tramo junto a un salto: lo que no encaja en su
+# sitio, con el resto del tramo encajando, se busca con la envolvente de la banda de la voz (cuándo se habla y cómo
+# sube y baja: 0,79 en su sitio de verdad, 0,30 donde iba). La frase que encaja claramente en otro desfase, dentro de
+# lo que ningún tramo confirma junto al salto, va ahí, con sus dos cortes fijos; donde iba, el original, y lo que en la
+# junta no es de ningún sitio, también
+JUNTA_MIRA = 20.0               # s del final (o del principio) de un tramo que se miran
+JUNTA_VENTANA = (2.0, 0.5)      # s de cada ventana del audio y cada cuánto
+JUNTA_MALA = 0.15               # parecido del audio en su sitio por debajo del cual la ventana no encaja...
+JUNTA_BUENA = 0.3               # ...y por encima, sí
+JUNTA_MALAS = 3                 # ventanas que no encajan, como poco...
+JUNTA_BUENAS = 3                # ...y que encajan en el tramo justo después (si no, todo el borde es dudoso)
+JUNTA_BUSCA = 15.0              # s a cada lado de su desfase
+JUNTA_VOZ_VENTANA = (2.8, 0.25) # s de la envolvente de la voz que se compara y cada cuánto
+JUNTA_VOZ = 0.6                 # parecido de la envolvente de la voz para ponerla en otro sitio...
+JUNTA_VENTAJA = 0.3             # ...esto más que en su sitio (±0,3 s)...
+JUNTA_PICO = 0.15               # ...y esto más que con cualquier otro desfase a más de 0,5 s
+JUNTA_ACUERDO = 0.06            # s: lo que pueden diferir los desfases de las ventanas de la frase
+JUNTA_SALTO = 1.0               # s que tiene que apartarse del desfase de su tramo
+JUNTA_CONFIRMA = 0.5            # parecido de la envolvente de la voz que confirma un trozo en su sitio
+# (solo frases: donde no se habla, la guía y la doblada llevan el mismo sonido, la música y los efectos, y su banda de la
+# voz va igual: 0,83-0,93 en el Hulk, frente a 0,22-0,39 con diálogo; mover eso no recupera castellano y añade dos
+# cortes. Con la frase justa: con el silencio de alrededor, sube y baja igual en las dos y parece que no se habla; trama a
+# trama no vale, que lo fino lo cambia la codificación de cada pista: 0,55-0,68 de «diálogo» donde no se hablaba)
+JUNTA_DIALOGO = 0.6             # parecido de la banda de la voz de la guía con la de la doblada desde el que no hay diálogo
+
+
+def envolvente_voz(x, t0, t1, fs=AR):
+    """La envolvente de la banda de la voz (300-3000 Hz) de x entre t0 y t1 (s, desde 0), en dB, 100 veces por segundo."""
+    i0, i1 = int(round(t0 * fs)), min(int(round(t1 * fs)), len(x))
+    if i0 < 0 or i1 - i0 < fs // 2:
+        return np.zeros(0, np.float32)
+    y = sosfiltfilt(butter(4, (300, 3000), btype="band", fs=fs, output="sos"), np.asarray(x[i0:i1], np.float64))
+    n = fs // 100
+    e = np.sqrt((y[:len(y) // n * n].reshape(-1, n) ** 2).mean(1))
+    return (20 * np.log10(e + 1e-6)).astype(np.float32)
+
+
+def ncc_con_media(w, x):
+    """Correlación normalizada de w a lo largo de x, quitando también la media de cada trozo de x (ncc_curve no la
+    quita: con una envolvente en dB, que no ronda el cero, todo salía casi igual de flojo), o None."""
+    n = len(w)
+    if n < 2 or len(x) < n:
+        return None
+    w = np.asarray(w, np.float64) - float(np.mean(w))
+    nw = float(np.linalg.norm(w))
+    if nw < 1e-9:
+        return None
+    x = np.asarray(x, np.float64)
+    c = fftconvolve(x, w[::-1], mode="valid")
+    s1, s2 = np.concatenate([[0.0], np.cumsum(x)]), np.concatenate([[0.0], np.cumsum(x * x)])
+    suma, suma2 = s1[n:] - s1[:-n], s2[n:] - s2[:-n]
+    return c / (nw * np.sqrt(np.maximum(suma2 - suma * suma / n, 1e-12)))
+
+
+def encaje_ventanas(a, b, t0, t1, L, k):
+    """El parecido del audio (a contra b, como audio_confirma) de cada ventana de JUNTA_VENTANA entre t0 y t1 del
+    doblaje con el desfase L (±0,3 s): [(inicio, parecido)]."""
+    largo, paso = JUNTA_VENTANA
+    W, S = int(largo * AR), int(0.3 * AR)
+    out = []
+    for t in np.arange(t0, t1 - largo + 1e-6, paso):
+        i0, j0 = int(t * AR), int(round((t * (1 + k) + L) * AR)) - S
+        if i0 < 0 or j0 < 0 or i0 + W > len(a) or j0 + W + 2 * S > len(b):
+            continue
+        cc = ncc_curve(np.asarray(a[i0:i0 + W], np.float32), np.asarray(b[j0:j0 + W + 2 * S], np.float32))
+        out.append((float(t), float(cc.max()) if cc is not None and len(cc) else 0.0))
+    return out
+
+
+def voz_en_desfases(va, vb, u, L, k, busca=JUNTA_BUSCA):
+    """La envolvente de la voz de la ventana del doblaje que empieza en u (JUNTA_VOZ_VENTANA) contra la del original con
+    los desfases de L - busca a L + busca: (desfases, parecidos) o None. va, vb: la guía y el original en mono a AR."""
+    largo = JUNTA_VOZ_VENTANA[0]
+    o0 = u * (1 + k) + L - busca
+    ga = envolvente_voz(va, u, u + largo)
+    gb = envolvente_voz(vb, o0, o0 + largo + 2 * busca)
+    if len(ga) < 50 or len(gb) <= len(ga):
+        return None
+    cc = ncc_con_media(ga, gb)
+    return None if cc is None else (L - busca + np.arange(len(cc)) / 100, cc)
+
+
+def frase_por_la_voz(va, vb, u0, u1, L, k, hacia):
+    """La frase de la guía entre u0 y u1 (s del doblaje) que la envolvente de la voz pone claramente en otro desfase,
+    más tarde (hacia=+1) o antes (-1) que L: (desfase, principio de su primera ventana, fin de la última, parecido, el de
+    su sitio) o None."""
+    largo, paso = JUNTA_VOZ_VENTANA
+    buenas = []
+    for u in np.arange(max(u0, 0.0), u1 - largo + 1e-6, paso):
+        r = voz_en_desfases(va, vb, u, L, k)
+        if r is None:
+            continue
+        Ls, cc = r
+        j = int(np.argmax(cc))
+        v, Lj = float(cc[j]), float(Ls[j])
+        cerca = np.abs(Ls - L) <= 0.3
+        aqui = float(cc[cerca].max()) if cerca.any() else 0.0
+        otros = cc[np.abs(Ls - Lj) > 0.5]
+        segundo = float(otros.max()) if len(otros) else 0.0
+        if v >= JUNTA_VOZ and v - aqui >= JUNTA_VENTAJA and v - segundo >= JUNTA_PICO and \
+                (Lj - L) * hacia >= JUNTA_SALTO:
+            buenas.append((float(u), Lj, v, aqui))
+    if len(buenas) < 2:
+        return None
+    centro = float(np.median([x[1] for x in buenas]))
+    juntas = [x for x in buenas if abs(x[1] - centro) <= JUNTA_ACUERDO]
+    if len(juntas) < 2:
+        return None
+    return (float(np.median([x[1] for x in juntas])), juntas[0][0], juntas[-1][0] + largo,
+            max(x[2] for x in juntas), max(x[3] for x in juntas))
+
+
+def con_dialogo(va, vd, t0, t1, nivel=None):
+    """¿Se habla entre t0 y t1 (s del doblaje)? Si la banda de la voz de la guía (va) y la de la doblada (vd) no van
+    igual: el mismo sonido (la música, los efectos) va igual en las dos; las voces, no (JUNTA_DIALOGO). nivel: el de la
+    frase de al lado (dB, lo más fuerte de la guía en 0,1 s): lo que no llega a PAUSA_VOZ dB de él es silencio, no
+    diálogo (dos ruidos de fondo se parecen al azar: -0,22 en el Hulk 1x02, 78:36, antes de «Hold on, Mel»)."""
+    eg, ed = envolvente_voz(va, t0, t1), envolvente_voz(vd, t0, t1)
+    n = min(len(eg), len(ed))
+    if n < 50 or eg[:n].std() < 1e-3 or ed[:n].std() < 1e-3:
+        return False
+    if nivel is not None and float(np.convolve(eg[:n], np.ones(10) / 10, mode="valid").max()) < nivel - PAUSA_VOZ:
+        return False
+    return float(np.corrcoef(eg[:n], ed[:n])[0, 1]) < JUNTA_DIALOGO
+
+
+JUNTA_PAUSA = 1.5           # s que se busca, desde el borde de la frase, la pausa de cada voz (sin ella, no se mueve)
+JUNTA_PAUSA_RAW = 0.5       # s de pausa que acaba una frase del original (entre «mind,» y «wasn't he?» había 0,2, y
+                            # entre «I» y «think», 0,3: con eso el relleno se quedaba el «I» de la frase que se mueve)
+
+
+def borde_de_frase(v, t, lado, minimo=0.0):
+    """El borde de la frase de una voz (la guía o la doblada) cerca de t (s del doblaje), en una pausa de su banda de la
+    voz (como en pausas_voz: PAUSA_VOZ dB por debajo de su percentil 90 de alrededor, en 0,1 s): con lado=-1, donde
+    empieza (lo último de la pausa de antes), y con +1, donde acaba (lo primero de la de después). Cada voz tiene las
+    suyas: el castellano empezaba 0,24 s después de la guía y acababa 0,3 s más tarde, y con una pausa de las dos juntas
+    la frase castellana se quedaba sin el final («...va a doler. Aguan-») o la inglesa dejaba su «I» en el relleno.
+    minimo: s que tiene que durar la pausa a la que se va (entre dos palabras también hay un respiro). None si a
+    JUNTA_PAUSA s no hay pausa."""
+    t0 = max(t - 3.0, 0.0)
+    e = envolvente_voz(v, t0, t + 3.0)
+    if len(e) < 100:
+        return None
+    m = np.convolve(e, np.ones(10) / 10, mode="same")
+    i, lim = min(max(int(round((t - t0) * 100)), 0), len(m) - 1), int(JUNTA_PAUSA * 100)
+
+    def con(pausa):
+        paso = 1 if (lado < 0) == bool(pausa[i]) else -1  # (hacia la frase dentro de la pausa; hacia la pausa, si no)
+        j = i
+        if pausa[i]:
+            while 0 <= j + paso < len(m) and pausa[j + paso] and abs(j + paso - i) <= lim:
+                j += paso
+        else:
+            while True:
+                while 0 <= j + paso < len(m) and not pausa[j] and abs(j + paso - i) <= lim:
+                    j += paso
+                if not pausa[j]:
+                    return None
+                p0_, p1_ = j, j                 # (la pausa entera: si es un respiro, se sigue)
+                while p0_ > 0 and pausa[p0_ - 1]:
+                    p0_ -= 1
+                while p1_ + 1 < len(m) and pausa[p1_ + 1]:
+                    p1_ += 1
+                if p1_ - p0_ + 1 >= minimo * 100:
+                    break
+                j = p1_ + 1 if paso > 0 else p0_ - 1
+                if not 0 <= j < len(m) or abs(j - i) > lim:
+                    return None
+        return t0 + j / 100
+    # una pausa clara; y si no la hay (con música debajo, la voz apenas baja entre frases), lo más callado de alrededor, a
+    # 3 dB de lo más bajo (el castellano del Hulk 1x02, 47:41, no bajaba de -28,3 dB y la pausa clara era -27,7). Solo si
+    # no: lo más callado cae también dentro de una palabra («aguan-ta», 78:41)
+    clara = con(m < np.percentile(m, 90) - PAUSA_VOZ)
+    return clara if clara is not None else con(m < float(m[max(i - lim, 0):i + lim + 1].min()) + 3.0)
+
+
+def confirmado_en_borde(a, b, va, vb, s, k, hacia):
+    """Lo primero (hacia=+1, desde el principio del tramo s) o lo último (hacia=-1, desde su final) que confirma el tramo
+    s en su sitio, en JUNTA_MIRA s: donde encaja el audio (JUNTA_BUENA; afinado por el sonido, borde_por_sonido: la
+    ventana que encaja puede empezar con algo que no) o la voz (JUNTA_CONFIRMA). None si nada."""
+    t0, t1 = (s[0], min(s[1], s[0] + JUNTA_MIRA)) if hacia > 0 else (max(s[0], s[1] - JUNTA_MIRA), s[1])
+    largo, (lv, pv) = JUNTA_VENTANA[0], JUNTA_VOZ_VENTANA
+    hay = [(t, t + largo) for t, f in encaje_ventanas(a, b, t0, t1, s[2], k) if f >= JUNTA_BUENA]
+    if hay:
+        x0, x1 = hay[0] if hacia > 0 else hay[-1]
+        x = borde_por_sonido(a, b, (x0 + x1) / 2, s[2], k, -hacia)
+        if x0 - 0.5 <= x <= x1 + 0.5:       # (la primera, o la última, desde donde encaja de verdad)
+            if hacia > 0:
+                hay[0] = (x, x1)
+            else:
+                hay[-1] = (x0, x)
+    for u in np.arange(t0, t1 - lv + 1e-6, pv):
+        r = voz_en_desfases(va, vb, float(u), s[2], k, busca=0.3)
+        if r is not None and float(r[1].max()) >= JUNTA_CONFIRMA:
+            hay.append((float(u) + lv / 2, float(u) + lv / 2))     # (encaja si encaja más de la mitad: desde su centro)
+    if not hay:
+        return None
+    return min(x[0] for x in hay) if hacia > 0 else max(x[1] for x in hay)
+
+
+class MonoAlCortar:
+    """Los dos canales de z sumados, trozo a trozo al cortarlo (una película entera en mono a AR son cientos de MB)."""
+    def __init__(self, z):
+        self.z = z
+
+    def __len__(self):
+        return len(self.z)
+
+    def __getitem__(self, trozo):
+        x = self.z[trozo]
+        return x[:, 0] + x[:, 1] if x.ndim == 2 else x
+
+
+def frases_junto_a_saltos(segs, entre, k, a, b, va, vb, cambios, calibracion, p, vd=None):
+    """Las frases junto a un salto entre dos tramos que la voz de la guía pone en otro sitio (JUNTA_*). a, b: las
+    señales del audio (las de audio_confirma); va, vb: la guía y el original en mono a AR (con su voz); vd: la pista
+    doblada en mono a AR, para que los bordes de la frase caigan también en sus pausas (o None). Devuelve
+    (tramos, entre, lo que no se coloca [(desde, hasta) del doblaje: su sitio va con el original], los saltos que pone
+    esto [el final del tramo de antes de cada uno: van ahí mismo, que nada los mueva], avisos)."""
+    segs = [list(s) for s in segs]
+    saltos = {segs[i][1]: v for i, v in entre.items()}
+    fuera, fijos, avisos = [], [], []
+    largo = JUNTA_VENTANA[0]
+    i = 0
+    while i < len(segs) - 1:
+        A, B = segs[i], segs[i + 1]
+        for hacia in (+1, -1):          # el final de A (la frase va más tarde) o el principio de B (más pronto)
+            s, otro = (A, B) if hacia > 0 else (B, A)
+            t0, t1 = (max(s[0], s[1] - JUNTA_MIRA), s[1]) if hacia > 0 else (s[0], min(s[1], s[0] + JUNTA_MIRA))
+            w = encaje_ventanas(a, b, t0, t1, s[2], k)
+            w = w[::-1] if hacia > 0 else w                 # (desde el salto hacia dentro del tramo)
+            n = next((x for x, (_, f) in enumerate(w) if f >= JUNTA_BUENA), len(w))
+            malas, resto = w[:n], w[n:n + 2 * JUNTA_BUENAS]
+            if sum(f < JUNTA_MALA for _, f in malas) < JUNTA_MALAS or \
+                    sum(f >= JUNTA_BUENA for _, f in resto) < JUNTA_BUENAS:
+                continue
+            # (lo que no encaja, del salto a lo que sí, con 1 s más hacia dentro: la frase puede empezar ahí)
+            m0, m1 = (malas[-1][0] - 1.0, s[1]) if hacia > 0 else (s[0], malas[-1][0] + largo + 1.0)
+            r = frase_por_la_voz(va, vb, max(m0, s[0]), min(m1, s[1]), s[2], k, hacia)
+            if r is None:
+                continue
+            Lw, u0, u1, v, aqui = r
+            # la frase: lo que ponen ahí las ventanas de la voz, sin entrar en lo que su sonido encaja en su sitio ni pasar
+            # de donde deja de encajar con el desfase nuevo (borde_por_sonido, si la onda lo dice), con los bordes en las
+            # pausas de las dos voces. Sin diálogo (la música o los efectos que las dos pistas comparten: con_dialogo),
+            # no se mueve
+            if vd is None:
+                continue
+            # (dentro de las ventanas, de donde sube la voz de la guía a donde baja, a 6 dB de lo más fuerte: una ventana
+            # encaja con la frase al final de ella, y empezaba hasta 2 s antes de que se hablara; lo de en medio pisaba el
+            # final de la frase inglesa del relleno de antes: Hulk 1x02, 76:12, «Your son was old enough to make...»)
+            ev = envolvente_voz(va, u0, u1)
+            v0, v1 = u0, u1
+            if len(ev) >= 50:
+                sv = np.convolve(ev, np.ones(10) / 10, mode="same")
+                fuerte = np.flatnonzero(sv >= np.percentile(sv, 90) - 6.0)
+                v0, v1 = u0 + fuerte[0] / 100, u0 + (fuerte[-1] + 1) / 100
+            if hacia > 0:
+                b0 = max(borde_por_sonido(a, b, malas[-1][0] + largo / 2, s[2], k, +1), v0)
+                b1 = borde_por_sonido(a, b, u1 - 0.5, Lw, k, +1)
+                b1 = min(b1, v1) if b1 != u1 - 0.5 else v1
+            else:
+                b1 = min(borde_por_sonido(a, b, malas[-1][0] + largo / 2, s[2], k, -1), v1)
+                b0 = borde_por_sonido(a, b, u0 + 0.5, Lw, k, -1)
+                b0 = max(b0, v0) if b0 != u0 + 0.5 else v0
+            # (cada voz entera: desde donde empieza la primera hasta donde acaba la última, borde_de_frase; sin pasar del
+            # tramo, que lo de fuera ya no es de esta frase)
+            ini = [borde_de_frase(x, b0, -1) for x in (va, vd)]
+            fin = [borde_de_frase(x, b1, +1) for x in (va, vd)]
+            if None in ini or None in fin:
+                continue
+            ini, fin = min(ini), max(fin)
+            if ini < s[0] + (1.0 if hacia > 0 else 0.0) or fin > s[1] - (0.0 if hacia > 0 else 1.0):
+                continue
+            # (lo que el original dice justo donde empieza o acaba lo que se mueve, y el doblaje no tiene —una frase que
+            # quitó el montaje de la tele—, no se pisa: empieza después, o acaba antes, si lo que se deja del doblaje no es
+            # diálogo; Hulk 1x02, 76:12: «Your son was old enough to make up his own mind, wasn't he?» se quedaba en
+            # «...make», tapado por la música de antes de «Hold on, Mel»)
+            ef = envolvente_voz(va, ini, fin)
+            nivel = float(np.convolve(ef, np.ones(10) / 10, mode="valid").max()) if len(ef) >= 10 else None
+            d0 = ini * (1 + k) + Lw
+            r_ = borde_de_frase(vb, d0, +1, JUNTA_PAUSA_RAW)
+            if r_ is not None and r_ > d0 + 0.05:
+                x = (r_ - Lw) / (1 + k)
+                if x < fin - 1.0 and not con_dialogo(va, vd, ini, x, nivel):
+                    ini = x
+            d1 = fin * (1 + k) + Lw
+            r_ = borde_de_frase(vb, d1, -1, JUNTA_PAUSA_RAW)
+            if r_ is not None and r_ < d1 - 0.05:
+                x = (r_ - Lw) / (1 + k)
+                if x > ini + 1.0 and not con_dialogo(va, vd, x, fin, nivel):
+                    fin = x
+            if fin - ini < 1.0 or not con_dialogo(va, vd, ini, fin):
+                continue                # (no se habla: es la música o los efectos, que las dos pistas comparten)
+            q = confirmado_en_borde(a, b, va, vb, otro, k, hacia)
+            if q is None:
+                continue
+            d0, d1 = ini * (1 + k) + Lw, fin * (1 + k) + Lw
+            conf = q * (1 + k) + otro[2]
+            if (d1 > conf) if hacia > 0 else (d0 < conf):
+                continue                # (pisaría lo que el otro tramo sí confirma)
+            R = (Lw - otro[2]) * hacia  # (lo que sobra del doblaje entre la frase y lo confirmado del otro tramo)
+            if R > 0 and ((q - R / (1 + k) < fin - 1e-6) if hacia > 0 else (q + R / (1 + k) > ini + 1e-6)):
+                continue                # (el recorte se comería el final o el principio de la frase)
+            saltos.pop(A[1], None)
+            if hacia > 0:
+                e = q - R / (1 + k) if R > 0 else fin
+                nuevo = [ini, e, Lw]
+                if (e if R > 0 else q) - fin > 0.05:
+                    fuera.append((fin, e if R > 0 else q))
+                A[1], B[0] = ini, q
+                saltos[ini] = (ini, ini, cambios, calibracion, (ini, ini))
+                saltos[e] = (e, q, cambios, calibracion) if R > 0 else (e, e, cambios, calibracion, (e, q))
+                fijos += [ini, e]
+            else:
+                e = q + R / (1 + k) if R > 0 else ini
+                nuevo = [e, fin, Lw]
+                if ini - (e if R > 0 else q) > 0.05:
+                    fuera.append((e if R > 0 else q, ini))
+                A[1], B[0] = q, fin
+                saltos[q] = (q, e, cambios, calibracion) if R > 0 else (q, q, cambios, calibracion, (q, ini))
+                saltos[fin] = (fin, fin, cambios, calibracion, (fin, fin))
+                fijos += [q, fin]
+            segs.insert(i + 1, nuevo)
+            p(f"Frase junto a un salto: {mmss(ini)}-{mmss(fin)} del doblaje va en {mmss(d0)} del original "
+              f"({Lw:+.2f} s; la voz de la guía la pone ahí, {v:.2f}, y en su sitio {aqui:.2f}: el montaje del doblaje "
+              "la movió); donde iba, el audio original")
+            avisos.append(f"{mmss(ini)}-{mmss(fin)} del doblaje: frase junto a un salto que va donde la pone la voz de "
+                          f"la guía ({mmss(d0)} del original, {Lw:+.2f} s), no donde la ponía su tramo; conviene "
+                          "comprobarlo")
+            i += 1                      # (el tramo nuevo ya está mirado)
+            break
+        i += 1
+    return segs, {i: saltos[s[1]] for i, s in enumerate(segs[:-1]) if s[1] in saltos}, fuera, fijos, avisos
 
 
 # Un salto que pone la imagen entre dos cambios de plano del doblaje (el último que encaja con el tramo de antes y el
@@ -10891,6 +11232,18 @@ def sincronizar(es_path, en_path, out_path, sub_path=None, pista=None, guia=None
                 L = [sg[2] for sg in segs]
         finally:
             shutil.rmtree(tmp_mini, ignore_errors=True)
+    # las frases junto a un salto que solo la voz de la guía pone en su sitio (frases_junto_a_saltos): sus dos cortes,
+    # ahí mismo; lo que dejan y lo que en la junta no es de ningún sitio, con el original
+    fijos_t = []
+    if not video and st_guia is not None and len(L) > 1:
+        cv_j = cv if doble else None
+        segs, entre_video, fuera_j, fijos_t, mas = frases_junto_a_saltos(
+            [sg[:2] + [Li] for sg, Li in zip(segs, L)], entre_video, k, a, b, MonoAlCortar(es8), MonoAlCortar(en8),
+            cv_j, (c_img or 0.0) if cv_j is not None else 0.0, p, mono8.get(st_es["index"]))
+        L = [sg[2] for sg in segs]
+        for d0, d1 in fuera_j:
+            zonas.append(dict(z0=0.0, z1=0.0, d0=d0, d1=d1, a=d0, b=d1, n=0, m=0, tipo="junta"))
+        avisos_imagen += mas
     vel = vel or Fraction(1)
     p(f"Deriva de velocidad: {round(k * 1e6, 1) + 0.0:+.1f} ppm "      # + 0.0: sin "-0.0"
       f"({round(k * en_len * 1000) + 0:+d} ms en todo el episodio)")
@@ -10956,6 +11309,9 @@ def sincronizar(es_path, en_path, out_path, sub_path=None, pista=None, guia=None
                 cortes[i] = dict(corte_exacto(db, t), firme=firme)
     for i, c in enumerate(cortes):      # (lo que es un bloque en otro orden lo decide esto, no los cortes: es_reordenado)
         c["reordenado"] = i in reordenados
+    for i, sg in enumerate(segs[:-1]):      # (los de una frase colocada con la voz: ahí mismo, que nada los mueva)
+        if any(abs(sg[1] - t) < 1e-9 for t in fijos_t):
+            cortes[i]["fijo"] = True
 
     # el castellano no se estira nunca (decisión del usuario): si va a otra velocidad que el original, aunque sea
     # poco (23,976 frente a 24 son 1000 ppm, 3,6 s por hora), se adapta el original, como con el PAL. Una deriva
@@ -10978,7 +11334,7 @@ def sincronizar(es_path, en_path, out_path, sub_path=None, pista=None, guia=None
         z["d1"] = min(z["d1"], dur_es)
     # (lo que no se coloca es lo del doblaje; su sitio en el resultado, el que quede sin castellano: con bloques en otro
     # orden no es el que dicen los tramos de al lado)
-    zonas = [z for z in zonas if z["d1"] - z["d0"] >= 1.0 or z.get("tipo") in ("sin_sitio", "resto")]
+    zonas = [z for z in zonas if z["d1"] - z["d0"] >= 1.0 or z.get("tipo") in ("sin_sitio", "resto", "junta")]
     if f != 1:
         # todo lo medido en el tiempo del original pasa a su nueva velocidad
         en_len /= float(f)
@@ -11281,7 +11637,7 @@ def sincronizar(es_path, en_path, out_path, sub_path=None, pista=None, guia=None
     avisos = list(avisos_pistas) + avisos_imagen + avisos_sonido + avisos_contraste + avisos_limpieza
     for z in zonas:
         con = "el audio original" if rellenar_original else "silencio (sin relleno con el original)"
-        if z.get("tipo") == "ajeno":            # (repeticiones_en_audio: ya se ha dicho)
+        if z.get("tipo") in ("ajeno", "junta"):  # (repeticiones_en_audio, frases_junto_a_saltos: ya se ha dicho)
             continue
         if z.get("tipo") == "vo":               # (recortes_en_pausas: ya se ha dicho)
             avisos.append(f"{mmss(z['a'])}-{mmss(z['b'])} del doblaje: {z['porque']}; va con {con}, conviene "

@@ -44,7 +44,7 @@ import zlib
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-VERSION = '1.4.22'
+VERSION = '1.4.23'
 AQUI = os.path.dirname(os.path.abspath(__file__))
 # el icono de las ondas (pedido del usuario, 29-10-2026), en la esquina de la ventana y en la barra de tareas
 ICONO = os.path.join(AQUI, "Sync_Master.ico")

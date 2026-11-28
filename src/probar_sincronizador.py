@@ -12,7 +12,7 @@ a una carpeta temporal que se borra al final (con --conservar se deja, para mira
 algún caso falla."""
 import argparse, ast, builtins, os, re, shutil, subprocess, sys, tempfile, time
 
-VERSION = '1.4.22'
+VERSION = '1.4.23'
 AQUI = os.path.dirname(os.path.abspath(__file__))
 MOTOR = os.path.join(AQUI, "sincronizar_doblaje.py")
 CARPETA = os.environ.get("SYNC_MASTER_PRUEBAS") or None     # (la de los vídeos de prueba; o --carpeta)
@@ -1206,6 +1206,66 @@ def pruebas_sueltas(carpeta=CARPETA):
         sd.bloques_lejanos, sd.piezas_por_imagen = antes_bl, antes_pz
     out.append(("escenas_colocadas", "entre dos escenas colocadas no queda un trozo con un desfase que no dice nada, y lo "
                                      "libre de una escena que incluye otra ya colocada se coloca", fallos))
+    # (1.4.23; El increíble Hulk 1x02, 47:41: el montaje de la tele puso dos frases 8 s antes, encima de otros planos)
+    # frases_junto_a_saltos con sonido fabricado: el original (120 s) con su fondo y su voz (ruido en la banda de la voz
+    # con sílabas al azar), y la guía: 0-40 como el original; 40,3-43,3, la frase que el original dice en 48-51, sobre
+    # otro fondo; hasta 50, lo que solo tiene el doblaje; y desde 50, el original desde 51,5. Los tramos, como los deja
+    # la medida: 0-46 con 0 y 46-80 con +1,5. La doblada, con el mismo fondo y otra voz (otras sílabas) donde se habla.
+    # 1) la frase va con +7,7 (en 48 del original), con lo que sobra de la junta fuera y sus dos cortes fijos;
+    # 2) si en ese trozo las dos pistas suenan igual (no se habla: música, efectos), no se toca;
+    # 3) si el tramo de después ya está confirmado donde iría (el doblaje sigue con el original desde 47,5), tampoco
+    fallos = []
+    AR = sd.AR
+    rng_f = np.random.default_rng(23)
+    sos_v = sd.butter(4, (300, 3000), btype="band", fs=AR, output="sos")
+    sos_g = sd.butter(4, 250, btype="low", fs=AR, output="sos")
+    voz_banda = lambda n: sd.sosfiltfilt(sos_v, rng_f.standard_normal(n)).astype(np.float32)
+    fondo = lambda n, g=0.3: (g * sd.sosfiltfilt(sos_g, rng_f.standard_normal(n)) +
+                              0.01 * rng_f.standard_normal(n)).astype(np.float32)
+
+    def silabas(dur, frases):           # envolvente de una voz: sílabas al azar dentro de las frases, a AR
+        e = np.zeros(int(dur * 100), np.float32)
+        for f0, f1 in frases:
+            t = f0
+            while t < f1:
+                n = rng_f.uniform(0.12, 0.3)
+                e[int(t * 100):int(min(t + n, f1) * 100)] = rng_f.uniform(0.4, 1.0)
+                t += n + rng_f.uniform(0.03, 0.12)
+        return np.repeat(e, AR // 100)
+
+    frases_o = [(5, 8), (12, 15), (20, 24), (30, 33), (36, 39), (41, 42), (48, 51), (55, 58), (62, 66), (70, 74)]
+    bg_o, voz_o = fondo(120 * AR), voz_banda(120 * AR) * silabas(120, frases_o)
+    b_f = bg_o + voz_o
+    seg = lambda x, t0, t1: x[int(round(t0 * AR)):int(round(t1 * AR))]
+    bg_d = fondo(10 * AR, 0.5)
+    guia = np.concatenate([seg(b_f, 0, 40), bg_d[:int(0.3 * AR)],
+                           seg(bg_d, 0.3, 3.3) + seg(voz_o, 48, 51), seg(bg_d, 3.3, 10), seg(b_f, 51.5, 81.5)])
+    # (la doblada: el fondo de la guía y otra voz donde la guía habla, con las mismas frases)
+    voz_g = np.concatenate([seg(voz_o, 0, 40), np.zeros(int(0.3 * AR), np.float32), seg(voz_o, 48, 51),
+                            np.zeros(int(6.7 * AR), np.float32), seg(voz_o, 51.5, 81.5)])
+    n_g = min(len(guia), len(voz_g))
+    frases_d = [(f0, f1) for f0, f1 in [(5, 8), (12, 15), (20, 24), (30, 33), (36, 39), (40.3, 43.3), (53.5, 56.5),
+                                         (60.5, 64.5), (68.5, 72.5)]]
+    doblada = guia[:n_g] - voz_g[:n_g] + (voz_banda(n_g) * silabas(n_g / AR, frases_d)[:n_g])
+    try:
+        for nombre_f, a_f, vd_f, bien in (
+                ("la frase junto a la junta", guia, doblada,
+                 lambda n, fu, fi: len(n) == 3 and abs(n[1][2] - 7.7) < 0.1 and 39.5 <= n[1][0] <= 40.6 and
+                 43.2 <= n[1][1] and n[0][1] == n[1][0] and fu and len(fi) == 2),
+                ("sin diálogo (las dos pistas suenan igual)", guia, guia, lambda n, fu, fi: len(n) == 2),
+                ("con el tramo de después confirmado donde iría",
+                 np.concatenate([guia[:46 * AR], seg(b_f, 47.5, 51.5), guia[50 * AR:]]), doblada,
+                 lambda n, fu, fi: len(n) == 2)):
+            msgs_f = []
+            n_f, e_f, fu_f, fi_f, av_f = sd.frases_junto_a_saltos([[0.0, 46.0, 0.0], [46.0, 80.0, 1.5]], {}, 0.0, a_f,
+                                                                  b_f, a_f, b_f, None, 0.0, msgs_f.append, vd_f)
+            if not bien(n_f, fu_f, fi_f):
+                fallos.append(f"{nombre_f}: sale {[[round(x, 2) for x in s] for s in n_f]}, fuera {fu_f}, fijos {fi_f}"
+                              + (f" ({msgs_f[0]})" if msgs_f else ""))
+    except Exception as e:
+        fallos.append(f"revienta ({type(e).__name__}: {e})")
+    out.append(("frase_junto_a_salto", "una frase junto a una junta que la voz de la guía pone en otro sitio va ahí "
+                                       "(solo si se habla, y sin pisar lo confirmado del otro tramo)", fallos))
     # cuándo la envolvente mide bien sin la imagen: el mismo sonido con otra codificación (parecido 0,85-0,94, desfase
     # estable) sí; otra mezcla (el desfase salta 0,18 s de ida y vuelta) no
     t = np.arange(600.0)
